@@ -1,0 +1,8 @@
+node_modules/
+dist/
+src/wasm/
+wasm/target/
+*.tsbuildinfo
+vite.config.d.ts
+.DS_Store
+*.local
