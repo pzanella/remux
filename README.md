@@ -9,10 +9,11 @@ no install.
 
 **[Try it live →](https://pzanella.github.io/remux/)**
 
-![Remux UI: a narrow rail with the video/output pickers and controls next to a wide preview stage with the player, log console, and playlist tabs](docs/screenshot.png)
+![Remux UI: an in-browser video-editor timeline with intro/main/outro tracks, waveform and subtitle rows, above a draft preview and a Shaka Player-powered final result](docs/screenshot.png)
 
-Controls sit in a narrow rail on the left, the preview and log console sit on
-the right — everything fits on one screen, no scrolling needed.
+A drag-and-drop timeline for intro/outro clips and subtitles sits below the
+preview, which itself shows a "Draft" edit while you're arranging clips and
+swaps to the real Shaka Player-driven HLS result once you press Start.
 
 ## Why
 
@@ -23,6 +24,11 @@ fast and the quality does not change. For other formats, it uses FFmpeg
 compiled to WebAssembly to convert the file first. Your video never leaves
 your computer.
 
+It has grown past a plain converter into a small in-browser packaging
+pipeline: a timeline editor for stitching on intro/outro clips and subtitles,
+and a Shaka Player-based result you can actually inspect — quality ladder,
+subtitle tracks and all — instead of just a folder of files you have to trust.
+
 ## Features
 
 - **Works with many formats** — MP4, MOV, MKV, WebM, AVI, WMV, FLV, and more.
@@ -31,9 +37,24 @@ your computer.
 - **Optional adaptive (multi-resolution) HLS** — generate a master playlist
   with 240p/360p/480p/720p renditions, picked in the UI. This mode re-encodes,
   using hardware acceleration when the browser supports it (see below).
-- **Built-in player** — watch the video while it is still converting.
+- **In-browser timeline editor** — drag intro/outro clips and a subtitle file
+  onto the timeline, or drop them straight from Finder/Explorer. Tracks are
+  drawn proportional to real clip duration, with thumbnails and a waveform,
+  and a draft preview plays intro → main → outro back to back (Space to
+  play/pause) so you can check the cut before converting anything.
+- **Subtitles** — attach a `.srt`/`.vtt` file, or double-click the subtitle
+  track to write cues from scratch in a built-in editor. Shipped as a proper
+  HLS sidecar track (`#EXT-X-MEDIA:TYPE=SUBTITLES`), selectable from the
+  player's own subtitle menu.
+- **Shaka Player result** — the final HLS output plays through
+  [Shaka Player](https://github.com/shaka-project/shaka-player), with its
+  stock quality/track selection UI, reading segments straight from disk (or
+  browser storage) with no server involved.
+- **Two output modes** — write straight to browser storage with no folder
+  picker and download a ZIP when done, or pick a real folder on disk and
+  watch segments land there as they're produced.
 - **Crash recovery** — if the browser closes or crashes, you can pick up
-  right where you left off.
+  right where you left off. **Start over** resets everything for a new file.
 - **Light on memory** — the file is never fully loaded into RAM, even for
   large videos.
 
@@ -53,12 +74,25 @@ remux/
 │   ├── Cargo.toml
 │   └── src/lib.rs                # reads MP4, writes MPEG-TS segments
 │
+├── packages/remux-core/         # `npm run build:wasm` output — a standalone,
+│                                 # publishable package (gitignored, generated)
+│
 └── src/
     ├── main.tsx
     ├── App.tsx                   # puts the whole page together
     ├── index.css                 # all styles, no CSS framework
     │
-    ├── components/               # small pieces of UI (one job each)
+    ├── components/
+    │   ├── Timeline.tsx           # intro/outro/subtitle tracks, drag & drop, playhead
+    │   ├── RawPreview.tsx         # draft preview during editing (plain <video>, no HLS yet)
+    │   ├── Player.tsx             # final HLS result, via Shaka Player
+    │   ├── SubtitleCueEditor.tsx  # in-browser WebVTT cue editor
+    │   ├── Waveform.tsx           # canvas waveform for the audio track
+    │   └── ...                    # one small job each
+    ├── lib/
+    │   ├── vtt.ts                 # WebVTT/SRT cue parsing, shared main-thread ⇄ worker
+    │   ├── mediaPreview.ts        # client-side thumbnails + waveform peaks
+    │   └── zip.ts                 # zips an output folder for download
     ├── hooks/
     │   ├── useTranscoder.ts      # runs the worker, tracks progress
     │   └── usePersistence.ts     # saves progress so you can resume later
@@ -86,7 +120,7 @@ remux/
 git clone https://github.com/pzanella/remux.git
 cd remux
 npm install
-npm run build:wasm   # compiles wasm/ and writes the output to src/wasm/
+npm run build:wasm   # compiles wasm/ and writes the output to packages/remux-core/
 npm run dev          # starts the dev server at http://localhost:5173
 ```
 
@@ -96,8 +130,9 @@ Or run both build steps in one command:
 npm run dev:full
 ```
 
-Open the app, pick a video file, pick a folder to save the output, and press
-**Start**.
+Open the app, drop a video file onto the timeline, and press **Start** —
+output goes to browser storage by default, no folder picker needed (see
+[Output Modes](#output-modes)).
 
 ## npm Scripts
 
@@ -121,10 +156,52 @@ Open the app, pick a video file, pick a folder to save the output, and press
    segment should start and end, always at a keyframe.
 4. **For each segment**, the worker reads the matching bytes from OPFS,
    hands them to Rust to build an MPEG-TS segment, and writes the result to
-   your chosen folder. The playlist (`index.m3u8`) is updated after every
-   segment, so the built-in player can start before the job is finished.
+   the output location (see [Output Modes](#output-modes)). The playlist
+   (`index.m3u8`) is updated after every segment, so the built-in player can
+   start before the job is finished.
 5. **Progress is saved to IndexedDB** after every segment. If something goes
    wrong, reopen the app and press **Resume**.
+
+## Editing the Timeline
+
+Before pressing Start, the timeline underneath the preview is a small
+drag-and-drop editor:
+
+- **Intro / outro** — drop a clip onto the "+ Intro"/"+ Outro" slot on
+  either side of the main track. Tracks are drawn proportional to each
+  clip's real duration, with thumbnails and a waveform, so the cut is
+  visible before you commit to it. If a clip's own resolution or aspect
+  ratio doesn't match the main content, it is letterboxed/pillarboxed to
+  match (black bars, never stretched or cropped) — on the fast path and
+  both Adaptive HLS paths alike.
+- **Subtitles** — drop a `.srt`/`.vtt` file onto the subtitle track, or
+  double-click the track to write cues from scratch in the built-in editor.
+  Cues are authored relative to the main content; if an intro is attached,
+  their timestamps are shifted forward automatically so they still land on
+  the right moment in the final, spliced output. Cues that run past the end
+  of the whole edit are flagged with a warning icon rather than silently
+  clipped or left to overflow the timeline.
+- **Preview vs. result** — the "Editing preview" above the timeline (marked
+  **Draft**) plays intro → main → outro back to back in a plain
+  `<video>` element, purely so you can check the cut — press Space to
+  play/pause. It is not the packaged output. Press **Start** to actually
+  remux/encode everything; the panel switches to the real HLS result,
+  marked **Packaged**, played through Shaka Player.
+- **Start over** clears the current file, timeline, and any in-progress
+  session, so you can begin again from a clean slate.
+
+## Output Modes
+
+- **Browser storage** (default) — no folder picker, no permission prompt.
+  Segments are written to a private, origin-scoped directory (OPFS) and
+  stick around until you download them. Once a job completes, **Download as
+  ZIP** bundles the whole output folder into one file.
+- **Local folder** — pick a real folder on disk via the File System Access
+  API; segments land there as they're produced, visible to any other
+  program immediately.
+
+Both modes support pause/resume and are read the same way by the built-in
+player — only where the bytes end up differs.
 
 ## Adaptive (Multi-Resolution) HLS
 
@@ -178,6 +255,61 @@ rendition (e.g. `480p.m3u8`, `480p_0000.ts`, ...), plus a `master.m3u8` that
 lists them all with `#EXT-X-STREAM-INF` so any HLS player can switch between
 them — the same output shape regardless of which path produced it.
 
+## Reusing the Engine in Your Own Pipeline
+
+The Rust remuxer that powers the fast path — MP4 header parsing, keyframe
+segmentation, MPEG-TS muxing — is a self-contained crate (`wasm/`) with no
+dependency on the rest of this app. `npm run build:wasm` compiles it and
+writes a standalone, publish-ready npm package to `packages/remux-core/`
+(gitignored, rebuilt from source — nothing to check in). This app consumes
+that same package itself, from `src/worker/remux.worker.ts`, the same way an
+external project would.
+
+To use it outside this app:
+
+```bash
+npm run build:wasm
+cd packages/remux-core && npm publish   # or `npm pack` to try it locally first
+```
+
+`npm run build:wasm` builds with `wasm-pack --target bundler`, so the
+package expects a bundler that can import `.wasm` files as ES modules —
+Vite with [`vite-plugin-wasm`](https://github.com/Menci/vite-plugin-wasm)
+(what this app itself uses), or webpack with `asyncWebAssembly` enabled. For
+a plain browser `<script type="module">` with no bundler, rebuild with
+`wasm-pack build --target web` instead, which exports an async `init()` you
+call yourself before using anything else.
+
+With a bundler target, no init step is needed — importing the module is
+enough (the crate has no Node-specific APIs; it reads whatever `Uint8Array`
+you hand it):
+
+```js
+import { HlsProcessor } from 'remux-core';
+
+const processor = new HlsProcessor();
+processor.set_target_duration(6.0);
+
+// `headerBytes` is however much of the front (or, for files without
+// +faststart, the tail) of an MP4 you can read — enough to contain `moov`.
+const { segmentCount, segments } = JSON.parse(processor.parse_headers(headerBytes));
+
+for (let i = 0; i < segmentCount; i++) {
+  const seg = segments[i];
+  // Read the exact byte ranges `seg.videoSamples`/`seg.audioSamples`
+  // describe from your source (see `readSamples` in remux.worker.ts for a
+  // working reference) and hand them to the muxer:
+  const tsSegment = processor.mux_segment(videoBytes, audioBytes, i); // Uint8Array
+  // write tsSegment wherever you like — disk, network, IndexedDB…
+}
+
+const playlist = processor.generate_m3u8(JSON.stringify(durations));
+```
+
+`HlsProcessor` only ever holds one video + one audio track and always
+produces MPEG-TS/HLS — that's the whole feature set today. There's no
+generic multi-track API and no DASH/CMAF output.
+
 ## Supported Formats
 
 | Format | Extensions | How it's handled |
@@ -201,6 +333,12 @@ them — the same output shape regardless of which path produced it.
   WebCodecs AAC encoder was found (empirically, against real stereo footage)
   to reliably fail to finish encoding stereo audio below that, regardless of
   source content or resolution.
+- Subtitle files are sniffed by content, not trusted by extension — a `.vtt`
+  that isn't actually WebVTT-shaped (a word processor's "export as .vtt" is
+  a common way to end up with something else entirely) is run through
+  FFmpeg as SRT instead of failing deep inside the player. If subtitles
+  still don't show up, open the file in a plain text editor and check that
+  it actually starts with `WEBVTT`.
 
 ## CI/CD
 
@@ -213,7 +351,7 @@ Every push and pull request runs through
 ## Acknowledgments
 
 - [FFmpeg](https://ffmpeg.org/) via [ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm)
-- [hls.js](https://github.com/video-dev/hls.js) for in-browser playback
+- [Shaka Player](https://github.com/shaka-project/shaka-player) for in-browser HLS playback
 - [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen) for the Rust ⇄ JS bridge
 - [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker), vendored in
   `public/coi-serviceworker.js`, for cross-origin isolation on static hosts
