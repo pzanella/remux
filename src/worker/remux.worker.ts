@@ -7,8 +7,9 @@
  * FFmpeg.wasm first.
  */
 
-import type { WorkerCommand, WorkerEvent, ParseHeadersResult, SegmentInfoJs } from '../types';
+import type { WorkerCommand, WorkerEvent, ParseHeadersResult, SegmentInfoJs, AbrRendition } from '../types';
 import { isNativeContainer, ABR_LADDER } from '../types';
+import { parseCues, serializeVtt, shiftCues } from '../lib/vtt';
 
 // Registered before any async work, so a stalled Wasm/FFmpeg load or a Rust
 // panic always reaches the UI instead of hanging silently.
@@ -29,11 +30,11 @@ self.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
 // Both modules below are loaded lazily (only once START/RESUME arrives), so
 // the message listener goes live immediately instead of waiting on a
 // top-level await inside the Wasm glue file or the FFmpeg bundle.
-type WasmModule = typeof import('../wasm/remux_core.js');
+type WasmModule = typeof import('../../packages/remux-core/remux_core.js');
 let _wasmModule: WasmModule | null = null;
 async function loadWasm(): Promise<WasmModule> {
   if (!_wasmModule) {
-    _wasmModule = await import('../wasm/remux_core.js');
+    _wasmModule = await import('../../packages/remux-core/remux_core.js');
   }
   return _wasmModule;
 }
@@ -186,6 +187,13 @@ async function encodeRendition(
   sourceHeight: number,
   signal: AbortSignal,
   onProgress: (progress: number) => void,
+  segmentPrefix: string = '',
+  // Set only when encoding a clip against another source's dimensions (an
+  // intro/outro clip matched to the main content) — `scale=-2:H` alone
+  // preserves *this* input's own aspect ratio, which is exactly wrong
+  // there: it needs to end up at these exact pixel dimensions, letterboxed
+  // or pillarboxed rather than stretched or cropped to get there.
+  letterboxTarget?: { width: number; height: number },
 ): Promise<RenditionResult> {
   const ffmpeg = new FFmpeg();
   ffmpeg.on('progress', ({ progress }) => onProgress(Math.min(Math.max(progress, 0), 1)));
@@ -193,13 +201,16 @@ async function encodeRendition(
   await ffmpeg.load({ coreURL, wasmURL }, { signal });
   await ffmpeg.writeFile(inputName, inputData.slice(), { signal });
 
-  const playlistName = `${rendition.label}.m3u8`;
-  const segmentPattern = `${rendition.label}_%04d.ts`;
+  const playlistName = `${segmentPrefix}${rendition.label}.m3u8`;
+  const segmentPattern = `${segmentPrefix}${rendition.label}_%04d.ts`;
+  const scaleFilter = letterboxTarget
+    ? `scale=${letterboxTarget.width}:${letterboxTarget.height}:force_original_aspect_ratio=decrease,pad=${letterboxTarget.width}:${letterboxTarget.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`
+    : `scale=-2:${rendition.height}`;
 
   await ffmpeg.exec(
     [
       '-i', inputName,
-      '-vf', `scale=-2:${rendition.height}`,
+      '-vf', scaleFilter,
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
       '-b:v', `${rendition.videoBitrateKbps}k`,
@@ -233,7 +244,7 @@ async function encodeRendition(
 
   ffmpeg.terminate();
 
-  const width = computeRenditionWidth(sourceWidth, sourceHeight, rendition.height);
+  const width = letterboxTarget ? letterboxTarget.width : computeRenditionWidth(sourceWidth, sourceHeight, rendition.height);
   return { rendition, playlist: playlistName, width, playlistText, segmentCount: segmentNames.length };
 }
 
@@ -265,45 +276,45 @@ async function encodeRendition(
  * effect here (same as the FFmpeg pre-conversion step). Cancel still works
  * mid-flight via an AbortSignal wired through every FFmpeg call.
  */
-async function runAbrTranscoding(
-  session: import('../types').TranscodingSession,
-  outputFolderHandle: FileSystemDirectoryHandle,
-): Promise<void> {
-  if (cancelled) {
-    log('Cancelled.');
-    return;
-  }
-
-  const heights = [...(session.abrHeights ?? [])].sort((a, b) => a - b);
-  if (heights.length === 0) {
-    post({ type: 'ERROR', error: 'No renditions selected for the adaptive playlist.' });
-    return;
-  }
-
-  const renditions = heights
-    .map((h) => ABR_LADDER.find((r) => r.height === h))
-    .filter((r): r is (typeof ABR_LADDER)[number] => r !== undefined);
-  const renditionLabels = renditions.map((r) => r.label).join(', ');
-
-  log('Loading source file…');
-  const { FFmpeg } = await loadFFmpegModule();
+/** Loads one OPFS-resident source's bytes for FFmpeg, keyed off its own
+ * filename for the input extension — used for the main file and, when
+ * present, intro/outro clips alike. */
+async function loadFFmpegInput(
+  opfsRoot: FileSystemDirectoryHandle,
+  opfsFileName: string,
+): Promise<{ data: Uint8Array; inputName: string }> {
   const { fetchFile } = await import('@ffmpeg/util');
-  const { coreURL, wasmURL } = await fetchFFmpegCoreBlobs();
+  const handle = await opfsRoot.getFileHandle(opfsFileName);
+  const file: File = await handle.getFile();
+  const data = (await fetchFile(file)) as Uint8Array;
+  const ext = opfsFileName.includes('.') ? opfsFileName.slice(opfsFileName.lastIndexOf('.')) : '.video';
+  return { data, inputName: `input${ext}` };
+}
 
-  const opfsRoot = await navigator.storage.getDirectory();
-  const srcHandle = await opfsRoot.getFileHandle(session.sourceFilePath);
-  const srcFile: File = await srcHandle.getFile();
-  const inputData = (await fetchFile(srcFile)) as Uint8Array;
-
-  const ext = session.sourceFileName.includes('.')
-    ? session.sourceFileName.slice(session.sourceFileName.lastIndexOf('.'))
-    : '.video';
-  const inputName = `input${ext}`;
-
-  const sourceWidth = session.sourceWidth ?? 0;
-  const sourceHeight = session.sourceHeight ?? 0;
-
-  log(`Encoding ${renditions.length} rendition${renditions.length > 1 ? 's' : ''} in parallel: ${renditionLabels}…`);
+/** Encodes every selected rendition for one source clip in parallel FFmpeg
+ * instances — the FFmpeg counterpart of `runAbrEncodeForSource` above, used
+ * once for the main content and, when present, once each for intro/outro. */
+async function encodeRenditionsForSource(
+  FFmpeg: FFmpegModule['FFmpeg'],
+  coreURL: string,
+  wasmURL: string,
+  renditions: (typeof ABR_LADDER)[number][],
+  inputData: Uint8Array,
+  inputName: string,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  sourceWidth: number,
+  sourceHeight: number,
+  segmentPrefix: string,
+  logPrefix: string,
+  // Set when this call is encoding an intro/outro clip against the main
+  // content's own dimensions — see `encodeRendition`'s `letterboxTarget`.
+  // Left unset for the main content's own encode, which should keep using
+  // `scale=-2:H` (its own aspect ratio always matches itself, by
+  // definition — nothing to letterbox against).
+  mainDimensions?: { width: number; height: number },
+): Promise<RenditionResult[]> {
+  const renditionLabels = renditions.map((r) => r.label).join(', ');
+  log(`${logPrefix}Encoding ${renditions.length} rendition${renditions.length > 1 ? 's' : ''} in parallel: ${renditionLabels}…`);
 
   abrAbortController = new AbortController();
   const { signal } = abrAbortController;
@@ -313,15 +324,14 @@ async function runAbrTranscoding(
     const avg = progressByIndex.reduce((a, b) => a + b, 0) / renditions.length;
     post({
       type: 'CONVERTING',
-      log: `Encoding ${renditionLabels}… ${Math.round(avg * 100)}%`,
+      log: `${logPrefix}Encoding ${renditionLabels}… ${Math.round(avg * 100)}%`,
       convertProgress: Math.min(Math.round(avg * 100), 99),
       renditionLabel: renditionLabels,
     });
   }, 500);
 
-  let results: RenditionResult[];
   try {
-    results = await Promise.all(
+    return await Promise.all(
       renditions.map((rendition, idx) =>
         encodeRendition(
           FFmpeg,
@@ -337,12 +347,77 @@ async function runAbrTranscoding(
           (progress) => {
             progressByIndex[idx] = progress;
           },
+          segmentPrefix,
+          mainDimensions
+            ? { width: computeRenditionWidth(mainDimensions.width, mainDimensions.height, rendition.height), height: rendition.height }
+            : undefined,
         ),
       ),
     );
-  } catch (err) {
+  } finally {
     clearInterval(progressTimer);
     abrAbortController = null;
+  }
+}
+
+async function runAbrTranscoding(
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  subtitleTag?: SubtitleTag,
+): Promise<void> {
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
+
+  const heights = [...(session.abrHeights ?? [])].sort((a, b) => a - b);
+  if (heights.length === 0) {
+    post({ type: 'ERROR', error: 'No renditions selected for the adaptive playlist.' });
+    return;
+  }
+
+  const renditions = heights
+    .map((h) => ABR_LADDER.find((r) => r.height === h))
+    .filter((r): r is (typeof ABR_LADDER)[number] => r !== undefined);
+
+  log('Loading source file…');
+  const { FFmpeg } = await loadFFmpegModule();
+  const { coreURL, wasmURL } = await fetchFFmpegCoreBlobs();
+  const opfsRoot = await navigator.storage.getDirectory();
+
+  const sourceWidth = session.sourceWidth ?? 0;
+  const sourceHeight = session.sourceHeight ?? 0;
+  const mainDimensions = { width: sourceWidth, height: sourceHeight };
+  const introName = session.introOutro?.introFileName;
+  const outroName = session.introOutro?.outroFileName;
+
+  let introResults: RenditionResult[] | null = null;
+  if (introName) {
+    try {
+      const { data, inputName } = await loadFFmpegInput(opfsRoot, introName);
+      introResults = await encodeRenditionsForSource(
+        FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, 'intro_', '[intro] ', mainDimensions,
+      );
+    } catch (err) {
+      if (cancelled) {
+        log('Cancelled.');
+        return;
+      }
+      log(`Could not encode the intro (${err}) — continuing without it.`, 'ERROR');
+    }
+  }
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
+
+  let mainResults: RenditionResult[];
+  try {
+    const { data, inputName } = await loadFFmpegInput(opfsRoot, session.sourceFilePath);
+    mainResults = await encodeRenditionsForSource(
+      FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, '', '',
+    );
+  } catch (err) {
     if (cancelled) {
       log('Cancelled.');
       return;
@@ -350,10 +425,32 @@ async function runAbrTranscoding(
     post({ type: 'ERROR', error: `Encoding failed: ${err}` });
     return;
   }
-  clearInterval(progressTimer);
-  abrAbortController = null;
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
 
-  for (const r of results) {
+  let outroResults: RenditionResult[] | null = null;
+  if (outroName) {
+    try {
+      const { data, inputName } = await loadFFmpegInput(opfsRoot, outroName);
+      outroResults = await encodeRenditionsForSource(
+        FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, 'outro_', '[outro] ', mainDimensions,
+      );
+    } catch (err) {
+      if (cancelled) {
+        log('Cancelled.');
+        return;
+      }
+      log(`Could not encode the outro (${err}) — continuing without it.`, 'ERROR');
+    }
+  }
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
+
+  for (const r of mainResults) {
     post({
       type: 'SEGMENT_DONE',
       log: `${r.rendition.label} done (${r.segmentCount} segments)`,
@@ -362,16 +459,18 @@ async function runAbrTranscoding(
     });
   }
 
-  const masterM3u8 = buildMasterM3U8(results.map((r) => ({ rendition: r.rendition, playlist: r.playlist, width: r.width })));
-  await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+  const toAbrSourceResults = (results: RenditionResult[] | null): AbrSourceResult[] | null =>
+    results && results.map((r) => ({ rendition: r.rendition, width: r.width, playlistText: r.playlistText }));
 
-  const highest = results[results.length - 1];
-  post({
-    type: 'COMPLETE',
-    log: 'Done! master.m3u8 is ready.',
-    m3u8: highest?.playlistText || masterM3u8,
-    masterM3u8,
-  });
+  const { masterM3u8, highestM3u8 } = await finalizeAbrResults(
+    outputFolderHandle,
+    toAbrSourceResults(mainResults) ?? [],
+    toAbrSourceResults(introResults),
+    toAbrSourceResults(outroResults),
+    subtitleTag,
+  );
+
+  post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
 }
 
 /** Standard 16:9 widths, used only when the source's real aspect ratio wasn't probed. */
@@ -384,16 +483,188 @@ function computeRenditionWidth(sourceWidth: number, sourceHeight: number, target
   return FALLBACK_WIDTH_BY_HEIGHT[targetHeight] ?? targetHeight;
 }
 
+/** Fits a `srcW x srcH` frame into a `dstW x dstH` box without changing its
+ * own aspect ratio — letterboxed (black bars top/bottom) or pillarboxed
+ * (black bars left/right) as needed, never stretched or cropped. Used to
+ * draw a decoded video frame onto a differently-shaped rendition canvas —
+ * matters whenever a source frame's own aspect ratio doesn't already match
+ * the canvas it's being drawn onto (main content never hits this in
+ * practice, since its own canvases are always sized from its own aspect
+ * ratio; an intro/outro clip with a different native aspect ratio than the
+ * main content routinely does). */
+function computeLetterboxRect(srcW: number, srcH: number, dstW: number, dstH: number): { x: number; y: number; w: number; h: number } {
+  if (srcW <= 0 || srcH <= 0) return { x: 0, y: 0, w: dstW, h: dstH };
+  const scale = Math.min(dstW / srcW, dstH / srcH);
+  const w = Math.max(2, Math.round((srcW * scale) / 2) * 2);
+  const h = Math.max(2, Math.round((srcH * scale) / 2) * 2);
+  return { x: Math.round((dstW - w) / 2), y: Math.round((dstH - h) / 2), w, h };
+}
+
 function buildMasterM3U8(
   streamInfos: { rendition: (typeof ABR_LADDER)[number]; playlist: string; width: number }[],
+  subtitleTag?: SubtitleTag,
 ): string {
   let m = '#EXTM3U\n#EXT-X-VERSION:3\n';
+  if (subtitleTag) m += buildSubtitleMediaTag(subtitleTag);
   for (const { rendition, playlist, width } of streamInfos) {
     const bandwidth = (rendition.videoBitrateKbps + rendition.audioBitrateKbps) * 1000;
-    m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${rendition.height}\n`;
+    const subsAttr = subtitleTag ? `,SUBTITLES="${SUBTITLES_GROUP_ID}"` : '';
+    m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${rendition.height}${subsAttr}\n`;
     m += `${playlist}\n`;
   }
   return m;
+}
+
+// ── Subtitles (optional sidecar WebVTT track) ───────────────────────
+//
+// HLS subtitles are a sidecar playlist referenced from the master/
+// multivariant playlist via #EXT-X-MEDIA, never muxed into the video/audio
+// segments themselves — so wiring them in never touches the Rust remuxer or
+// its fixed-PID MPEG-TS muxer, only the JS playlist-building layer here.
+
+const SUBTITLES_GROUP_ID = 'subs';
+const SUBTITLE_OUTPUT_FILENAME = 'subtitles.vtt';
+/** Per RFC 8216 §4.3.4.1, #EXT-X-MEDIA's URI for TYPE=SUBTITLES must point
+ * to a *Media Playlist*, not a raw WebVTT file directly — Shaka (and any
+ * spec-correct HLS player) fetches that URI expecting `#EXTM3U` as the
+ * first line, and errors (HLS_PLAYLIST_HEADER_MISSING) on raw VTT content.
+ * This wraps the single whole-file VTT in a one-segment VOD playlist, the
+ * standard pattern for "not actually segmented" WebVTT in HLS. */
+const SUBTITLE_PLAYLIST_FILENAME = 'subtitles.m3u8';
+
+interface SubtitleTag {
+  name: string;
+  /** BCP-47 code, e.g. "en", "it". Without this, HLS defaults the track's
+   * language to "und" (undetermined) — which is what made Shaka's UI show
+   * "Undetermined" in the subtitle menu instead of a real language name;
+   * the NAME attribute isn't what stock player UIs surface there. */
+  language: string;
+}
+
+function buildSubtitleMediaTag({ name, language }: SubtitleTag): string {
+  return `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="${SUBTITLES_GROUP_ID}",NAME="${name}",LANGUAGE="${language}",DEFAULT=YES,AUTOSELECT=YES,URI="${SUBTITLE_PLAYLIST_FILENAME}"\n`;
+}
+
+/** Writes the one-segment media playlist that wraps `subtitles.vtt` — see
+ * `SUBTITLE_PLAYLIST_FILENAME`'s comment for why this has to exist at all.
+ * `totalDurationSec` should be the *video's* total duration (main content
+ * plus any spliced intro/outro), not the VTT's own span: a WebVTT file
+ * with cues shorter or longer than the video is fine either way — cues
+ * keep their own internal timestamps regardless of this wrapper, and any
+ * past the video's end simply never get reached. */
+function buildSubtitlePlaylist(totalDurationSec: number): string {
+  const target = Math.max(1, Math.ceil(totalDurationSec));
+  return (
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:3\n' +
+    `#EXT-X-TARGETDURATION:${target}\n` +
+    '#EXT-X-MEDIA-SEQUENCE:0\n' +
+    '#EXT-X-PLAYLIST-TYPE:VOD\n' +
+    `#EXTINF:${totalDurationSec.toFixed(6)},\n` +
+    `${SUBTITLE_OUTPUT_FILENAME}\n` +
+    '#EXT-X-ENDLIST\n'
+  );
+}
+
+/** Sums every #EXTINF value in an already-built playlist — used to get the
+ * *actual* total duration (main content plus any spliced intro/outro) for
+ * the subtitle playlist wrapper, without threading a separate duration
+ * figure through every call site that can produce a final playlist. */
+function totalDurationFromPlaylist(playlistText: string): number {
+  let total = 0;
+  for (const match of playlistText.matchAll(/#EXTINF:([\d.]+)/g)) {
+    total += parseFloat(match[1]);
+  }
+  return total;
+}
+
+/**
+ * Reads the raw subtitle file the UI saved to OPFS, converts it to WebVTT
+ * with FFmpeg.wasm if it's SRT, and writes the result into the output
+ * folder. Returns the display label to use in #EXT-X-MEDIA, or undefined if
+ * there's no subtitle track or it couldn't be prepared — a subtitle problem
+ * degrades to "no subtitles" rather than failing the whole conversion.
+ */
+async function resolveSubtitleTrack(
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+): Promise<SubtitleTag | undefined> {
+  const track = session.subtitleTrack;
+  if (!track) return undefined;
+
+  try {
+    const opfsRoot = await navigator.storage.getDirectory();
+    const fileHandle = await opfsRoot.getFileHandle(track.fileName);
+    const file = await fileHandle.getFile();
+
+    // Trust content over filename: a mislabeled extension (real SRT saved
+    // as .vtt, a .vtt that's actually SRT-formatted, unusual encoding, ...)
+    // would otherwise sail through untouched and only fail later, deep
+    // inside Shaka's strict WebVTT parser (INVALID_TEXT_HEADER) — by which
+    // point there's no good way to recover. Sniffing the actual text and
+    // normalizing through FFmpeg whenever it doesn't already look like
+    // WebVTT catches all of those cases the same way, regardless of cause.
+    let vttText = await file.text();
+    // `File.text()` decodes as UTF-8 but doesn't strip a leading byte-order
+    // mark, so one — common from Windows-authored subtitle files — would
+    // otherwise sit right before "WEBVTT" and make the check below miss a
+    // file that's actually fine.
+    if (vttText.charCodeAt(0) === 0xfeff) vttText = vttText.slice(1);
+    const looksLikeWebVtt = /^WEBVTT($|[ \t\r\n])/.test(vttText);
+    if (!looksLikeWebVtt) {
+      // Not WebVTT-shaped and, per the catch block below, potentially not
+      // SRT-shaped either — logging what the browser actually decoded (as
+      // opposed to what the file is *named*) is the only way to tell
+      // "wrong format entirely" apart from "wrong text encoding" without
+      // access to the file itself.
+      const preview = JSON.stringify(vttText.slice(0, 150));
+      log(`Subtitle file doesn't look like WebVTT — first ~150 chars as decoded: ${preview}`);
+
+      // Feed FFmpeg the file as SRT regardless of its original extension:
+      // the content just failed a WebVTT-shaped check, and SRT is the only
+      // other format the file picker accepts — trusting the extension here
+      // is exactly the assumption that got us into this branch in the
+      // first place (e.g. asking FFmpeg to read genuinely SRT-formatted
+      // content as `sub.vtt` makes its WebVTT demuxer choke on SRT's
+      // comma-decimal timestamps instead of converting anything).
+      log('Normalizing subtitles to WebVTT…');
+      const { FFmpeg } = await loadFFmpegModule();
+      const ffmpeg = new FFmpeg();
+      // FFmpeg's own stderr is the only thing that can actually explain a
+      // conversion failure — without it, a failed exec just surfaces later
+      // as an opaque "file not found" from the readFile() below, when the
+      // real reason is whatever FFmpeg logged and discarded.
+      const ffmpegLog: string[] = [];
+      ffmpeg.on('log', ({ message }) => ffmpegLog.push(message));
+      try {
+        await loadFFmpegCore(ffmpeg);
+        await ffmpeg.writeFile('sub.srt', new Uint8Array(await file.arrayBuffer()));
+        await ffmpeg.exec(['-i', 'sub.srt', 'sub.vtt']);
+        vttText = (await ffmpeg.readFile('sub.vtt', 'utf8')) as string;
+      } catch (ffmpegErr) {
+        throw new Error(`FFmpeg could not read this as SRT either (${ffmpegErr}). FFmpeg said: ${ffmpegLog.slice(-6).join(' / ') || '(no output)'}`);
+      } finally {
+        ffmpeg.terminate();
+      }
+    }
+
+    // Cues are authored relative to the main content, same as the timeline
+    // editor shows them — but once an intro is spliced in front of it, the
+    // main content itself starts later in the final output, so every cue
+    // needs to shift forward by exactly that much or they'd play back
+    // during the intro instead of alongside the footage they were written
+    // for.
+    const introDuration = session.introOutro?.introDuration;
+    if (introDuration && introDuration > 0) {
+      vttText = serializeVtt(shiftCues(parseCues(vttText), introDuration));
+    }
+
+    await writeOutputFile(outputFolderHandle, SUBTITLE_OUTPUT_FILENAME, vttText);
+    return { name: track.label, language: track.language };
+  } catch (err) {
+    log(`Could not prepare subtitles (${err}) — continuing without them.`, 'ERROR');
+    return undefined;
+  }
 }
 
 // ── Adaptive HLS via WebCodecs (primary ABR path) ───────────────────
@@ -440,6 +711,11 @@ interface AbrPipelineContext {
   processor: InstanceType<WasmModule['HlsProcessor']>;
   audioSampleRate: number;
   audioChannels: number;
+  /** Namespaces segment/playlist filenames per source clip (e.g. `intro_`,
+   * `outro_`, or `''` for the main content) so intro/main/outro can be
+   * encoded independently and spliced together afterward without filename
+   * collisions. */
+  segmentPrefix: string;
 }
 
 interface RenditionSink {
@@ -577,7 +853,7 @@ function createRenditionSink(
     videoEncoder,
     audioEncoder,
     pipeline,
-    playlistName: `${rendition.label}.m3u8`,
+    playlistName: `${pipeline.segmentPrefix}${rendition.label}.m3u8`,
     segmentIndex: 0,
     segmentStartUs: 0,
     videoChunks: [],
@@ -649,27 +925,183 @@ async function writeRenditionSegment(sink: RenditionSink, cut: CutSegment, isFin
     sink.pipeline.audioChannels,
   ) as Uint8Array;
 
-  const segName = `${sink.rendition.label}_${String(sink.segmentIndex).padStart(4, '0')}.ts`;
+  const prefix = sink.pipeline.segmentPrefix;
+  const segName = `${prefix}${sink.rendition.label}_${String(sink.segmentIndex).padStart(4, '0')}.ts`;
   await writeOutputFile(sink.pipeline.outputFolderHandle, segName, tsBytes);
 
   sink.durations.push((cut.endUs - cut.startUs) / 1_000_000);
   sink.segmentIndex++;
 
-  const segmentName = (i: number) => `${sink.rendition.label}_${String(i).padStart(4, '0')}.ts`;
+  const segmentName = (i: number) => `${prefix}${sink.rendition.label}_${String(i).padStart(4, '0')}.ts`;
   const m3u8 = buildIntermediateM3U8(sink.durations, isFinal, segmentName);
   await writeOutputFile(sink.pipeline.outputFolderHandle, sink.playlistName, m3u8);
 }
 
+/** One source clip (intro, main, or outro) encoded across every selected
+ * rendition. `playlistText` is the final, complete variant playlist for
+ * this source+rendition alone — already written to
+ * `${segmentPrefix}${rendition.label}.m3u8`, and also returned so the
+ * caller can splice intro/main/outro together into the canonical
+ * `${rendition.label}.m3u8` afterward. */
+interface AbrSourceResult {
+  rendition: (typeof ABR_LADDER)[number];
+  width: number;
+  playlistText: string;
+}
+
+/** Keeps only the `#EXTINF`/segment-name pairs from a playlist, dropping its
+ * own header (`#EXTM3U`, `#EXT-X-TARGETDURATION`, ...) and footer
+ * (`#EXT-X-ENDLIST`) — the piece that's actually source-specific when
+ * splicing several playlists (WebCodecs- or FFmpeg-generated, both are
+ * plain text either way) into one. */
+function extractPlaylistBody(playlistText: string): string {
+  return playlistText
+    .split('\n')
+    .filter((line) => line.startsWith('#EXTINF') || (line.trim() !== '' && !line.startsWith('#')))
+    .join('\n');
+}
+
+/** Concatenates 1-3 already-complete variant playlists (intro/main/outro,
+ * in that order) for the *same* rendition into one, with an
+ * #EXT-X-DISCONTINUITY between each — the ABR counterpart of
+ * `buildSplicedM3U8`, which does the same thing for the fast path's
+ * duration-array-based playlists instead of pre-built playlist text. */
+function spliceM3U8Texts(playlistTexts: string[]): string {
+  const targetDuration = Math.max(
+    1,
+    ...playlistTexts.map((t) => parseInt(t.match(/#EXT-X-TARGETDURATION:(\d+)/)?.[1] ?? '0', 10)),
+  );
+  let m = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${targetDuration}\n#EXT-X-MEDIA-SEQUENCE:0\n`;
+  playlistTexts.forEach((text, i) => {
+    if (i > 0) m += '#EXT-X-DISCONTINUITY\n';
+    const body = extractPlaylistBody(text);
+    if (body) m += `${body}\n`;
+  });
+  m += '#EXT-X-ENDLIST\n';
+  return m;
+}
+
+/**
+ * Splices intro/outro onto every produced rendition (matched by height) and
+ * writes the combined result to each rendition's canonical
+ * `${label}.m3u8` — the same filename `buildMasterM3U8` already points
+ * to, so the master playlist needs no special-casing for intro/outro.
+ * A rendition missing from `introResults`/`outroResults` (that clip failed
+ * for just that rendition, or wasn't requested at all) simply splices
+ * without it rather than failing the whole rendition.
+ */
+async function finalizeAbrResults(
+  outputFolderHandle: FileSystemDirectoryHandle,
+  mainResults: AbrSourceResult[],
+  introResults: AbrSourceResult[] | null,
+  outroResults: AbrSourceResult[] | null,
+  subtitleTag: SubtitleTag | undefined,
+): Promise<{ masterM3u8: string; highestM3u8: string }> {
+  if (mainResults.length === 0) {
+    throw new Error('No rendition produced any output.');
+  }
+
+  const streamInfos: { rendition: (typeof ABR_LADDER)[number]; playlist: string; width: number }[] = [];
+  let highestM3u8 = '';
+
+  for (const main of mainResults) {
+    const intro = introResults?.find((r) => r.rendition.height === main.rendition.height);
+    const outro = outroResults?.find((r) => r.rendition.height === main.rendition.height);
+    const texts = [intro?.playlistText, main.playlistText, outro?.playlistText].filter(
+      (t): t is string => t !== undefined,
+    );
+
+    const spliced = texts.length > 1 ? spliceM3U8Texts(texts) : main.playlistText;
+    const playlistName = `${main.rendition.label}.m3u8`;
+    await writeOutputFile(outputFolderHandle, playlistName, spliced);
+    streamInfos.push({ rendition: main.rendition, playlist: playlistName, width: main.width });
+    highestM3u8 = spliced;
+
+    // The intro/outro clips' own standalone playlists (e.g.
+    // `intro_240p.m3u8`) were only ever a byproduct of encoding them with
+    // the same per-source machinery as the main content — nothing
+    // references them once their segments are folded into the spliced
+    // playlist above, so clean them up rather than leave dead files
+    // sitting in the output.
+    if (intro) await removeOutputFileQuietly(outputFolderHandle, `intro_${main.rendition.label}.m3u8`);
+    if (outro) await removeOutputFileQuietly(outputFolderHandle, `outro_${main.rendition.label}.m3u8`);
+  }
+
+  if (subtitleTag) {
+    const totalDuration = totalDurationFromPlaylist(highestM3u8);
+    await writeOutputFile(outputFolderHandle, SUBTITLE_PLAYLIST_FILENAME, buildSubtitlePlaylist(totalDuration));
+  }
+
+  const masterM3u8 = buildMasterM3U8(streamInfos, subtitleTag);
+  await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+
+  return { masterM3u8, highestM3u8 };
+}
+
+/** Adaptive-HLS hardware entry point: encodes the main content across every
+ * selected rendition and, when present, intro/outro clips too (each
+ * independently — see `runAbrEncodeForSource`), then splices them together
+ * per rendition. An intro/outro that fails to encode is logged and skipped
+ * rather than failing the whole job, matching how a single broken
+ * rendition is already handled inside `runAbrWebCodecsWithHandle`. */
 async function runAbrTranscodingWebCodecs(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
   renditions: (typeof ABR_LADDER)[number][],
+  subtitleTag?: SubtitleTag,
 ): Promise<void> {
+  const sourceWidth = session.sourceWidth ?? 0;
+  const sourceHeight = session.sourceHeight ?? 0;
+  const introName = session.introOutro?.introFileName;
+  const outroName = session.introOutro?.outroFileName;
+
+  let introResults: AbrSourceResult[] | null = null;
+  if (introName) {
+    try {
+      introResults = await runAbrEncodeForSource(introName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'intro_');
+    } catch (err) {
+      if (cancelled) return;
+      log(`Could not encode the intro (${err}) — continuing without it.`, 'ERROR');
+    }
+  }
+  if (cancelled) return;
+
+  const mainResults = await runAbrEncodeForSource(session.sourceFilePath, outputFolderHandle, renditions, sourceWidth, sourceHeight, '');
+  if (cancelled) return;
+
+  let outroResults: AbrSourceResult[] | null = null;
+  if (outroName) {
+    try {
+      outroResults = await runAbrEncodeForSource(outroName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'outro_');
+    } catch (err) {
+      if (cancelled) return;
+      log(`Could not encode the outro (${err}) — continuing without it.`, 'ERROR');
+    }
+  }
+  if (cancelled) return;
+
+  const { masterM3u8, highestM3u8 } = await finalizeAbrResults(outputFolderHandle, mainResults, introResults, outroResults, subtitleTag);
+  post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
+}
+
+/** Runs the hardware WebCodecs ABR pipeline for one OPFS-resident source
+ * clip. Used for the main content (`segmentPrefix: ''`) and, when present,
+ * for intro/outro clips (`segmentPrefix: 'intro_'`/`'outro_'`) — each call
+ * is fully independent, so one clip's trouble can be caught and skipped by
+ * the caller without affecting the others. */
+async function runAbrEncodeForSource(
+  opfsFileName: string,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  renditions: (typeof ABR_LADDER)[number][],
+  sourceWidth: number,
+  sourceHeight: number,
+  segmentPrefix: string,
+): Promise<AbrSourceResult[]> {
   const opfsRoot = await navigator.storage.getDirectory();
-  const fileHandle = await opfsRoot.getFileHandle(session.sourceFilePath);
+  const fileHandle = await opfsRoot.getFileHandle(opfsFileName);
   const syncHandle = await fileHandle.createSyncAccessHandle();
   try {
-    await runAbrWebCodecsWithHandle(syncHandle, session, outputFolderHandle, renditions);
+    return await runAbrWebCodecsWithHandle(syncHandle, outputFolderHandle, renditions, sourceWidth, sourceHeight, segmentPrefix);
   } finally {
     syncHandle.close();
   }
@@ -677,12 +1109,15 @@ async function runAbrTranscodingWebCodecs(
 
 async function runAbrWebCodecsWithHandle(
   syncHandle: FileSystemSyncAccessHandle,
-  session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
   renditions: (typeof ABR_LADDER)[number][],
-): Promise<void> {
+  sourceWidth: number,
+  sourceHeight: number,
+  segmentPrefix: string,
+): Promise<AbrSourceResult[]> {
   const renditionLabels = renditions.map((r) => r.label).join(', ');
-  log(`Encoding ${renditions.length} rendition${renditions.length > 1 ? 's' : ''} with hardware acceleration: ${renditionLabels}…`);
+  const logPrefix = segmentPrefix ? `[${segmentPrefix.replace(/_$/, '')}] ` : '';
+  log(`${logPrefix}Encoding ${renditions.length} rendition${renditions.length > 1 ? 's' : ''} with hardware acceleration: ${renditionLabels}…`);
 
   const fileSize = syncHandle.getSize();
   const HEADER_READ = Math.min(32 * 1024 * 1024, fileSize);
@@ -725,10 +1160,9 @@ async function runAbrWebCodecsWithHandle(
     processor,
     audioSampleRate: codecConfig.audioSampleRate,
     audioChannels: codecConfig.audioChannels,
+    segmentPrefix,
   };
 
-  const sourceWidth = session.sourceWidth ?? 0;
-  const sourceHeight = session.sourceHeight ?? 0;
   const sinks = renditions.map((r) =>
     createRenditionSink(r, computeRenditionWidth(sourceWidth, sourceHeight, r.height), pipeline),
   );
@@ -806,7 +1240,14 @@ async function runAbrWebCodecsWithHandle(
     if (forceKey) nextForceKeyframeUs = frame.timestamp + ABR_SEGMENT_TARGET_SEC * 1_000_000;
 
     const scaled = sinks.map((sink) => {
-      sink.ctx.drawImage(frame, 0, 0, sink.width, sink.rendition.height);
+      // Black-fill first: the letterbox/pillarbox rect below only covers
+      // part of the canvas whenever the frame's own aspect ratio doesn't
+      // exactly match this sink's — the rest needs to stay black, not
+      // whatever pixels a previous frame left behind.
+      sink.ctx.fillStyle = 'black';
+      sink.ctx.fillRect(0, 0, sink.width, sink.rendition.height);
+      const rect = computeLetterboxRect(frame.displayWidth, frame.displayHeight, sink.width, sink.rendition.height);
+      sink.ctx.drawImage(frame, rect.x, rect.y, rect.w, rect.h);
       return new VideoFrame(sink.canvas, { timestamp: frame.timestamp, duration: frame.duration ?? undefined });
     });
     frame.close();
@@ -920,7 +1361,7 @@ async function runAbrWebCodecsWithHandle(
 
         if (videoIdx % 15 === 0 && totalDurationSec > 0) {
           const pct = Math.min(Math.round((s.dts / videoTimescale / totalDurationSec) * 85), 85);
-          post({ type: 'CONVERTING', log: `Decoding and encoding… ${pct}%`, convertProgress: pct, renditionLabel: renditionLabels });
+          post({ type: 'CONVERTING', log: `${logPrefix}Decoding and encoding… ${pct}%`, convertProgress: pct, renditionLabel: renditionLabels });
         }
         videoIdx++;
       } else {
@@ -943,7 +1384,7 @@ async function runAbrWebCodecsWithHandle(
 
     if (cancelled) {
       log('Cancelled.');
-      return;
+      return [];
     }
     // Not checking `decodeFailed` here on purpose: it's set asynchronously by
     // the decoder's `error` callback, and `decode()` doesn't wait for that,
@@ -969,7 +1410,7 @@ async function runAbrWebCodecsWithHandle(
     } catch (err) {
       if (cancelled) {
         log('Cancelled.');
-        return;
+        return [];
       }
       if (!isNearEndOfVideo()) throw decodeFailed ?? err;
       log(
@@ -995,7 +1436,7 @@ async function runAbrWebCodecsWithHandle(
       decodeFailed = null;
     }
 
-    post({ type: 'CONVERTING', log: 'Finalizing renditions…', convertProgress: 90, renditionLabel: renditionLabels });
+    post({ type: 'CONVERTING', log: `${logPrefix}Finalizing renditions…`, convertProgress: 90, renditionLabel: renditionLabels });
 
     // Every sample has already been submitted for encoding by this point —
     // flush() just drains whatever's still queued per rendition. A rejection
@@ -1037,26 +1478,15 @@ async function runAbrWebCodecsWithHandle(
     // A rendition that failed early enough to produce zero segments (rare —
     // the tolerance above is for trouble on the last stretch of an
     // otherwise-successful run) has no `.m3u8` file to point to, so it's
-    // left out of the master playlist rather than referencing a file that
-    // doesn't exist.
+    // left out of the results the caller splices/builds a master from,
+    // rather than referencing a file that doesn't exist.
     const producedSinks = sinks.filter((s) => s.durations.length > 0);
-    if (producedSinks.length === 0) {
-      throw new Error('No rendition produced any output.');
-    }
 
-    const masterM3u8 = buildMasterM3U8(
-      producedSinks.map((s) => ({ rendition: s.rendition, playlist: s.playlistName, width: s.width })),
-    );
-    await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
-
-    const highest = producedSinks[producedSinks.length - 1];
-    const highestM3u8 = buildIntermediateM3U8(
-      highest.durations,
-      true,
-      (i) => `${highest.rendition.label}_${String(i).padStart(4, '0')}.ts`,
-    );
-
-    post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
+    return producedSinks.map((s) => ({
+      rendition: s.rendition,
+      width: s.width,
+      playlistText: buildIntermediateM3U8(s.durations, true, (i) => `${segmentPrefix}${s.rendition.label}_${String(i).padStart(4, '0')}.ts`),
+    }));
   } finally {
     closeQuietly(videoDecoder);
     closeQuietly(audioDecoder);
@@ -1075,6 +1505,7 @@ async function runAbrWebCodecsWithHandle(
 async function runAdaptiveHls(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
+  subtitleTag?: SubtitleTag,
 ): Promise<void> {
   const heights = [...(session.abrHeights ?? [])].sort((a, b) => a - b);
   if (heights.length === 0) {
@@ -1089,7 +1520,7 @@ async function runAdaptiveHls(
 
   if (canUseHardware) {
     try {
-      await runAbrTranscodingWebCodecs(session, outputFolderHandle, renditions);
+      await runAbrTranscodingWebCodecs(session, outputFolderHandle, renditions, subtitleTag);
       return;
     } catch (err) {
       if (cancelled) {
@@ -1102,7 +1533,7 @@ async function runAdaptiveHls(
     log('Hardware-accelerated encoding is not available here — using FFmpeg instead.');
   }
 
-  await runAbrTranscoding(session, outputFolderHandle);
+  await runAbrTranscoding(session, outputFolderHandle, subtitleTag);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -1152,6 +1583,14 @@ async function writeOutputFile(
   await writable.close();
 }
 
+async function removeOutputFileQuietly(dirHandle: FileSystemDirectoryHandle, filename: string): Promise<void> {
+  try {
+    await dirHandle.removeEntry(filename);
+  } catch {
+    // Never existed, or already gone — fine either way.
+  }
+}
+
 // ── Message handling ─────────────────────────────────────────────
 
 let paused = false;
@@ -1190,8 +1629,10 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
+  const subtitleTag = await resolveSubtitleTrack(session, outputFolderHandle);
+
   if (session.abrHeights && session.abrHeights.length > 0) {
-    await runAdaptiveHls(session, outputFolderHandle);
+    await runAdaptiveHls(session, outputFolderHandle, subtitleTag);
     return;
   }
 
@@ -1235,7 +1676,7 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
   }
 
   try {
-    await runWithHandle(syncHandle, effectiveSession, outputFolderHandle, cmd.type === 'RESUME');
+    await runWithHandle(syncHandle, effectiveSession, outputFolderHandle, cmd.type === 'RESUME', subtitleTag);
   } finally {
     syncHandle.close();
   }
@@ -1246,6 +1687,7 @@ async function runWithHandle(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
   isResume: boolean,
+  subtitleTag?: SubtitleTag,
 ): Promise<void> {
   const fileSize = syncHandle.getSize();
   log(`File size: ${(fileSize / 1024 / 1024).toFixed(1)} MiB`);
@@ -1284,6 +1726,7 @@ async function runWithHandle(
   const startIndex = isResume ? Math.max(0, session.lastSegmentIndex + 1) : 0;
   const durations = isResume ? [...session.segmentDurations] : [];
   let retryCount = 0;
+  let totalBytes = 0;
 
   for (let i = startIndex; i < segmentCount; i++) {
     while (paused && !cancelled) {
@@ -1340,6 +1783,7 @@ async function runWithHandle(
 
     log(`Segment ${i + 1} saved (${(tsBytes.byteLength / 1024).toFixed(0)} KiB)`);
     durations[i] = seg.durationSec;
+    totalBytes += tsBytes.byteLength;
 
     const intermediateDurations = durations.slice(0, i + 1).filter((d) => d !== undefined);
     const m3u8 = buildIntermediateM3U8(intermediateDurations, i === segmentCount - 1);
@@ -1361,16 +1805,225 @@ async function runWithHandle(
   }
 
   const finalDurations = durations.filter((d) => d !== undefined);
-  const finalM3u8 = processor.generate_m3u8(JSON.stringify(finalDurations));
-  await writeOutputFile(outputFolderHandle, 'index.m3u8', finalM3u8);
+  let outputM3u8 = processor.generate_m3u8(JSON.stringify(finalDurations));
+  await writeOutputFile(outputFolderHandle, 'index.m3u8', outputM3u8);
+
+  // Intro/outro splicing: each clip is remuxed (or, if it doesn't match the
+  // main content's dimensions, letterboxed to match) through its own
+  // HlsProcessor instance, then stitched into a single index.m3u8 — see
+  // spliceIntroOutro's comment for why the same-dimensions case needs no
+  // muxer changes at all.
+  if (session.introOutro?.introFileName || session.introOutro?.outroFileName) {
+    outputM3u8 = await spliceIntroOutro(session, outputFolderHandle, outputM3u8);
+    await writeOutputFile(outputFolderHandle, 'index.m3u8', outputM3u8);
+  }
+
+  // The fast path has no ladder of renditions, so — unlike the ABR paths —
+  // it normally never needs a master playlist. #EXT-X-MEDIA only has
+  // meaning inside one, though, so a subtitle track forces a minimal,
+  // single-variant master.m3u8 into existence here.
+  let masterM3u8: string | undefined;
+  if (subtitleTag) {
+    // Derived from the *final* playlist (post intro/outro splicing, if any)
+    // rather than summing `finalDurations` directly, so both the subtitle
+    // wrapper and the bandwidth estimate below account for spliced-on
+    // intro/outro duration too, not just the main content's.
+    const totalDuration = totalDurationFromPlaylist(outputM3u8);
+    await writeOutputFile(outputFolderHandle, SUBTITLE_PLAYLIST_FILENAME, buildSubtitlePlaylist(totalDuration));
+
+    const bandwidth = totalDuration > 0 ? Math.round((totalBytes * 8) / totalDuration) : 1_000_000;
+    masterM3u8 = buildFastPathMasterM3U8(subtitleTag, bandwidth, session.sourceWidth, session.sourceHeight);
+    await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+  }
 
   post({
     type: 'COMPLETE',
     totalSegments: segmentCount,
-    log: 'Done! index.m3u8 is ready.',
-    m3u8: finalM3u8,
+    log: masterM3u8 ? 'Done! master.m3u8 is ready.' : 'Done! index.m3u8 is ready.',
+    m3u8: outputM3u8,
+    masterM3u8,
     sessionId: session.id,
   });
+}
+
+function buildFastPathMasterM3U8(subtitleTag: SubtitleTag, bandwidth: number, width?: number, height?: number): string {
+  let m = '#EXTM3U\n#EXT-X-VERSION:3\n';
+  m += buildSubtitleMediaTag(subtitleTag);
+  const resAttr = width && height ? `,RESOLUTION=${width}x${height}` : '';
+  m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth}${resAttr},SUBTITLES="${SUBTITLES_GROUP_ID}"\n`;
+  m += 'index.m3u8\n';
+  return m;
+}
+
+// ── Intro/outro splicing (fast path) ────────────────────────────────
+//
+// Every Remux-produced MPEG-TS segment uses the same fixed PID layout
+// (VID_PID=0x0100, AUD_PID=0x0101 — see mux_segment in wasm/src/lib.rs), so
+// segments from two separate fast-path remux runs are already compatible
+// for splicing whenever they share the same frame dimensions: no need for
+// a more general multi-source muxer, just reuse HlsProcessor once per clip
+// and concatenate the resulting playlists with spliceM3U8Texts. When a
+// clip's own dimensions *don't* match the main content's, byte-copying it
+// as-is would splice differently-sized segments into one variant — so it's
+// re-encoded and letterboxed to match instead, via the same single-source
+// WebCodecs/FFmpeg pipeline the ABR paths already use, just for one
+// ad-hoc rendition sized to match main exactly rather than a ladder rung.
+
+/** A one-off "rendition" matching the main content's own resolution —
+ * reuses the ABR encode pipeline to letterbox/pillarbox an intro/outro
+ * clip into that exact size, without it needing to be an actual ladder
+ * rung. Bitrate is generous (bumpers are short; quality matters more than
+ * file size here) and floored well above the 96kbps WebCodecs AAC floor
+ * documented on ABR_LADDER. */
+function matchMainRendition(mainHeight: number): AbrRendition {
+  return {
+    height: mainHeight,
+    label: 'main',
+    videoBitrateKbps: Math.max(1200, Math.round(mainHeight * 6)),
+    audioBitrateKbps: 128,
+  };
+}
+
+/** Re-encodes one auxiliary clip to match the main content's exact
+ * dimensions (letterboxed/pillarboxed, never stretched or cropped),
+ * returning its final playlist text. Tries hardware WebCodecs first, falls
+ * back to FFmpeg — the same fallback relationship `runAdaptiveHls` uses for
+ * whole ABR jobs, just for this one clip. */
+async function encodeAuxiliaryClipMatchingMain(
+  opfsFileName: string,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  mainWidth: number,
+  mainHeight: number,
+  segmentPrefix: string,
+): Promise<string> {
+  const rendition = matchMainRendition(mainHeight);
+
+  if (await canUseWebCodecsAbr([rendition], mainWidth, mainHeight)) {
+    try {
+      const results = await runAbrEncodeForSource(opfsFileName, outputFolderHandle, [rendition], mainWidth, mainHeight, segmentPrefix);
+      if (results.length > 0) return results[0].playlistText;
+      log(`${segmentPrefix}: hardware letterboxing produced no output, falling back to FFmpeg…`, 'ERROR');
+    } catch (err) {
+      log(`${segmentPrefix}: hardware letterboxing failed (${err}), falling back to FFmpeg…`, 'ERROR');
+    }
+  }
+
+  const { FFmpeg } = await loadFFmpegModule();
+  const { coreURL, wasmURL } = await fetchFFmpegCoreBlobs();
+  const opfsRoot = await navigator.storage.getDirectory();
+  const { data, inputName } = await loadFFmpegInput(opfsRoot, opfsFileName);
+  const results = await encodeRenditionsForSource(
+    FFmpeg, coreURL, wasmURL, [rendition], data, inputName, outputFolderHandle, mainWidth, mainHeight, segmentPrefix, '',
+    { width: mainWidth, height: mainHeight },
+  );
+  return results[0].playlistText;
+}
+
+/** Produces a spliceable playlist for one intro/outro clip: byte-copied
+ * as-is when its dimensions already match the main content's (or aren't
+ * known — nothing to compare against), re-encoded and letterboxed to match
+ * otherwise. */
+async function prepareAuxiliaryClip(
+  label: 'intro' | 'outro',
+  opfsFileName: string,
+  segmentPrefix: string,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  clipWidth: number | undefined,
+  clipHeight: number | undefined,
+  mainWidth: number | undefined,
+  mainHeight: number | undefined,
+): Promise<string> {
+  const matchesMain = clipWidth && clipHeight && mainWidth && mainHeight && clipWidth === mainWidth && clipHeight === mainHeight;
+
+  if (matchesMain || !clipWidth || !clipHeight || !mainWidth || !mainHeight) {
+    return remuxAuxiliaryClip(opfsFileName, segmentPrefix, outputFolderHandle);
+  }
+
+  log(`${label} is ${clipWidth}x${clipHeight}, main content is ${mainWidth}x${mainHeight} — letterboxing to match…`);
+  const playlistText = await encodeAuxiliaryClipMatchingMain(opfsFileName, outputFolderHandle, mainWidth, mainHeight, segmentPrefix);
+  // The single-rendition encode above wrote its own intermediate playlist
+  // (e.g. `intro_main.m3u8`) as a byproduct — nothing references it once
+  // its segments are folded into the spliced index.m3u8, same as the ABR
+  // path's per-rendition cleanup.
+  await removeOutputFileQuietly(outputFolderHandle, `${segmentPrefix}main.m3u8`);
+  return playlistText;
+}
+
+/** Remuxes one auxiliary clip (intro or outro) with its own HlsProcessor
+ * instance — a byte-for-byte copy, same as the fast path's main content —
+ * writing `${segmentPrefix}NNNN.ts` files, and returns its final playlist
+ * text. Only used when the clip's own dimensions already match the main
+ * content's (or aren't known); see `prepareAuxiliaryClip`. */
+async function remuxAuxiliaryClip(
+  opfsFileName: string,
+  segmentPrefix: string,
+  outputFolderHandle: FileSystemDirectoryHandle,
+): Promise<string> {
+  const opfsRoot = await navigator.storage.getDirectory();
+  const fileHandle = await opfsRoot.getFileHandle(opfsFileName);
+  const syncHandle = await fileHandle.createSyncAccessHandle();
+
+  try {
+    const fileSize = syncHandle.getSize();
+    const HEADER_READ = Math.min(32 * 1024 * 1024, fileSize);
+    const headerBuf = readAt(syncHandle, 0, HEADER_READ);
+
+    const { HlsProcessor } = await loadWasm();
+    const processor = new HlsProcessor();
+    processor.set_target_duration(6.0);
+
+    let parseResult: ParseHeadersResult;
+    try {
+      parseResult = JSON.parse(processor.parse_headers(headerBuf) as unknown as string) as ParseHeadersResult;
+    } catch {
+      const tailOffset = Math.max(0, fileSize - 32 * 1024 * 1024);
+      const tailBuf = readAt(syncHandle, tailOffset, fileSize - tailOffset);
+      parseResult = JSON.parse(processor.parse_headers(tailBuf) as unknown as string) as ParseHeadersResult;
+    }
+
+    const segmentName = (i: number) => `${segmentPrefix}${String(i).padStart(4, '0')}.ts`;
+    const durations: number[] = [];
+    for (let i = 0; i < parseResult.segmentCount; i++) {
+      const seg = parseResult.segments[i];
+      const videoData = readSamples(syncHandle, seg.videoSamples);
+      const audioData = readSamples(syncHandle, seg.audioSamples);
+      const tsBytes = processor.mux_segment(videoData, audioData, i) as Uint8Array;
+      await writeOutputFile(outputFolderHandle, segmentName(i), tsBytes);
+      durations.push(seg.durationSec);
+    }
+    return buildIntermediateM3U8(durations, true, segmentName);
+  } finally {
+    syncHandle.close();
+  }
+}
+
+async function spliceIntroOutro(
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  mainPlaylistText: string,
+): Promise<string> {
+  const io = session.introOutro;
+  const mainWidth = session.sourceWidth;
+  const mainHeight = session.sourceHeight;
+  const texts: string[] = [];
+
+  if (io?.introFileName) {
+    log('Adding intro…');
+    texts.push(
+      await prepareAuxiliaryClip('intro', io.introFileName, 'intro_', outputFolderHandle, io.introWidth, io.introHeight, mainWidth, mainHeight),
+    );
+  }
+
+  texts.push(mainPlaylistText);
+
+  if (io?.outroFileName) {
+    log('Adding outro…');
+    texts.push(
+      await prepareAuxiliaryClip('outro', io.outroFileName, 'outro_', outputFolderHandle, io.outroWidth, io.outroHeight, mainWidth, mainHeight),
+    );
+  }
+
+  return spliceM3U8Texts(texts);
 }
 
 function sleep(ms: number): Promise<void> {

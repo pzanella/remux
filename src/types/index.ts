@@ -26,12 +26,44 @@ export interface TranscodingSession {
    * restart begins the whole job over.
    */
   abrHeights?: number[];
+  /**
+   * Optional sidecar subtitle track (WebVTT, or SRT converted to WebVTT by
+   * the worker). `fileName` is the OPFS filename of the raw uploaded file.
+   * When set, the worker always emits a master.m3u8 — even on the fast
+   * path, which otherwise has none — since #EXT-X-MEDIA only has meaning
+   * inside a multivariant playlist.
+   */
+  subtitleTrack?: { fileName: string; label: string; language: string };
+  /**
+   * Optional intro/outro clips (OPFS filenames of native MP4/MOV files),
+   * spliced onto the start/end of the output — on the fast path directly,
+   * and on ABR jobs once per selected rendition. When a clip's own probed
+   * dimensions (`introWidth`/`introHeight`, `outroWidth`/`outroHeight`)
+   * don't match the main content's, it's letterboxed/pillarboxed to match
+   * rather than spliced in at a different resolution or stretched — see
+   * `computeLetterboxRect` in the worker.
+   */
+  introOutro?: {
+    introFileName?: string;
+    introWidth?: number;
+    introHeight?: number;
+    /** Seconds, probed client-side — used to shift subtitle cue timestamps
+     * (authored relative to the main content) forward so they still land
+     * on the right moment once an intro is spliced in front of it. */
+    introDuration?: number;
+    outroFileName?: string;
+    outroWidth?: number;
+    outroHeight?: number;
+  };
 }
 
 // ── Adaptive bitrate (multi-resolution) ────────────────────────────
 
 export interface AbrRendition {
-  height: 240 | 360 | 480 | 720;
+  /** A literal 240/360/480/720 for the ladder rungs below, but widened to
+   * `number` so an intro/outro mismatch fix can also build a one-off
+   * rendition matching the main content's own (arbitrary) height. */
+  height: number;
   label: string;
   /** Encoder target width when scaling, kept even via ffmpeg's scale=-2:h. */
   videoBitrateKbps: number;

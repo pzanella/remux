@@ -85,7 +85,7 @@ body {
   min-height: 100vh;
   display: flex;
   justify-content: center;
-  padding: 1.75rem 1.25rem;
+  padding: 1.25rem;
 }
 
 .app-inner {
@@ -93,7 +93,7 @@ body {
   max-width: 1180px;
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 0.9rem;
 }
 
 .app-header {
@@ -101,16 +101,18 @@ body {
   align-items: baseline;
   justify-content: space-between;
   gap: 1rem;
-  padding-bottom: 1rem;
+  padding-bottom: 0.75rem;
   border-bottom: 1px solid var(--line);
 }
 
-/* ── Body grid: a narrow rail of controls next to the preview stage,
-   so the whole workflow fits on one screen without scrolling. ── */
+/* ── Body grid: a narrow rail of controls next to the preview stage, sized
+   so the editor (rail + stage + timeline) fits above the fold on a typical
+   desktop viewport without scrolling — the log/playlist panel below stays
+   collapsed by default for the same reason (see .panel--activity). ── */
 .app-body {
   display: grid;
-  grid-template-columns: 300px 1fr;
-  gap: 1.25rem;
+  grid-template-columns: 280px 1fr;
+  gap: 0.9rem;
   align-items: start;
 }
 @media (max-width: 860px) {
@@ -122,13 +124,13 @@ body {
 .rail {
   display: flex;
   flex-direction: column;
-  gap: 0.85rem;
+  gap: 0.6rem;
 }
 
 .stage {
   display: flex;
   flex-direction: column;
-  gap: 0.85rem;
+  gap: 0.6rem;
   min-width: 0;
 }
 
@@ -185,13 +187,45 @@ body {
   color: var(--text-muted);
 }
 
+.section-label-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Editing preview (raw clips, no packaging yet) vs the final HLS result
+   (played through Shaka after Start) look enough alike — same panel,
+   same video frame — that it's worth spelling out which one you're
+   looking at right next to the section title. */
+.preview-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+.preview-badge--editing {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.preview-badge--final {
+  border-color: var(--success);
+  color: var(--success);
+}
+
 .panel {
   border: 1px solid var(--line);
   background: var(--bg-raised);
-  padding: 1rem;
+  padding: 0.85rem;
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: 0.55rem;
 }
 
 .panel-row {
@@ -281,6 +315,21 @@ body {
   color: var(--text);
 }
 
+/* ── Text inputs ── */
+.text-input {
+  width: 4.5rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+.text-input:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* ── Checkboxes ── */
 .checkbox-row {
   display: flex;
@@ -320,7 +369,7 @@ body {
   border: 1px solid var(--line-strong);
   border-left: 3px solid var(--accent);
   background: var(--bg-raised);
-  padding: 0.85rem 1rem;
+  padding: 0.6rem 0.9rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -331,10 +380,11 @@ body {
 /* ── Activity panel (Log / Playlist tabs) ── */
 .tabs {
   display: flex;
+  align-items: center;
   gap: 1rem;
   border-bottom: 1px solid var(--line);
 }
-.tabs .btn-quiet {
+.activity-toggle {
   margin-left: auto;
 }
 
@@ -408,7 +458,7 @@ body {
   position: relative;
   background: var(--bg-sunken);
   aspect-ratio: 16 / 9;
-  max-width: 640px;
+  max-width: 520px;
   width: 100%;
   margin: 0 auto;
   overflow: hidden;
@@ -435,6 +485,424 @@ body {
   color: var(--danger);
   padding: 0.75rem;
   font-size: 0.78rem;
+}
+
+/* ── Timeline ──
+   Row heights are shared, hardcoded constants between `.timeline-labels`
+   and `.timeline-tracks` (ruler / video / audio / subtitles) — both are
+   plain flex columns with the same gap, so a label cell and its track
+   always line up without any JS-measured layout. */
+:root {
+  --tl-ruler-h: 1.15rem;
+  --tl-video-h: 4.25rem;
+  --tl-audio-h: 2.6rem;
+  --tl-subs-h: 1.9rem;
+  --tl-gap: 2px;
+}
+
+.timeline {
+  border: 1px solid var(--line);
+  background: var(--bg-raised);
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+/* Four columns, all sharing one grid so every row's height comes from the
+   same source: a fixed label column, an intro "add" slot that collapses to
+   0 once intro exists, the time-scaled area (ruler/video/audio/subtitles,
+   all sized off the exact same total duration), and a matching outro
+   slot. Keeping the add-slots *outside* the scaled area is what stops an
+   empty "+ Intro" button from ever distorting the real proportions. */
+.timeline-tracks {
+  display: grid;
+  grid-template-columns: 5rem var(--intro-slot) 1fr var(--outro-slot);
+  gap: 0.6rem;
+  align-items: stretch;
+}
+
+.timeline-labels {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tl-gap);
+}
+.timeline-label-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  height: var(--tl-video-h);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.timeline-labels .timeline-label-cell:nth-child(1) {
+  height: var(--tl-ruler-h);
+}
+.timeline-labels .timeline-label-cell:nth-child(3) {
+  height: var(--tl-audio-h);
+}
+.timeline-labels .timeline-label-cell:nth-child(4) {
+  height: var(--tl-subs-h);
+}
+.timeline-mute-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0.2rem;
+  margin: -0.2rem;
+  line-height: 1;
+  color: var(--text-muted);
+}
+.timeline-mute-btn:hover {
+  color: var(--accent);
+}
+
+.timeline-add-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.timeline-add-btn {
+  cursor: pointer;
+  width: 100%;
+  height: 100%;
+  border: 1px dashed var(--line-strong);
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.timeline-add-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.timeline-add-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.timeline-add-btn.is-drag-over {
+  border-style: solid;
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.timeline-scaled-area {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--tl-gap);
+}
+
+.timeline-ruler {
+  position: relative;
+  height: var(--tl-ruler-h);
+  border-bottom: 1px solid var(--line);
+  cursor: ew-resize;
+  touch-action: none;
+}
+.timeline-tick {
+  position: absolute;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+.timeline-tick:first-child {
+  transform: translateX(0);
+}
+
+.timeline-track {
+  display: flex;
+  height: var(--tl-video-h);
+  gap: var(--tl-gap);
+}
+.timeline-track--audio {
+  height: var(--tl-audio-h);
+}
+
+.timeline-clip {
+  cursor: pointer;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  text-align: left;
+  overflow: hidden;
+  min-width: 2.5rem;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.timeline-clip:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.timeline-clip.is-selected {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.timeline-clip--empty {
+  align-items: center;
+  justify-content: center;
+  border-style: dashed;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  padding: 0.5rem;
+}
+.timeline-clip--empty:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.timeline-clip--main-empty {
+  gap: 0.3rem;
+}
+.timeline-clip.is-drag-over {
+  border-color: var(--accent);
+  border-style: solid;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-sunken));
+}
+
+.timeline-clip-thumbs {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  background: var(--bg-sunken);
+}
+.timeline-clip-thumbs img {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0.85;
+}
+.timeline-clip--main .timeline-clip-thumbs img {
+  opacity: 1;
+}
+
+.timeline-clip-info {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  padding: 0.3rem 0.5rem;
+  background: linear-gradient(to top, color-mix(in srgb, black 75%, transparent) 40%, transparent);
+}
+.timeline-clip-label {
+  font-size: 0.76rem;
+  color: #f3ede1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+.timeline-clip-duration {
+  font-size: 0.66rem;
+  color: #cbbfa4;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+.timeline-clip-remove {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.3rem;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.3rem;
+  height: 1.3rem;
+  cursor: pointer;
+  color: #f3ede1;
+  background: color-mix(in srgb, black 55%, transparent);
+  border-radius: 50%;
+  font-size: 0.78rem;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s, transform 0.15s;
+}
+.timeline-clip-remove:hover {
+  color: #fff;
+  background: var(--danger);
+  transform: scale(1.08);
+}
+
+.timeline-clip--audio {
+  cursor: default;
+  padding: 0.35rem;
+  flex-shrink: 0;
+}
+.waveform-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.timeline-subtitle-track {
+  position: relative;
+  height: var(--tl-subs-h);
+  border: 1px solid var(--line);
+  background: var(--bg-sunken);
+  cursor: pointer;
+  overflow: hidden;
+}
+.timeline-subtitle-track.is-drag-over {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.timeline-warning {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.3rem;
+  color: var(--warning);
+  cursor: help;
+}
+.timeline-subtitle-label {
+  position: absolute;
+  left: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 1;
+}
+.timeline-cue {
+  position: absolute;
+  top: 0.4rem;
+  bottom: 0.4rem;
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+  border: 1px solid var(--accent);
+}
+.timeline-subtitle-add {
+  position: absolute;
+  right: 1.6rem;
+  top: 50%;
+  transform: translateY(-50%);
+  cursor: pointer;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+.timeline-subtitle-add:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.timeline-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 6;
+}
+.timeline-playhead::before {
+  content: '';
+  position: absolute;
+  top: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--accent);
+}
+
+/* ── Subtitle cue editor ── */
+.cue-editor-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, black 60%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 1.5rem;
+}
+.cue-editor {
+  width: 100%;
+  max-width: 640px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-raised);
+  padding: 1.25rem;
+}
+.cue-editor-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.cue-editor-lang {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+.cue-editor-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding-right: 0.25rem;
+}
+.cue-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  border: 1px solid var(--line);
+  background: var(--bg-sunken);
+  padding: 0.6rem;
+}
+.cue-row-times {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+  padding-top: 0.1rem;
+}
+.cue-time-input {
+  width: 9ch;
+  text-align: center;
+}
+.cue-text-input {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  padding: 0.4rem 0.5rem;
+}
+.cue-text-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .sr-only {

@@ -9,10 +9,16 @@ interface TransportControlsProps {
    * begins the whole job over — so the button is hidden rather than shown
    * doing nothing. */
   canPause: boolean;
+  isZipping: boolean;
+  /** Whether there's anything to reset — a file has been picked, even if
+   * the job hasn't started or has already finished. */
+  hasSession: boolean;
   onStart: () => void;
   onResume: () => void;
   onPause: () => void;
   onCancel: () => void;
+  onDownloadZip: () => void;
+  onReset: () => void;
 }
 
 export default function TransportControls({
@@ -21,10 +27,14 @@ export default function TransportControls({
   canStart,
   canResume,
   canPause,
+  isZipping,
+  hasSession,
   onStart,
   onResume,
   onPause,
   onCancel,
+  onDownloadZip,
+  onReset,
 }: TransportControlsProps) {
   return (
     <div className="btn-row">
@@ -47,6 +57,18 @@ export default function TransportControls({
       {(isRunning || status === 'paused') && (
         <button onClick={onCancel} className="btn btn-danger">
           Cancel
+        </button>
+      )}
+
+      {status === 'complete' && (
+        <button onClick={onDownloadZip} disabled={isZipping} className="btn">
+          {isZipping ? 'Zipping…' : 'Download as ZIP'}
+        </button>
+      )}
+
+      {hasSession && (
+        <button onClick={onReset} className="btn-quiet">
+          Start over
         </button>
       )}
     </div>

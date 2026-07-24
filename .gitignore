@@ -1,6 +1,6 @@
 node_modules/
 dist/
-src/wasm/
+packages/remux-core/
 wasm/target/
 *.tsbuildinfo
 vite.config.d.ts

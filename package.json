@@ -7,6 +7,7 @@
     "m3u8",
     "video",
     "video-processing",
+    "video-editor",
     "transcoding",
     "remux",
     "streaming",
@@ -16,6 +17,8 @@
     "wasm",
     "rust",
     "ffmpeg",
+    "shaka-player",
+    "subtitles",
     "browser",
     "client-side"
   ],
@@ -29,15 +32,15 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "build:wasm": "cd wasm && RUSTUP_TOOLCHAIN=stable wasm-pack build --target bundler --out-dir ../src/wasm",
+    "build:wasm": "cd wasm && RUSTUP_TOOLCHAIN=stable wasm-pack build --target bundler --out-dir ../packages/remux-core && cp ../LICENSE ../packages/remux-core/",
     "dev:full": "npm run build:wasm && vite"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
-    "hls.js": "^1.6.15",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "shaka-player": "^5.2.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

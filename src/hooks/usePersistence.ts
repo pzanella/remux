@@ -91,6 +91,19 @@ export async function deleteOpfsFile(opfsName: string): Promise<void> {
   await root.removeEntry(opfsName);
 }
 
+/** Overwrites (or creates) a specific OPFS file with text content — unlike
+ * `saveFileToOpfs`, which always mints a fresh unique name, this keeps a
+ * stable filename across repeated writes. Used for subtitle edits, so the
+ * worker's reference to the file stays valid and edits don't pile up
+ * orphaned OPFS entries. */
+export async function writeOpfsTextFile(opfsName: string, content: string): Promise<void> {
+  const root = await getOpfsRoot();
+  const fh = await root.getFileHandle(opfsName, { create: true });
+  const writable = await fh.createWritable();
+  await writable.write(content);
+  await writable.close();
+}
+
 export function usePersistence() {
   const createSession = useCallback(
     async (

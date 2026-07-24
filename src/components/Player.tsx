@@ -1,86 +1,48 @@
 /**
- * In-browser HLS playback with hls.js, reading segments straight from a
- * FileSystemDirectoryHandle — no server needed. A custom loader intercepts
- * every request: `.m3u8`/key requests go through fetch() on the blob URL we
- * create ourselves; `.ts` segment requests are resolved by filename against
- * the local output folder (hls.js resolves segment URLs relative to the
- * blob URL, which produces a non-fetchable blob:.../segment_0000.ts).
+ * In-browser HLS playback with Shaka Player, reading segments straight from a
+ * FileSystemDirectoryHandle — no server needed. A custom `localdir` scheme
+ * plugin serves the manifest (kept in memory, never written to disk) and
+ * every relative reference Shaka resolves against it — segments, per-
+ * rendition playlists, subtitle tracks — by filename against the local
+ * output folder.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type Hls from 'hls.js';
-import type { LoaderCallbacks, LoaderContext, LoaderStats, LoaderConfiguration } from 'hls.js';
+import shaka from 'shaka-player/dist/shaka-player.ui';
+import 'shaka-player/dist/controls.css';
 
-type HlsClass = typeof import('hls.js').default;
+const SCHEME = 'localdir';
+const MANIFEST_URI = `${SCHEME}://root/__manifest__.m3u8`;
+const URI_PREFIX = `${SCHEME}://root/`;
 
-let _hlsClass: HlsClass | null = null;
-async function loadHlsClass(): Promise<HlsClass> {
-  if (!_hlsClass) {
-    _hlsClass = (await import('hls.js')).default;
+let polyfillsInstalled = false;
+function ensurePolyfills() {
+  if (!polyfillsInstalled) {
+    shaka.polyfill.installAll();
+    polyfillsInstalled = true;
   }
-  return _hlsClass;
 }
 
-function createLocalLoader(dirHandle: FileSystemDirectoryHandle) {
-  return class LocalFileLoader {
-    private _cancelled = false;
+function registerLocalDirScheme(dirHandle: FileSystemDirectoryHandle, readManifest: () => string) {
+  const plugin: shaka.extern.SchemePlugin = (uri, request) => {
+    const promise = (async (): Promise<shaka.extern.Response> => {
+      const path = uri.slice(URI_PREFIX.length).split('?')[0];
+      let data: ArrayBuffer;
 
-    context: LoaderContext | null = null;
-    stats: LoaderStats = {
-      aborted: false,
-      loaded: 0,
-      retry: 0,
-      total: 0,
-      chunkCount: 0,
-      bwEstimate: 0,
-      loading: { start: 0, first: 0, end: 0 },
-      parsing: { start: 0, end: 0 },
-      buffering: { start: 0, first: 0, end: 0 },
-    };
+      if (path === '__manifest__.m3u8') {
+        data = new TextEncoder().encode(readManifest()).buffer;
+      } else {
+        const fileHandle = await dirHandle.getFileHandle(path);
+        const file = await fileHandle.getFile();
+        data = await file.arrayBuffer();
+      }
 
-    load(context: LoaderContext, _config: LoaderConfiguration, callbacks: LoaderCallbacks<LoaderContext>): void {
-      this.context = context;
-      const url = context.url;
-      const filename = url.split('/').pop()?.split('?')[0] ?? url;
+      return { uri, originalUri: uri, data, headers: {}, status: 200, originalRequest: request };
+    })();
 
-      this.stats.loading.start = performance.now();
-
-      void (async () => {
-        try {
-          if (this._cancelled) return;
-
-          let data: string | ArrayBuffer;
-          if (filename.endsWith('.ts') || filename.endsWith('.m2ts')) {
-            const fileHandle = await dirHandle.getFileHandle(filename);
-            const file = await fileHandle.getFile();
-            data = await file.arrayBuffer();
-          } else {
-            const resp = await fetch(url);
-            data = await resp.text();
-          }
-
-          if (this._cancelled) return;
-
-          this.stats.loading.end = performance.now();
-          this.stats.loaded = typeof data === 'string' ? data.length : data.byteLength;
-          this.stats.total = this.stats.loaded;
-
-          callbacks.onSuccess({ data, url, code: 200 }, this.stats, context, null);
-        } catch (err) {
-          if (!this._cancelled) {
-            callbacks.onError({ code: 0, text: String(err) }, context, null, this.stats);
-          }
-        }
-      })();
-    }
-
-    abort(): void {
-      this._cancelled = true;
-    }
-
-    destroy(): void {
-      this._cancelled = true;
-    }
+    return shaka.util.AbortableOperation.notAbortable(promise);
   };
+
+  shaka.net.NetworkingEngine.registerScheme(SCHEME, plugin);
 }
 
 interface PlayerProps {
@@ -91,79 +53,82 @@ interface PlayerProps {
 
 export default function Player({ m3u8Content, outputFolderHandle, isComplete }: PlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
-  const blobUrlRef = useRef<string | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const playerRef = useRef<shaka.Player | null>(null);
+  const uiRef = useRef<shaka.ui.Overlay | null>(null);
+  const manifestContentRef = useRef(m3u8Content);
+  manifestContentRef.current = m3u8Content;
   const [playerError, setPlayerError] = useState<string | null>(null);
 
-  const destroyHls = useCallback(() => {
-    hlsRef.current?.destroy();
-    hlsRef.current = null;
-    if (blobUrlRef.current) {
-      URL.revokeObjectURL(blobUrlRef.current);
-      blobUrlRef.current = null;
-    }
+  const destroyPlayer = useCallback(() => {
+    void uiRef.current?.destroy();
+    uiRef.current = null;
+    void playerRef.current?.destroy();
+    playerRef.current = null;
   }, []);
 
   useEffect(() => {
-    if (!m3u8Content || !outputFolderHandle || !videoRef.current) return;
+    if (!m3u8Content || !outputFolderHandle || !videoRef.current || !containerRef.current) return;
 
     let cancelled = false;
 
     void (async () => {
-      const HlsClass = await loadHlsClass();
-      if (cancelled) return;
+      ensurePolyfills();
 
-      if (!HlsClass.isSupported()) {
-        setPlayerError('This browser cannot play HLS with hls.js.');
+      if (!shaka.Player.isBrowserSupported()) {
+        setPlayerError('This browser cannot play HLS with Shaka Player.');
         return;
       }
 
-      destroyHls();
+      destroyPlayer();
       setPlayerError(null);
+      registerLocalDirScheme(outputFolderHandle, () => manifestContentRef.current);
 
-      const blob = new Blob([m3u8Content], { type: 'application/vnd.apple.mpegurl' });
-      const blobUrl = URL.createObjectURL(blob);
-      blobUrlRef.current = blobUrl;
+      const player = new shaka.Player();
+      await player.attach(videoRef.current!);
+      if (cancelled) {
+        void player.destroy();
+        return;
+      }
+      playerRef.current = player;
 
-      const hls = new HlsClass({
-        loader: createLocalLoader(outputFolderHandle),
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        enableWorker: false,
+      player.addEventListener('error', (event) => {
+        const detail = (event as unknown as { detail?: shaka.util.Error }).detail;
+        setPlayerError(`Playback error: ${detail ? `code ${detail.code}` : 'unknown error'}`);
       });
 
-      hls.on(HlsClass.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          setPlayerError(`Playback error: ${data.details}`);
-          destroyHls();
-        }
-      });
+      uiRef.current = new shaka.ui.Overlay(player, containerRef.current!, videoRef.current!);
 
-      hls.on(HlsClass.Events.MANIFEST_PARSED, () => {
+      try {
+        await player.load(MANIFEST_URI);
+        if (cancelled) return;
         videoRef.current?.play().catch(() => {
           // Autoplay may be blocked; the user can press play.
         });
-      });
-
-      hls.loadSource(blobUrl);
-      hls.attachMedia(videoRef.current!);
-      hlsRef.current = hls;
+      } catch (err) {
+        if (!cancelled) {
+          setPlayerError(`Playback error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     })();
 
     return () => {
       cancelled = true;
-      destroyHls();
+      destroyPlayer();
     };
-  }, [m3u8Content, outputFolderHandle, destroyHls]);
+  }, [m3u8Content, outputFolderHandle, destroyPlayer]);
 
-  useEffect(() => () => destroyHls(), [destroyHls]);
+  useEffect(() => () => destroyPlayer(), [destroyPlayer]);
 
   const isReady = m3u8Content && outputFolderHandle;
 
   return (
     <div className="panel">
       <div className="panel-row panel-row--split">
-        <span className="section-label">Preview</span>
+        <span className="section-label-row">
+          <span className="section-label">HLS result</span>
+          <span className="preview-badge preview-badge--final">Packaged</span>
+        </span>
         {isReady && (
           <span className={`status-line ${isComplete ? 'is-done' : 'is-active'}`}>
             {isComplete ? 'Ready' : 'Playing live while it converts'}
@@ -174,9 +139,9 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
       {playerError ? (
         <div className="player-error">{playerError}</div>
       ) : (
-        <div className="player-frame">
+        <div className="player-frame" ref={containerRef}>
           {isReady ? (
-            <video ref={videoRef} controls />
+            <video ref={videoRef} />
           ) : (
             <p className="player-placeholder">Your video will play here once the first segment is ready.</p>
           )}

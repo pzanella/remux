@@ -1,17 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppStatus, LogEntry, TranscodingSession, WorkerCommand, WorkerEvent } from '../types';
-import { saveFileToOpfs, usePersistence } from './usePersistence';
+import { saveFileToOpfs, writeOpfsTextFile, usePersistence } from './usePersistence';
+import { createZipBlob } from '../lib/zip';
 import RemuxWorker from '../worker/remux.worker.ts?worker';
 
-/** Reads intrinsic video dimensions client-side, without touching FFmpeg/OPFS. */
-function probeVideoDimensions(file: File): Promise<{ width: number; height: number } | null> {
+/** An intro/outro clip's OPFS pointer plus everything the timeline needs to
+ * draw and preview it, without re-reading the file. */
+export interface ClipFile {
+  fileName: string;
+  label: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  file: File;
+}
+
+/** Reads intrinsic video dimensions and duration client-side, without
+ * touching FFmpeg/OPFS — duration feeds the timeline's proportional clip
+ * widths and the subtitle intro-offset shift. */
+function probeVideoMetadata(file: File): Promise<{ width: number; height: number; duration: number } | null> {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(file);
     const video = document.createElement('video');
     const cleanup = () => URL.revokeObjectURL(url);
     video.preload = 'metadata';
     video.onloadedmetadata = () => {
-      resolve({ width: video.videoWidth, height: video.videoHeight });
+      resolve({ width: video.videoWidth, height: video.videoHeight, duration: video.duration });
       cleanup();
     };
     video.onerror = () => {
@@ -39,9 +53,32 @@ export function useTranscoder() {
   const [masterM3u8Preview, setMasterM3u8Preview] = useState('');
   const [renditionLabel, setRenditionLabel] = useState('');
   const [outputFolder, setOutputFolder] = useState<FileSystemDirectoryHandle | null>(null);
+  /**
+   * 'opfs' (default) needs no picker at all — output goes to a private,
+   * origin-scoped directory the browser already grants access to, same as
+   * the source file's own OPFS staging. 'folder' is the original flow: a
+   * real on-disk folder via `showDirectoryPicker`, for anyone who wants the
+   * files to land somewhere they can see them without an extra step.
+   */
+  const [outputMode, setOutputModeState] = useState<'opfs' | 'folder'>('opfs');
   const [sourceResolution, setSourceResolution] = useState<{ width: number; height: number } | null>(null);
+  const [sourceDuration, setSourceDuration] = useState<number | undefined>(undefined);
+  /** Kept only for the timeline's raw (pre-conversion) clip preview — never
+   * persisted, never sent to the worker (which reads from OPFS by name). */
+  const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [abrEnabled, setAbrEnabled] = useState(false);
   const [abrHeights, setAbrHeightsState] = useState<number[]>([]);
+  const [subtitleTrack, setSubtitleTrackState] = useState<{ fileName: string; label: string; language: string } | null>(
+    null,
+  );
+  /** The current subtitle content as editable text — kept alongside
+   * `subtitleTrack` (which is just the OPFS pointer + display metadata) so
+   * the cue editor has something to show immediately without a round trip
+   * through OPFS. */
+  const [subtitleVttText, setSubtitleVttText] = useState('');
+  const [introFile, setIntroFileState] = useState<ClipFile | null>(null);
+  const [outroFile, setOutroFileState] = useState<ClipFile | null>(null);
+  const [isZipping, setIsZipping] = useState(false);
 
   const toggleAbrHeight = useCallback((height: number) => {
     setAbrHeightsState((prev) => (prev.includes(height) ? prev.filter((h) => h !== height) : [...prev, height].sort((a, b) => a - b)));
@@ -142,11 +179,13 @@ export function useTranscoder() {
           saveFileToOpfs(file, (loaded, total) => {
             setUploadProgress(Math.round((loaded / total) * 100));
           }),
-          probeVideoDimensions(file),
+          probeVideoMetadata(file),
         ]);
         const newSession = await createSession(file.name, opfsPath, file.size, 0, outputFolder);
         setSession({ ...newSession, sourceWidth: dims?.width, sourceHeight: dims?.height });
         setSourceResolution(dims);
+        setSourceDuration(dims?.duration);
+        setSourceFile(file);
         setAbrHeightsState((prev) => (dims ? prev.filter((h) => h <= dims.height) : prev));
         setStatus('idle');
         addLog('Ready. Press Start when you are.', 'success');
@@ -158,9 +197,80 @@ export function useTranscoder() {
     [addLog, createSession, outputFolder],
   );
 
+  const selectSubtitleFile = useCallback(
+    async (file: File) => {
+      try {
+        const [opfsPath, text] = await Promise.all([saveFileToOpfs(file), file.text()]);
+        const label = file.name.replace(/\.(srt|vtt)$/i, '');
+        setSubtitleTrackState({ fileName: opfsPath, label, language: 'en' });
+        setSubtitleVttText(text);
+        addLog(`Subtitles: ${file.name}`, 'success');
+      } catch (err) {
+        addLog(`Could not save the subtitle file: ${err}`, 'error');
+      }
+    },
+    [addLog],
+  );
+
+  const setSubtitleLanguage = useCallback((language: string) => {
+    setSubtitleTrackState((prev) => (prev ? { ...prev, language } : prev));
+  }, []);
+
+  const clearSubtitleTrack = useCallback(() => {
+    setSubtitleTrackState(null);
+    setSubtitleVttText('');
+  }, []);
+
+  // Writes edited cue text back to the *same* OPFS filename a track already
+  // has (so the worker's reference to it stays valid across edits), or
+  // mints a fresh one for a track created from scratch in the cue editor.
+  const saveSubtitleEdits = useCallback(
+    async (vttText: string) => {
+      try {
+        const fileName = subtitleTrack?.fileName ?? `subtitles_${Date.now()}.vtt`;
+        await writeOpfsTextFile(fileName, vttText);
+        setSubtitleVttText(vttText);
+        setSubtitleTrackState((prev) => prev ?? { fileName, label: 'Subtitles', language: 'en' });
+        addLog('Subtitles updated.', 'success');
+      } catch (err) {
+        addLog(`Could not save subtitle edits: ${err}`, 'error');
+      }
+    },
+    [subtitleTrack, addLog],
+  );
+
+  const selectIntroFile = useCallback(
+    async (file: File) => {
+      try {
+        const [opfsPath, dims] = await Promise.all([saveFileToOpfs(file), probeVideoMetadata(file)]);
+        setIntroFileState({ fileName: opfsPath, label: file.name, width: dims?.width, height: dims?.height, duration: dims?.duration, file });
+        addLog(`Intro: ${file.name}`, 'success');
+      } catch (err) {
+        addLog(`Could not save the intro file: ${err}`, 'error');
+      }
+    },
+    [addLog],
+  );
+  const clearIntroFile = useCallback(() => setIntroFileState(null), []);
+
+  const selectOutroFile = useCallback(
+    async (file: File) => {
+      try {
+        const [opfsPath, dims] = await Promise.all([saveFileToOpfs(file), probeVideoMetadata(file)]);
+        setOutroFileState({ fileName: opfsPath, label: file.name, width: dims?.width, height: dims?.height, duration: dims?.duration, file });
+        addLog(`Outro: ${file.name}`, 'success');
+      } catch (err) {
+        addLog(`Could not save the outro file: ${err}`, 'error');
+      }
+    },
+    [addLog],
+  );
+  const clearOutroFile = useCallback(() => setOutroFileState(null), []);
+
   const selectOutputFolder = useCallback(async () => {
     try {
       const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      setOutputModeState('folder');
       setOutputFolder(handle);
       addLog(`Output folder: ${handle.name}`, 'success');
     } catch (err) {
@@ -169,6 +279,39 @@ export function useTranscoder() {
       }
     }
   }, [addLog]);
+
+  const setOutputMode = useCallback((mode: 'opfs' | 'folder') => {
+    setOutputModeState(mode);
+    // Both directions need a fresh resolve: 'folder' must wait for an
+    // explicit pick (can't silently reuse a stale handle), and 'opfs' must
+    // re-derive its directory for whichever session is now current.
+    setOutputFolder(null);
+  }, []);
+
+  // Auto-resolves the OPFS output directory — no picker, no permission
+  // prompt needed. Keyed off the session id (not created fresh each time)
+  // so a Resume after a reload finds the same directory and its
+  // already-written segments, the same way folder-mode resume finds them
+  // by the user re-picking the same real folder.
+  useEffect(() => {
+    if (outputMode !== 'opfs' || outputFolder) return;
+    const sessionId = session?.id ?? resumableSession?.id;
+    if (!sessionId) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const opfsRoot = await navigator.storage.getDirectory();
+        const dirHandle = await opfsRoot.getDirectoryHandle(`output_${sessionId}`, { create: true });
+        if (!cancelled) setOutputFolder(dirHandle);
+      } catch (err) {
+        if (!cancelled) addLog(`Could not prepare browser storage: ${err}`, 'error');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [outputMode, session?.id, resumableSession?.id, outputFolder, addLog]);
 
   const start = useCallback(() => {
     if (!session || !outputFolder) return;
@@ -180,13 +323,38 @@ export function useTranscoder() {
     setLogs([]);
     addLog(abrEnabled && abrHeights.length > 0 ? `Starting adaptive HLS (${abrHeights.join(', ')}p)…` : 'Starting…');
 
+    const isAbrJob = abrEnabled && abrHeights.length > 0;
+    const introOutro =
+      introFile || outroFile
+        ? {
+            introFileName: introFile?.fileName,
+            introWidth: introFile?.width,
+            introHeight: introFile?.height,
+            introDuration: introFile?.duration,
+            outroFileName: outroFile?.fileName,
+            outroWidth: outroFile?.width,
+            outroHeight: outroFile?.height,
+          }
+        : undefined;
+
+    // Fold the subtitle/intro/outro selections into the session itself (not
+    // just the outgoing worker command) so they round-trip through
+    // IndexedDB and survive a Resume, the same way abrHeights already does
+    // implicitly.
+    const sessionWithExtras: TranscodingSession = {
+      ...session,
+      subtitleTrack: subtitleTrack ?? undefined,
+      introOutro,
+    };
+    setSession(sessionWithExtras);
+
     const worker = spawnWorker();
     const cmd: WorkerCommand = {
       type: 'START',
       session: {
-        ...session,
+        ...sessionWithExtras,
         outputFolderHandle: outputFolder,
-        abrHeights: abrEnabled && abrHeights.length > 0 ? abrHeights : undefined,
+        abrHeights: isAbrJob ? abrHeights : undefined,
       },
       outputFolderHandle: outputFolder,
     };
@@ -196,7 +364,7 @@ export function useTranscoder() {
       setStatus('error');
       addLog(`Could not talk to the worker: ${err}`, 'error');
     }
-  }, [session, outputFolder, abrEnabled, abrHeights, addLog, spawnWorker]);
+  }, [session, outputFolder, abrEnabled, abrHeights, subtitleTrack, introFile, outroFile, addLog, spawnWorker]);
 
   const resume = useCallback(async () => {
     const src = resumableSession ?? session;
@@ -243,6 +411,71 @@ export function useTranscoder() {
 
   const clearLogs = useCallback(() => setLogs([]), []);
 
+  // Tears down everything so a new video can be picked from a clean slate —
+  // stops any in-flight worker, drops the IndexedDB checkpoint(s) and their
+  // OPFS source file(s) the same way a normal completion already does, and
+  // clears the OPFS output directory too (only when it's actually ours —
+  // never touches a user-picked real folder in 'folder' mode).
+  const reset = useCallback(async () => {
+    workerRef.current?.postMessage({ type: 'CANCEL' } as WorkerCommand);
+    workerRef.current?.terminate();
+    workerRef.current = null;
+
+    if (session) await deleteSession(session.id);
+    if (resumableSession && resumableSession.id !== session?.id) await deleteSession(resumableSession.id);
+
+    if (outputMode === 'opfs' && session) {
+      try {
+        const opfsRoot = await navigator.storage.getDirectory();
+        await opfsRoot.removeEntry(`output_${session.id}`, { recursive: true });
+      } catch {
+        // Already gone, or never created — fine either way.
+      }
+    }
+
+    setStatus('idle');
+    setSession(null);
+    setResumableSession(null);
+    setUploadProgress(0);
+    setConvertProgress(0);
+    setSegmentProgress({ done: 0, total: 0 });
+    setLogs([]);
+    setM3u8Preview('');
+    setMasterM3u8Preview('');
+    setRenditionLabel('');
+    setOutputFolder(null);
+    setSourceResolution(null);
+    setSourceDuration(undefined);
+    setSourceFile(null);
+    setAbrEnabled(false);
+    setAbrHeightsState([]);
+    setSubtitleTrackState(null);
+    setSubtitleVttText('');
+    setIntroFileState(null);
+    setOutroFileState(null);
+    setIsZipping(false);
+  }, [session, resumableSession, outputMode, deleteSession]);
+
+  const downloadZip = useCallback(async () => {
+    if (!outputFolder) return;
+    setIsZipping(true);
+    addLog('Zipping output…');
+    try {
+      const blob = await createZipBlob(outputFolder);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${session?.sourceFileName.replace(/\.[^.]+$/, '') || 'remux-output'}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      addLog('Download ready.', 'success');
+    } catch (err) {
+      addLog(`Could not build the ZIP: ${err}`, 'error');
+    } finally {
+      setIsZipping(false);
+    }
+  }, [outputFolder, session, addLog]);
+
   const isRunning = status === 'processing' || status === 'converting';
   const canStart = !!session && !!outputFolder && !isRunning && status !== 'complete';
   const canResume =
@@ -254,6 +487,7 @@ export function useTranscoder() {
     session,
     resumableSession,
     outputFolder,
+    outputMode,
     uploadProgress,
     convertProgress,
     segmentProgress,
@@ -261,13 +495,28 @@ export function useTranscoder() {
     masterM3u8Preview,
     renditionLabel,
     sourceResolution,
+    sourceDuration,
+    sourceFile,
     abrEnabled,
     abrHeights,
+    subtitleTrack,
+    subtitleVttText,
+    introFile,
+    outroFile,
     isRunning,
     canStart,
     canResume,
     selectFile,
     selectOutputFolder,
+    setOutputMode,
+    selectSubtitleFile,
+    saveSubtitleEdits,
+    selectIntroFile,
+    clearIntroFile,
+    selectOutroFile,
+    clearOutroFile,
+    clearSubtitleTrack,
+    setSubtitleLanguage,
     setAbrEnabled,
     toggleAbrHeight,
     start,
@@ -276,5 +525,8 @@ export function useTranscoder() {
     cancel,
     dismissResume,
     clearLogs,
+    downloadZip,
+    isZipping,
+    reset,
   };
 }
