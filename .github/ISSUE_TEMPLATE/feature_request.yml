@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest an idea, improvement, or new capability.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: Remux's core constraint is that everything runs
+        client-side — no server, no upload, ever. Requests that need a
+        backend (accounts, cloud rendering, server-side storage, etc.) are
+        likely out of scope; see [CONTRIBUTING.md](../../CONTRIBUTING.md#scope-note).
+        Everything else is fair game.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do today that Remux doesn't support, or makes harder than it should?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you imagine it working. Rough is fine — this is a starting point for discussion, not a spec.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve the same problem, including workarounds you're using today.
+    validations:
+      required: false

@@ -1,0 +1,84 @@
+name: Bug report
+description: Something isn't working — a conversion fails, output is wrong, or playback breaks.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remux does everything in-browser, so
+        most issues are specific to a browser version, a source file's
+        exact encoding, or a hardware codec quirk — the details below are
+        what actually let someone reproduce it.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected instead, too.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: browser
+    attributes:
+      label: Browser
+      options:
+        - Chrome
+        - Edge
+        - Other Chromium-based (please specify version/browser below)
+        - Something else (Remux doesn't officially support this — please note it)
+    validations:
+      required: true
+
+  - type: input
+    id: browser-version
+    attributes:
+      label: Browser version
+      description: "chrome://version or edge://version"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "e.g. macOS 15.1, Windows 11, Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: path
+    attributes:
+      label: Which path were you using?
+      options:
+        - Fast path (MP4/MOV, no re-encode)
+        - Adaptive HLS (ABR, multi-resolution)
+        - Non-native format (FFmpeg.wasm conversion first)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: source-format
+    attributes:
+      label: Source file format/codec
+      description: Extension, and video/audio codec if you know it (e.g. .mov, H.264 + AAC — or "iPhone HEVC video").
+    validations:
+      required: false
+
+  - type: textarea
+    id: console
+    attributes:
+      label: Browser console output
+      description: Open DevTools → Console before reproducing. Include anything from Remux's own logs (the Activity panel in the app) and any Shaka Player error (`code N`).
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: If the bug depends on a specific source file, a minimal repro file (or a link to one) is the single most useful thing you can attach — encoding quirks are often file-specific and hard to guess at from a description alone.
+    validations:
+      required: true
