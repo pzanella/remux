@@ -8,6 +8,7 @@ import Waveform from './Waveform';
 const NATIVE_ACCEPT = '.mp4,.mov,.m4v,.3gp,.f4v';
 const MAIN_ACCEPT =
   'video/mp4,video/quicktime,video/x-matroska,video/webm,video/avi,video/x-msvideo,video/x-flv,video/x-ms-wmv,video/mpeg,video/ogg,.mp4,.mov,.m4v,.mkv,.webm,.avi,.wmv,.flv,.ts,.mts,.m2ts,.ogv,.mpg,.mpeg,.3gp,.f4v';
+const DUB_AUDIO_ACCEPT = '.mp3,.wav,.aac,.m4a,.mp4,.mov,.m4v';
 const TICK_STEPS = [1, 2, 5, 10, 15, 30, 60, 90, 120, 300, 600];
 const THUMB_COUNT = 10;
 const PEAK_COUNT = 200;
@@ -123,6 +124,7 @@ interface TimelineProps {
   outroFile: ClipFile | null;
   subtitleTrack: { fileName: string; label: string; language: string } | null;
   subtitleVttText: string;
+  dubAudioTracks: { fileName: string; label: string; language: string }[];
   selectedClip: ClipKind | null;
   playheadTime: number;
   muted: boolean;
@@ -138,6 +140,9 @@ interface TimelineProps {
   onClearSubtitle: () => void;
   onSaveSubtitleEdits: (vtt: string) => void;
   onSubtitleLanguageChange: (lang: string) => void;
+  onSelectDubAudio: (file: File) => void;
+  onRemoveDubAudio: (fileName: string) => void;
+  onDubAudioLanguageChange: (fileName: string, language: string) => void;
 }
 
 export default function Timeline({
@@ -149,6 +154,7 @@ export default function Timeline({
   outroFile,
   subtitleTrack,
   subtitleVttText,
+  dubAudioTracks,
   selectedClip,
   playheadTime,
   muted,
@@ -164,12 +170,16 @@ export default function Timeline({
   onClearSubtitle,
   onSaveSubtitleEdits,
   onSubtitleLanguageChange,
+  onSelectDubAudio,
+  onRemoveDubAudio,
+  onDubAudioLanguageChange,
 }: TimelineProps) {
   const [cueEditorOpen, setCueEditorOpen] = useState(false);
   const mainInputRef = useRef<HTMLInputElement>(null);
   const introInputRef = useRef<HTMLInputElement>(null);
   const outroInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
+  const dubAudioInputRef = useRef<HTMLInputElement>(null);
   const scaledAreaRef = useRef<HTMLDivElement>(null);
 
   const introMedia = useMediaPreview(introFile?.file ?? null);
@@ -209,6 +219,7 @@ export default function Timeline({
   const introDrop = useFileDrop(onSelectIntro, disabled);
   const outroDrop = useFileDrop(onSelectOutro, disabled);
   const subtitleDrop = useFileDrop(onSelectSubtitle, disabled);
+  const dubAudioDrop = useFileDrop(onSelectDubAudio, disabled);
 
   const scrubAt = (clientX: number) => {
     const el = scaledAreaRef.current;
@@ -423,10 +434,56 @@ export default function Timeline({
         </div>
       )}
 
+      {/* Not time-positioned like the tracks above — a dub applies to the
+          whole main content, not a span within it — so this lives outside
+          the proportionally-scaled grid entirely, as a plain list. */}
+      {sourceLabel && (
+        <div className="timeline-dub-audio">
+          <span className="timeline-dub-audio-label">Dub audio</span>
+          <div className="timeline-dub-audio-list">
+            {dubAudioTracks.map((track) => (
+              <div key={track.fileName} className="dub-audio-chip">
+                <span className="dub-audio-chip-name">{track.label}</span>
+                <input
+                  type="text"
+                  className="text-input dub-audio-lang-input"
+                  value={track.language}
+                  onChange={(e) => onDubAudioLanguageChange(track.fileName, e.target.value)}
+                  disabled={disabled}
+                  title="BCP-47 language code, e.g. en, it, fr"
+                />
+                <button
+                  type="button"
+                  className="dub-audio-chip-remove"
+                  onClick={() => onRemoveDubAudio(track.fileName)}
+                  disabled={disabled}
+                  title={`Remove ${track.label}`}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className={`timeline-add-btn timeline-add-btn--dub${dubAudioDrop.isOver ? ' is-drag-over' : ''}`}
+              onClick={() => dubAudioInputRef.current?.click()}
+              onDragOver={dubAudioDrop.onDragOver}
+              onDragLeave={dubAudioDrop.onDragLeave}
+              onDrop={dubAudioDrop.onDrop}
+              disabled={disabled}
+              title="Add an alternate audio track (a dub) — selectable from the audio menu once converted"
+            >
+              + Dub audio
+            </button>
+          </div>
+        </div>
+      )}
+
       <input ref={mainInputRef} type="file" accept={MAIN_ACCEPT} className="sr-only" onChange={handlePick(onSelectMainFile)} />
       <input ref={introInputRef} type="file" accept={NATIVE_ACCEPT} className="sr-only" onChange={handlePick(onSelectIntro)} />
       <input ref={outroInputRef} type="file" accept={NATIVE_ACCEPT} className="sr-only" onChange={handlePick(onSelectOutro)} />
       <input ref={subtitleInputRef} type="file" accept=".srt,.vtt" className="sr-only" onChange={handlePick(onSelectSubtitle)} />
+      <input ref={dubAudioInputRef} type="file" accept={DUB_AUDIO_ACCEPT} className="sr-only" onChange={handlePick(onSelectDubAudio)} />
 
       {cueEditorOpen && (
         <SubtitleCueEditor

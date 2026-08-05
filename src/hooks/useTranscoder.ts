@@ -78,6 +78,7 @@ export function useTranscoder() {
   const [subtitleVttText, setSubtitleVttText] = useState('');
   const [introFile, setIntroFileState] = useState<ClipFile | null>(null);
   const [outroFile, setOutroFileState] = useState<ClipFile | null>(null);
+  const [dubAudioTracks, setDubAudioTracksState] = useState<{ fileName: string; label: string; language: string }[]>([]);
   const [isZipping, setIsZipping] = useState(false);
 
   const toggleAbrHeight = useCallback((height: number) => {
@@ -267,6 +268,50 @@ export function useTranscoder() {
   );
   const clearOutroFile = useCallback(() => setOutroFileState(null), []);
 
+  const selectDubAudioTrack = useCallback(
+    async (file: File) => {
+      try {
+        // `<video>` reads .duration for audio-only files fine (it's really
+        // an <audio> capable element too) — reused here just for that,
+        // width/height come back 0 and are ignored.
+        const dims = await probeVideoMetadata(file);
+        // A dub shorter than the main content produces a media playlist
+        // with fewer segments than the video's — real-world HLS players
+        // (Shaka included) expect every rendition in the same #EXT-X-MEDIA
+        // group to span the same duration, and choke on the mismatch once
+        // playback reaches the point where the shorter track has run out
+        // but the video hasn't (confirmed against a real Shaka VIDEO_ERROR
+        // this way). Properly fixing this means padding the gap with
+        // synthesized silence, which isn't implemented yet — rejecting the
+        // file here is what stands between that and shipping a conversion
+        // that looks like it succeeded but produces broken playback.
+        const TOLERANCE_SEC = 0.5;
+        if (sourceDuration !== undefined && dims && dims.duration < sourceDuration - TOLERANCE_SEC) {
+          addLog(
+            `Dub audio "${file.name}" (${dims.duration.toFixed(1)}s) is shorter than the main content ` +
+              `(${sourceDuration.toFixed(1)}s) — not supported yet, it would produce broken playback. Trim the main ` +
+              `content to match, or use a dub at least as long.`,
+            'error',
+          );
+          return;
+        }
+        const opfsPath = await saveFileToOpfs(file);
+        const label = file.name.replace(/\.[^.]+$/, '');
+        setDubAudioTracksState((prev) => [...prev, { fileName: opfsPath, label, language: 'en' }]);
+        addLog(`Dub audio: ${file.name}`, 'success');
+      } catch (err) {
+        addLog(`Could not save the dub audio file: ${err}`, 'error');
+      }
+    },
+    [addLog, sourceDuration],
+  );
+  const removeDubAudioTrack = useCallback((fileName: string) => {
+    setDubAudioTracksState((prev) => prev.filter((t) => t.fileName !== fileName));
+  }, []);
+  const setDubAudioTrackLanguage = useCallback((fileName: string, language: string) => {
+    setDubAudioTracksState((prev) => prev.map((t) => (t.fileName === fileName ? { ...t, language } : t)));
+  }, []);
+
   const selectOutputFolder = useCallback(async () => {
     try {
       const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
@@ -345,6 +390,7 @@ export function useTranscoder() {
       ...session,
       subtitleTrack: subtitleTrack ?? undefined,
       introOutro,
+      dubAudioTracks: dubAudioTracks.length > 0 ? dubAudioTracks : undefined,
     };
     setSession(sessionWithExtras);
 
@@ -364,7 +410,7 @@ export function useTranscoder() {
       setStatus('error');
       addLog(`Could not talk to the worker: ${err}`, 'error');
     }
-  }, [session, outputFolder, abrEnabled, abrHeights, subtitleTrack, introFile, outroFile, addLog, spawnWorker]);
+  }, [session, outputFolder, abrEnabled, abrHeights, subtitleTrack, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
 
   const resume = useCallback(async () => {
     const src = resumableSession ?? session;
@@ -453,6 +499,7 @@ export function useTranscoder() {
     setSubtitleVttText('');
     setIntroFileState(null);
     setOutroFileState(null);
+    setDubAudioTracksState([]);
     setIsZipping(false);
   }, [session, resumableSession, outputMode, deleteSession]);
 
@@ -503,6 +550,7 @@ export function useTranscoder() {
     subtitleVttText,
     introFile,
     outroFile,
+    dubAudioTracks,
     isRunning,
     canStart,
     canResume,
@@ -515,6 +563,9 @@ export function useTranscoder() {
     clearIntroFile,
     selectOutroFile,
     clearOutroFile,
+    selectDubAudioTrack,
+    removeDubAudioTrack,
+    setDubAudioTrackLanguage,
     clearSubtitleTrack,
     setSubtitleLanguage,
     setAbrEnabled,

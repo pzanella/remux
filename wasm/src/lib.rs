@@ -31,6 +31,35 @@ pub struct SegmentSamples {
     pub duration_sec: f64,
 }
 
+/// Shared by `parse_headers`, `parse_audio_only`, and
+/// `segment_audio_at_boundaries` — all three return the same JSON shape
+/// regardless of whether `video` is populated (video+audio) or always empty
+/// (audio-only), so the caller's segment-reading code never needs to branch
+/// on which one produced a given result.
+fn segments_to_json(segments: &[SegmentSamples]) -> Vec<serde_json::Value> {
+    fn sample_json(sm: &SampleInfo) -> serde_json::Value {
+        serde_json::json!({
+            "fileOffset": sm.file_offset,
+            "size": sm.size,
+            "pts": sm.pts,
+            "dts": sm.dts,
+            "duration": sm.duration,
+            "isKeyframe": sm.is_keyframe,
+        })
+    }
+    segments
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "startPtsSec": s.start_pts_sec,
+                "durationSec": s.duration_sec,
+                "videoSamples": s.video.iter().map(sample_json).collect::<Vec<_>>(),
+                "audioSamples": s.audio.iter().map(sample_json).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct SampleMeta {
     pub size: u32,
@@ -753,6 +782,119 @@ fn compute_segments(
     segments
 }
 
+/// Segments an audio-only track (a dub-audio rendition) by duration alone —
+/// unlike `compute_segments`, there's no keyframe to align to: every AAC
+/// frame decodes independently, so any duration-based cut point is a valid
+/// segment boundary. `video` is always empty in the resulting
+/// `SegmentSamples`, which is what tells `mux_segment`/`mux_segment_inner`
+/// to write an audio-only MPEG-TS stream instead of video+audio.
+fn compute_audio_only_segments(
+    audio: &[SampleInfo],
+    audio_timescale: u32,
+    target_sec: f64,
+) -> Vec<SegmentSamples> {
+    if audio.is_empty() {
+        return vec![];
+    }
+    let mut segments: Vec<SegmentSamples> = Vec::new();
+    let mut seg_start = 0usize;
+
+    let target_ts = (target_sec * audio_timescale as f64) as u64;
+    let seg_start_dts = audio[0].dts;
+
+    let mut i = 1;
+    while i <= audio.len() {
+        let is_last = i == audio.len();
+        let is_boundary = is_last || (audio[i].dts - audio[seg_start].dts) >= target_ts;
+
+        if is_boundary {
+            let seg = &audio[seg_start..i];
+            let seg_start_pts = seg[0].dts;
+            let seg_end_dts = if is_last {
+                seg.last().map(|s| s.dts + s.duration as u64).unwrap_or(seg_start_pts)
+            } else {
+                audio[i].dts
+            };
+
+            let start_pts_sec = (seg_start_pts - seg_start_dts) as f64 / audio_timescale as f64;
+            let duration_sec = (seg_end_dts - seg_start_pts) as f64 / audio_timescale as f64;
+
+            segments.push(SegmentSamples {
+                video: vec![],
+                audio: seg.to_vec(),
+                start_pts_sec,
+                duration_sec,
+            });
+
+            seg_start = i;
+        }
+        i += 1;
+    }
+
+    segments
+}
+
+/// Segments an audio-only track at explicit end-of-segment timestamps
+/// (seconds from the track's own start) instead of a fixed target duration.
+/// Used to align a dub-audio track's cuts to the *main content's own*
+/// video segment boundaries — those land at whatever keyframe is at or
+/// after each 6-second mark, so their real durations vary slightly (e.g.
+/// 5.9s, 6.2s, ...); cutting a dub track independently by a fixed 6.0s
+/// target would drift out of sync with that over enough segments, since
+/// small per-segment differences accumulate. `boundary_secs` should be the
+/// main content's own cumulative segment end times, so both tracks share
+/// exactly the same cut points regardless of that jitter.
+fn compute_audio_only_segments_at_boundaries(
+    audio: &[SampleInfo],
+    audio_timescale: u32,
+    boundary_secs: &[f64],
+) -> Vec<SegmentSamples> {
+    if audio.is_empty() || boundary_secs.is_empty() {
+        return vec![];
+    }
+    let mut segments: Vec<SegmentSamples> = Vec::new();
+    let start_dts = audio[0].dts;
+    let mut cursor = 0usize;
+
+    for (idx, &boundary_sec) in boundary_secs.iter().enumerate() {
+        let is_last = idx == boundary_secs.len() - 1;
+        let seg_start = cursor;
+
+        if is_last {
+            // Absorb every remaining sample — a dub track can run a little
+            // longer or shorter than the main content, and whatever's left
+            // belongs in the final segment rather than being dropped.
+            cursor = audio.len();
+        } else {
+            let boundary_ts = start_dts + (boundary_sec * audio_timescale as f64) as u64;
+            while cursor < audio.len() && audio[cursor].dts < boundary_ts {
+                cursor += 1;
+            }
+        }
+
+        if cursor <= seg_start {
+            // The dub track ran out before reaching this boundary (shorter
+            // than main) — no samples for this or any later segment.
+            break;
+        }
+
+        let seg = &audio[seg_start..cursor];
+        let seg_start_pts = seg[0].dts;
+        let seg_end_dts = seg.last().map(|s| s.dts + s.duration as u64).unwrap_or(seg_start_pts);
+        let start_pts_sec = (seg_start_pts - start_dts) as f64 / audio_timescale as f64;
+        let duration_sec = (seg_end_dts - seg_start_pts) as f64 / audio_timescale as f64;
+
+        segments.push(SegmentSamples {
+            video: vec![],
+            audio: seg.to_vec(),
+            start_pts_sec,
+            duration_sec,
+        });
+    }
+
+    segments
+}
+
 // ── MPEG-TS CRC-32 ───────────────────────────────────────────────
 
 fn crc32_mpeg(data: &[u8]) -> u32 {
@@ -811,8 +953,8 @@ fn build_pat(cc: &mut u8) -> Vec<u8> {
     pkt.to_vec()
 }
 
-fn build_pmt(cc: &mut u8, has_audio: bool) -> Vec<u8> {
-    let num_streams = if has_audio { 2 } else { 1 };
+fn build_pmt(cc: &mut u8, has_video: bool, has_audio: bool) -> Vec<u8> {
+    let num_streams = (has_video as usize) + (has_audio as usize);
     let sec_len = 9 + num_streams * 5 + 4; // pmt header + streams + crc
 
     let mut sec: Vec<u8> = Vec::with_capacity(30);
@@ -824,14 +966,20 @@ fn build_pmt(cc: &mut u8, has_audio: bool) -> Vec<u8> {
     sec.push(0xC1);
     sec.push(0x00);
     sec.push(0x00);
-    sec.push(0xE0 | ((VID_PID >> 8) as u8 & 0x1F)); // PCR PID = video PID
-    sec.push((VID_PID & 0xFF) as u8);
+    // PCR PID = video PID when there's a video stream to carry it; falls back
+    // to the audio PID for audio-only streams (dub-audio renditions), which
+    // have no video stream at all to anchor it to.
+    let pcr_pid = if has_video { VID_PID } else { AUD_PID };
+    sec.push(0xE0 | ((pcr_pid >> 8) as u8 & 0x1F));
+    sec.push((pcr_pid & 0xFF) as u8);
     sec.extend_from_slice(&[0xF0, 0x00]); // no program info
 
-    sec.push(0x1B); // H.264 video stream
-    sec.push(0xE0 | ((VID_PID >> 8) as u8 & 0x1F));
-    sec.push((VID_PID & 0xFF) as u8);
-    sec.extend_from_slice(&[0xF0, 0x00]);
+    if has_video {
+        sec.push(0x1B); // H.264 video stream
+        sec.push(0xE0 | ((VID_PID >> 8) as u8 & 0x1F));
+        sec.push((VID_PID & 0xFF) as u8);
+        sec.extend_from_slice(&[0xF0, 0x00]);
+    }
 
     if has_audio {
         sec.push(0x0F); // AAC/ADTS audio stream
@@ -1040,10 +1188,20 @@ fn mux_segment_inner(
     let mut vid_cc = 0u8;
     let mut aud_cc = 0u8;
 
+    // Symmetric with `has_audio` below: checking *both* the metadata array
+    // and the actual byte data lets a caller force either an audio-only or
+    // a video-only mux from segments whose metadata has both (i.e. reuse
+    // one `HlsProcessor` built from the main content's own `parse_headers`
+    // to produce its video-only rendition and its "original audio" render
+    // as a separate audio-only rendition, from the exact same segment
+    // boundaries — see the worker's dub-audio pipeline). A dedicated
+    // audio-only source (`HlsProcessor::parse_audio_only`) naturally has
+    // empty video metadata too, so this covers that case as well.
+    let has_video = !video_samples.is_empty() && !video_data.is_empty();
     let has_audio = !audio_samples.is_empty() && !audio_data.is_empty();
 
     out.extend_from_slice(&build_pat(&mut pat_cc));
-    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_audio));
+    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_video, has_audio));
 
     let mut v_offset = 0usize;
     let mut is_first_vid = true;
@@ -1074,6 +1232,7 @@ fn mux_segment_inner(
 
     if has_audio {
         let mut a_offset = 0usize;
+        let mut is_first_aud = true;
         for sm in audio_samples {
             let end = a_offset + sm.size as usize;
             if end > audio_data.len() {
@@ -1085,12 +1244,20 @@ fn mux_segment_inner(
             let wrapped = adts_wrap(raw, aac_config);
             let pts_90 = sm.pts * 90000 / audio_timescale as u64;
 
+            // In the video+audio case, PCR anchors to the video track above
+            // and audio never carries its own. Audio-only segments have no
+            // video track to anchor to, so the first audio packet takes over
+            // that job instead — same reasoning as the video PCR above,
+            // just on whichever track is actually present.
+            let pcr = if !has_video && is_first_aud { Some(pts_90) } else { None };
+
             let header = pes_header(0xC0, pts_90, None);
             let mut pes_payload = Vec::with_capacity(header.len() + wrapped.len());
             pes_payload.extend_from_slice(&header);
             pes_payload.extend_from_slice(&wrapped);
 
-            out.extend_from_slice(&packetise(AUD_PID, &pes_payload, None, &mut aud_cc));
+            out.extend_from_slice(&packetise(AUD_PID, &pes_payload, pcr, &mut aud_cc));
+            is_first_aud = false;
         }
     }
 
@@ -1128,11 +1295,16 @@ fn mux_encoded_segment_inner(
     let mut vid_cc = 0u8;
     let mut aud_cc = 0u8;
 
+    // Symmetric with `mux_segment_inner`'s fast-path counterpart: an empty
+    // `video_meta` (a dub-audio-only ABR rendition) produces an audio-only
+    // stream instead of erroring, and a video rendition with dub-audio
+    // active is muxed with empty audio the same way.
+    let has_video = !video_meta.is_empty();
     let has_audio = !audio_meta.is_empty() && !audio_data.is_empty();
     let aac_config = [2u8, sample_rate_to_idx(audio_sample_rate), audio_channels]; // AAC-LC
 
     out.extend_from_slice(&build_pat(&mut pat_cc));
-    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_audio));
+    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_video, has_audio));
 
     let mut v_offset = 0usize;
     let mut is_first_vid = true;
@@ -1161,6 +1333,7 @@ fn mux_encoded_segment_inner(
 
     if has_audio {
         let mut a_offset = 0usize;
+        let mut is_first_aud = true;
         for sm in audio_meta {
             let end = a_offset + sm.size as usize;
             if end > audio_data.len() {
@@ -1172,12 +1345,18 @@ fn mux_encoded_segment_inner(
             let wrapped = adts_wrap(raw, aac_config);
             let pts_90 = (sm.timestamp_us / 1_000_000.0 * 90000.0).round() as u64;
 
+            // Same reasoning as mux_segment_inner: PCR anchors to video when
+            // there is one; an audio-only rendition has no video PID to
+            // anchor to, so its first audio packet takes over that job.
+            let pcr = if !has_video && is_first_aud { Some(pts_90) } else { None };
+
             let header = pes_header(0xC0, pts_90, None);
             let mut pes_payload = Vec::with_capacity(header.len() + wrapped.len());
             pes_payload.extend_from_slice(&header);
             pes_payload.extend_from_slice(&wrapped);
 
-            out.extend_from_slice(&packetise(AUD_PID, &pes_payload, None, &mut aud_cc));
+            out.extend_from_slice(&packetise(AUD_PID, &pes_payload, pcr, &mut aud_cc));
+            is_first_aud = false;
         }
     }
 
@@ -1284,31 +1463,7 @@ impl HlsProcessor {
         log!("[wasm] computed {} segments", segments.len());
 
         let total = segments.len();
-        let seg_json: Vec<serde_json::Value> = segments
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "startPtsSec": s.start_pts_sec,
-                    "durationSec": s.duration_sec,
-                    "videoSamples": s.video.iter().map(|sm| serde_json::json!({
-                        "fileOffset": sm.file_offset,
-                        "size": sm.size,
-                        "pts": sm.pts,
-                        "dts": sm.dts,
-                        "duration": sm.duration,
-                        "isKeyframe": sm.is_keyframe,
-                    })).collect::<Vec<_>>(),
-                    "audioSamples": s.audio.iter().map(|sm| serde_json::json!({
-                        "fileOffset": sm.file_offset,
-                        "size": sm.size,
-                        "pts": sm.pts,
-                        "dts": sm.dts,
-                        "duration": sm.duration,
-                        "isKeyframe": sm.is_keyframe,
-                    })).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
+        let seg_json = segments_to_json(&segments);
 
         let result = serde_json::json!({
             "segmentCount": total,
@@ -1325,6 +1480,95 @@ impl HlsProcessor {
         // Return a JSON string, not a JsValue object: serde_wasm_bindgen turns a
         // serde_json::Map into a JS Map, so `result.segmentCount` would read as
         // undefined. JSON.parse() on the JS side always gives a plain object.
+        let json_str = serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(JsValue::from_str(&json_str))
+    }
+
+    /// Like `parse_headers`, but for a dub-audio track: only looks for a
+    /// `soun` trak, doesn't require (or even look for) video, and segments
+    /// by duration alone via `compute_audio_only_segments` instead of video
+    /// keyframes. Returns the same JSON shape as `parse_headers` (so the
+    /// caller's segment-reading code doesn't need a separate branch) —
+    /// `videoSamples` is simply `[]` on every segment.
+    pub fn parse_audio_only(&mut self, data: &[u8]) -> Result<JsValue, JsValue> {
+        let moov = find_box(data, b"moov")
+            .ok_or_else(|| JsValue::from_str("moov box not found in data"))?;
+
+        let traks = find_all_boxes(moov, b"trak");
+        let movie_timescale = parse_mvhd_timescale(moov).unwrap_or(0);
+
+        let mut audio: Option<TrackData> = None;
+        for trak in traks {
+            if let Some(td) = parse_track(trak, movie_timescale) {
+                if &td.handler == b"soun" && audio.is_none() {
+                    audio = Some(td);
+                }
+            }
+        }
+
+        let mut aud = audio.ok_or_else(|| JsValue::from_str("No audio track found"))?;
+
+        // Same edit-list trimming `parse_headers` does for video+audio,
+        // just against this track's own edit list (there's no second track
+        // to combine against).
+        let aud_end_sec = aud.edit_list_end.map(|t| t as f64 / aud.timescale as f64);
+        if let Some(end_sec) = combined_edit_list_end_sec(None, aud_end_sec) {
+            let cutoff = (end_sec * aud.timescale as f64) as u64;
+            let before = aud.samples.len();
+            aud.samples.retain(|s| s.dts < cutoff);
+            if before != aud.samples.len() {
+                log!("[wasm] edit list trimmed {} trailing sample(s) not meant for playback", before - aud.samples.len());
+            }
+        }
+
+        let segments = compute_audio_only_segments(&aud.samples, aud.timescale, self.target_duration);
+        log!("[wasm] computed {} audio-only segments", segments.len());
+
+        let total = segments.len();
+        let seg_json = segments_to_json(&segments);
+
+        let result = serde_json::json!({
+            "segmentCount": total,
+            "audioTimescale": aud.timescale,
+            "targetDuration": self.target_duration,
+            "segments": seg_json,
+        });
+
+        self.segments = segments;
+        self.video = None;
+        self.audio = Some(aud);
+
+        let json_str = serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(JsValue::from_str(&json_str))
+    }
+
+    /// Re-segments the track already parsed by `parse_audio_only` at
+    /// explicit boundaries instead of `target_duration` — call this right
+    /// after `parse_audio_only` and before reading segment count/muxing, to
+    /// align a dub track's cuts to the main content's own segment
+    /// boundaries (see `compute_audio_only_segments_at_boundaries`).
+    /// `boundaries_json` is a JSON array of cumulative end-of-segment
+    /// times, in seconds from this track's own start.
+    pub fn segment_audio_at_boundaries(&mut self, boundaries_json: &str) -> Result<JsValue, JsValue> {
+        let aud = self.audio.as_ref().ok_or_else(|| JsValue::from_str("Not initialised"))?;
+        let boundaries: Vec<f64> = serde_json::from_str(boundaries_json)
+            .map_err(|e| JsValue::from_str(&format!("bad boundaries_json: {e}")))?;
+
+        let segments = compute_audio_only_segments_at_boundaries(&aud.samples, aud.timescale, &boundaries);
+        log!("[wasm] re-segmented to {} boundary-aligned audio segments", segments.len());
+
+        let total = segments.len();
+        let seg_json = segments_to_json(&segments);
+        let result = serde_json::json!({
+            "segmentCount": total,
+            "audioTimescale": aud.timescale,
+            "segments": seg_json,
+        });
+
+        self.segments = segments;
+
         let json_str = serde_json::to_string(&result)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(JsValue::from_str(&json_str))
@@ -1404,14 +1648,17 @@ impl HlsProcessor {
 
     /// Mux one segment into MPEG-TS bytes.
     /// `video_data`/`audio_data` are the concatenated raw sample bytes read
-    /// from the file at the offsets `parse_headers` returned.
+    /// from the file at the offsets `parse_headers` (or `parse_audio_only`)
+    /// returned. When this instance was built via `parse_audio_only`,
+    /// `self.video` is `None` and every segment's own `video` samples are
+    /// empty — `mux_segment_inner` reads that as "audio-only" and writes an
+    /// audio-only MPEG-TS stream instead of erroring.
     pub fn mux_segment(
         &self,
         video_data: &[u8],
         audio_data: &[u8],
         segment_index: u32,
     ) -> Result<Box<[u8]>, JsValue> {
-        let vid = self.video.as_ref().ok_or_else(|| JsValue::from_str("Not initialised"))?;
         let aud = self.audio.as_ref().ok_or_else(|| JsValue::from_str("Not initialised"))?;
         let seg = self
             .segments
@@ -1429,15 +1676,23 @@ impl HlsProcessor {
             .map(|s| SampleMeta { size: s.size, pts: s.pts, dts: s.dts, is_keyframe: s.is_keyframe })
             .collect();
 
+        // No video track at all in audio-only mode — annexb_header/
+        // nalu_len_size/video_timescale only matter inside `video_samples`'
+        // loop, which is empty here, so these placeholders are never read.
+        let (annexb_header, nalu_len_size, video_timescale): (&[u8], u8, u32) = match &self.video {
+            Some(vid) => (&vid.annexb_header, vid.nalu_len_size, vid.timescale),
+            None => (&[], 4, 1),
+        };
+
         let ts_bytes = mux_segment_inner(
             &vmeta,
             video_data,
             &ameta,
             audio_data,
-            &vid.annexb_header,
-            vid.nalu_len_size,
+            annexb_header,
+            nalu_len_size,
             aud.aac_config,
-            vid.timescale,
+            video_timescale,
             aud.timescale,
         );
 
@@ -1563,5 +1818,110 @@ mod tests {
     #[test]
     fn combined_edit_list_end_is_none_when_neither_track_has_one() {
         assert_eq!(combined_edit_list_end_sec(None, None), None);
+    }
+
+    fn audio_sample(dts: u64, duration: u32) -> SampleInfo {
+        SampleInfo { file_offset: 0, size: 100, pts: dts, dts, duration, is_keyframe: false }
+    }
+
+    #[test]
+    fn audio_only_segments_empty_input_returns_empty() {
+        assert!(compute_audio_only_segments(&[], 44100, 6.0).is_empty());
+    }
+
+    #[test]
+    fn audio_only_segments_split_by_duration_not_keyframe() {
+        // AAC frames have no keyframe concept — every sample here has
+        // is_keyframe=false, unlike compute_segments' video input, and the
+        // function must still produce boundaries from duration alone.
+        let samples: Vec<SampleInfo> = (0..10).map(|i| audio_sample(i * 1024, 1024)).collect();
+        let segments = compute_audio_only_segments(&samples, 44100, 0.05);
+        assert!(!segments.is_empty());
+        let total_samples: usize = segments.iter().map(|s| s.audio.len()).sum();
+        assert_eq!(total_samples, 10, "every sample must be accounted for exactly once");
+        assert!(segments.iter().all(|s| s.video.is_empty()), "audio-only segments carry no video samples");
+    }
+
+    #[test]
+    fn audio_only_segments_last_segment_absorbs_the_remainder() {
+        let samples: Vec<SampleInfo> = (0..5).map(|i| audio_sample(i * 1024, 1024)).collect();
+        // A target far longer than the whole track: one segment holding
+        // every sample, same "is_last" fallback compute_segments relies on.
+        let segments = compute_audio_only_segments(&samples, 44100, 60.0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].audio.len(), 5);
+    }
+
+    #[test]
+    fn audio_only_segments_at_boundaries_matches_given_cut_points_not_a_fixed_target() {
+        // 100 samples/sec for 1 second (timescale 100, matching sample
+        // index to dts for readability). Three boundaries at 0.3s/0.6s/1.0s
+        // must produce exactly three segments split there, regardless of
+        // what a fixed-target cut would have chosen.
+        let samples: Vec<SampleInfo> = (0..100).map(|i| audio_sample(i, 1)).collect();
+        let segments = compute_audio_only_segments_at_boundaries(&samples, 100, &[0.3, 0.6, 1.0]);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].audio.len(), 30);
+        assert_eq!(segments[1].audio.len(), 30);
+        assert_eq!(segments[2].audio.len(), 40);
+    }
+
+    #[test]
+    fn audio_only_segments_at_boundaries_shorter_track_stops_early() {
+        // A dub track that runs out before the main content's last
+        // boundary: later boundaries simply produce no segment, rather
+        // than panicking or fabricating empty ones.
+        let samples: Vec<SampleInfo> = (0..50).map(|i| audio_sample(i, 1)).collect();
+        let segments = compute_audio_only_segments_at_boundaries(&samples, 100, &[0.3, 0.6, 1.0]);
+        assert_eq!(segments.len(), 2);
+        let total: usize = segments.iter().map(|s| s.audio.len()).sum();
+        assert_eq!(total, 50, "every available sample still ends up in some segment");
+    }
+
+    #[test]
+    fn audio_only_segments_at_boundaries_longer_track_absorbs_remainder_into_last() {
+        // A dub track longer than the main content: the *last* boundary
+        // always absorbs every remaining sample regardless of its own
+        // stated time, so trailing extra audio is folded into the final
+        // segment instead of being dropped.
+        let samples: Vec<SampleInfo> = (0..150).map(|i| audio_sample(i, 1)).collect();
+        let segments = compute_audio_only_segments_at_boundaries(&samples, 100, &[0.3, 0.6, 1.0]);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[2].audio.len(), 90, "60 samples up to 0.6s already consumed, the remaining 90 all land here");
+    }
+
+    fn pmt_section_length(pkt: &[u8]) -> u16 {
+        (((pkt[6] & 0x0F) as u16) << 8) | pkt[7] as u16
+    }
+
+    fn pmt_pcr_pid(pkt: &[u8]) -> u16 {
+        (((pkt[13] & 0x1F) as u16) << 8) | pkt[14] as u16
+    }
+
+    #[test]
+    fn pmt_video_and_audio_has_two_stream_entries() {
+        let mut cc = 0u8;
+        let pkt = build_pmt(&mut cc, true, true);
+        assert_eq!(pkt.len(), 188);
+        assert_eq!(pmt_section_length(&pkt), 9 + 2 * 5 + 4);
+        assert_eq!(pmt_pcr_pid(&pkt), VID_PID, "PCR anchors to video when video is present");
+    }
+
+    #[test]
+    fn pmt_video_only_has_one_stream_entry_and_video_pcr() {
+        let mut cc = 0u8;
+        let pkt = build_pmt(&mut cc, true, false);
+        assert_eq!(pmt_section_length(&pkt), 9 + 5 + 4);
+        assert_eq!(pmt_pcr_pid(&pkt), VID_PID);
+        assert_eq!(pkt[17], 0x1B, "sole stream entry is H.264 video");
+    }
+
+    #[test]
+    fn pmt_audio_only_has_one_stream_entry_and_audio_pcr() {
+        let mut cc = 0u8;
+        let pkt = build_pmt(&mut cc, false, true);
+        assert_eq!(pmt_section_length(&pkt), 9 + 5 + 4);
+        assert_eq!(pmt_pcr_pid(&pkt), AUD_PID, "no video track to anchor PCR to — falls back to audio");
+        assert_eq!(pkt[17], 0x0F, "sole stream entry is AAC/ADTS audio, not the video 0x1B seen when video is present");
     }
 }

@@ -55,6 +55,17 @@ export interface TranscodingSession {
     outroWidth?: number;
     outroHeight?: number;
   };
+  /**
+   * Optional dub-audio tracks (OPFS filenames of audio or video files, only
+   * their audio is read). Per real-world HLS practice, these aren't muxed
+   * into the video segments alongside the original audio — the main
+   * content's video segments become video-only, its own audio becomes an
+   * audio-only rendition in its own right, and every dub track is another
+   * audio-only rendition alongside it, all in the same `#EXT-X-MEDIA:
+   * TYPE=AUDIO` group so a player can switch between them. Forces a
+   * master.m3u8 on the fast path, same reason as `subtitleTrack`.
+   */
+  dubAudioTracks?: { fileName: string; language: string; label: string }[];
 }
 
 // ── Adaptive bitrate (multi-resolution) ────────────────────────────
@@ -167,6 +178,16 @@ export interface ParseHeadersResult {
   videoTimescale: number;
   audioTimescale: number;
   targetDuration: number;
+  segments: SegmentInfoJs[];
+}
+
+/** Result shape of `HlsProcessor.parse_audio_only`/`segment_audio_at_boundaries`
+ * — same idea as `ParseHeadersResult`, but there's no video track at all, so
+ * no `videoTimescale`. `videoSamples` is still present on each segment (see
+ * `SegmentInfoJs`), just always `[]`. */
+export interface AudioOnlyParseResult {
+  segmentCount: number;
+  audioTimescale: number;
   segments: SegmentInfoJs[];
 }
 

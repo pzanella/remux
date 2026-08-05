@@ -829,6 +829,71 @@ body {
   border-top: 6px solid var(--accent);
 }
 
+/* ── Dub audio (not time-positioned, so it lives outside the scaled grid — see the comment above it in Timeline.tsx) ── */
+.timeline-dub-audio {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--line);
+}
+.timeline-dub-audio-label {
+  flex-shrink: 0;
+  width: 5rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.timeline-dub-audio-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.dub-audio-chip {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-sunken);
+}
+.dub-audio-chip-name {
+  font-size: 0.78rem;
+  color: var(--text);
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dub-audio-lang-input {
+  width: 3rem;
+  padding: 0.15rem 0.35rem;
+}
+.dub-audio-chip-remove {
+  cursor: pointer;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 0.1rem;
+}
+.dub-audio-chip-remove:hover:not(:disabled) {
+  color: var(--danger);
+}
+.dub-audio-chip-remove:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.timeline-add-btn--dub {
+  width: auto;
+  height: auto;
+  padding: 0.35rem 0.6rem;
+}
+
 /* ── Subtitle cue editor ── */
 .cue-editor-backdrop {
   position: fixed;

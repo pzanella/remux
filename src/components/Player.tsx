@@ -94,7 +94,18 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
 
       player.addEventListener('error', (event) => {
         const detail = (event as unknown as { detail?: shaka.util.Error }).detail;
-        setPlayerError(`Playback error: ${detail ? `code ${detail.code}` : 'unknown error'}`);
+        // Shaka's own `data` array carries the actual diagnostic payload for
+        // a given code (e.g. the native MediaError code/message behind a
+        // VIDEO_ERROR) — logging just `code {N}` throws that away, leaving
+        // nothing to debug from later. Surface it in both places: the
+        // console (full object, in case anything in `data` doesn't stringify
+        // cleanly) and the on-screen message (so it's visible without
+        // DevTools open).
+        if (detail) {
+          console.error('[Shaka] Playback error', detail);
+        }
+        const dataSuffix = detail?.data?.length ? ` — ${detail.data.map(String).join(', ')}` : '';
+        setPlayerError(`Playback error: ${detail ? `code ${detail.code}${dataSuffix}` : 'unknown error'}`);
       });
 
       uiRef.current = new shaka.ui.Overlay(player, containerRef.current!, videoRef.current!);

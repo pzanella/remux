@@ -7,7 +7,7 @@
  * FFmpeg.wasm first.
  */
 
-import type { WorkerCommand, WorkerEvent, ParseHeadersResult, SegmentInfoJs, AbrRendition } from '../types';
+import type { WorkerCommand, WorkerEvent, ParseHeadersResult, AudioOnlyParseResult, SegmentInfoJs, AbrRendition } from '../types';
 import { isNativeContainer, ABR_LADDER } from '../types';
 import { parseCues, serializeVtt, shiftCues } from '../lib/vtt';
 
@@ -158,6 +158,43 @@ async function convertToMp4(sourceOpfsName: string, originalFileName: string): P
   return outputOpfsName;
 }
 
+/** FFmpeg fallback for a dub-audio file that isn't already an MP4-family
+ * container `HlsProcessor.parse_audio_only` can read directly (`.mp3`,
+ * `.wav`, ...) — same idea as `convertToMp4` above, but audio-only: a dub
+ * track's own video stream, if a video file was dropped in as one, was
+ * never going to be used anyway. */
+async function convertAudioToM4a(sourceOpfsName: string, originalFileName: string): Promise<string> {
+  const { FFmpeg } = await loadFFmpegModule();
+  const { fetchFile } = await import('@ffmpeg/util');
+
+  const ffmpeg = new FFmpeg();
+  await loadFFmpegCore(ffmpeg);
+
+  const opfsRoot = await navigator.storage.getDirectory();
+  const srcHandle = await opfsRoot.getFileHandle(sourceOpfsName);
+  const srcFile: File = await srcHandle.getFile();
+
+  const ext = originalFileName.includes('.') ? originalFileName.slice(originalFileName.lastIndexOf('.')) : '.audio';
+  const inputName = `input${ext}`;
+  await ffmpeg.writeFile(inputName, await fetchFile(srcFile));
+
+  const outputName = 'output.m4a';
+  await ffmpeg.exec(['-i', inputName, '-vn', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-y', outputName]);
+
+  const outputData = (await ffmpeg.readFile(outputName)) as Uint8Array;
+  const outputOpfsName = `converted_${Date.now()}_dub.m4a`;
+  const outHandle = await opfsRoot.getFileHandle(outputOpfsName, { create: true });
+  const writable = await outHandle.createWritable();
+  await writable.write(outputData.buffer.slice(0) as ArrayBuffer);
+  await writable.close();
+
+  await ffmpeg.deleteFile(inputName);
+  await ffmpeg.deleteFile(outputName);
+  ffmpeg.terminate();
+
+  return outputOpfsName;
+}
+
 interface RenditionResult {
   rendition: (typeof ABR_LADDER)[number];
   playlist: string;
@@ -194,6 +231,13 @@ async function encodeRendition(
   // there: it needs to end up at these exact pixel dimensions, letterboxed
   // or pillarboxed rather than stretched or cropped to get there.
   letterboxTarget?: { width: number; height: number },
+  // With dub-audio active, every rendition drops its own embedded audio in
+  // favor of the shared "aud" group `buildAudioOnlyRenditions` builds once
+  // (see the WebCodecs path's identical tradeoff) — `-an` skips the audio
+  // encode entirely here rather than just discarding its output, since
+  // FFmpeg (unlike the WebCodecs per-rendition encoders) has no shared
+  // decode-once-fan-out to lose by doing so.
+  hasDubAudio = false,
 ): Promise<RenditionResult> {
   const ffmpeg = new FFmpeg();
   ffmpeg.on('progress', ({ progress }) => onProgress(Math.min(Math.max(progress, 0), 1)));
@@ -206,6 +250,7 @@ async function encodeRendition(
   const scaleFilter = letterboxTarget
     ? `scale=${letterboxTarget.width}:${letterboxTarget.height}:force_original_aspect_ratio=decrease,pad=${letterboxTarget.width}:${letterboxTarget.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1`
     : `scale=-2:${rendition.height}`;
+  const audioArgs = hasDubAudio ? ['-an'] : ['-c:a', 'aac', '-b:a', `${rendition.audioBitrateKbps}k`];
 
   await ffmpeg.exec(
     [
@@ -219,8 +264,7 @@ async function encodeRendition(
       '-g', '60',
       '-keyint_min', '60',
       '-sc_threshold', '0',
-      '-c:a', 'aac',
-      '-b:a', `${rendition.audioBitrateKbps}k`,
+      ...audioArgs,
       '-hls_time', '6',
       '-hls_playlist_type', 'vod',
       '-hls_segment_filename', segmentPattern,
@@ -312,6 +356,7 @@ async function encodeRenditionsForSource(
   // `scale=-2:H` (its own aspect ratio always matches itself, by
   // definition — nothing to letterbox against).
   mainDimensions?: { width: number; height: number },
+  hasDubAudio = false,
 ): Promise<RenditionResult[]> {
   const renditionLabels = renditions.map((r) => r.label).join(', ');
   log(`${logPrefix}Encoding ${renditions.length} rendition${renditions.length > 1 ? 's' : ''} in parallel: ${renditionLabels}…`);
@@ -351,6 +396,7 @@ async function encodeRenditionsForSource(
           mainDimensions
             ? { width: computeRenditionWidth(mainDimensions.width, mainDimensions.height, rendition.height), height: rendition.height }
             : undefined,
+          hasDubAudio,
         ),
       ),
     );
@@ -390,6 +436,9 @@ async function runAbrTranscoding(
   const mainDimensions = { width: sourceWidth, height: sourceHeight };
   const introName = session.introOutro?.introFileName;
   const outroName = session.introOutro?.outroFileName;
+  // Mutually exclusive with intro/outro (checked in runTranscoding), so
+  // introName/outroName are never set alongside this.
+  const hasDubAudio = !!session.dubAudioTracks?.length;
 
   let introResults: RenditionResult[] | null = null;
   if (introName) {
@@ -415,7 +464,7 @@ async function runAbrTranscoding(
   try {
     const { data, inputName } = await loadFFmpegInput(opfsRoot, session.sourceFilePath);
     mainResults = await encodeRenditionsForSource(
-      FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, '', '',
+      FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, '', '', undefined, hasDubAudio,
     );
   } catch (err) {
     if (cancelled) {
@@ -462,12 +511,30 @@ async function runAbrTranscoding(
   const toAbrSourceResults = (results: RenditionResult[] | null): AbrSourceResult[] | null =>
     results && results.map((r) => ({ rendition: r.rendition, width: r.width, playlistText: r.playlistText }));
 
+  let audioTags: AudioTrackTag[] | undefined;
+  if (hasDubAudio) {
+    if (mainResults.length === 0) {
+      post({ type: 'ERROR', error: 'No rendition produced any output.' });
+      return;
+    }
+    // Every rendition shares the same `-hls_time 6` target duration and the
+    // same source, so their real cut points agree — any one's playlist works.
+    const boundaries = cumulativeBoundaries(durationsFromPlaylist(mainResults[0].playlistText));
+    const result = await buildAudioOnlyRenditions(session, outputFolderHandle, boundaries);
+    if ('error' in result) {
+      post({ type: 'ERROR', error: result.error });
+      return;
+    }
+    audioTags = result;
+  }
+
   const { masterM3u8, highestM3u8 } = await finalizeAbrResults(
     outputFolderHandle,
     toAbrSourceResults(mainResults) ?? [],
     toAbrSourceResults(introResults),
     toAbrSourceResults(outroResults),
     subtitleTag,
+    audioTags,
   );
 
   post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
@@ -503,13 +570,21 @@ function computeLetterboxRect(srcW: number, srcH: number, dstW: number, dstH: nu
 function buildMasterM3U8(
   streamInfos: { rendition: (typeof ABR_LADDER)[number]; playlist: string; width: number }[],
   subtitleTag?: SubtitleTag,
+  audioTags?: AudioTrackTag[],
 ): string {
   let m = '#EXTM3U\n#EXT-X-VERSION:3\n';
   if (subtitleTag) m += buildSubtitleMediaTag(subtitleTag);
+  if (audioTags) for (const tag of audioTags) m += buildAudioMediaTag(tag);
   for (const { rendition, playlist, width } of streamInfos) {
+    // With dub-audio, every rendition's own audio was dropped in favor of
+    // the shared "aud" group (see buildAudioOnlyRenditions) — the
+    // audioBitrateKbps folded into BANDWIDTH here is nominal in that case
+    // (no per-rendition audio encode happened), same tradeoff subtitles
+    // already make by not affecting BANDWIDTH at all.
     const bandwidth = (rendition.videoBitrateKbps + rendition.audioBitrateKbps) * 1000;
     const subsAttr = subtitleTag ? `,SUBTITLES="${SUBTITLES_GROUP_ID}"` : '';
-    m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${rendition.height}${subsAttr}\n`;
+    const audioAttr = audioTags?.length ? `,AUDIO="${AUDIO_GROUP_ID}"` : '';
+    m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${rendition.height}${subsAttr}${audioAttr}\n`;
     m += `${playlist}\n`;
   }
   return m;
@@ -576,6 +651,30 @@ function totalDurationFromPlaylist(playlistText: string): number {
     total += parseFloat(match[1]);
   }
   return total;
+}
+
+// ── Dub-audio (optional alternate #EXT-X-MEDIA:TYPE=AUDIO renditions) ──
+//
+// Same reasoning as subtitles above: an alternate audio track is a sidecar
+// referenced from the master playlist, not muxed into the video segments.
+// Unlike subtitles, though, there's more than one track in play the moment
+// dub-audio is used at all (the original included) — see the GROUP-ID/
+// AUDIO="aud" wiring in buildFastPathMasterM3U8 and the "original" audio
+// split out of the main content's own segments in runWithHandle.
+
+const AUDIO_GROUP_ID = 'aud';
+const ORIGINAL_AUDIO_PLAYLIST = 'audio_orig.m3u8';
+const ORIGINAL_AUDIO_SEGMENT_PREFIX = 'audio_orig_';
+
+interface AudioTrackTag {
+  name: string;
+  language: string;
+  playlist: string;
+  isDefault: boolean;
+}
+
+function buildAudioMediaTag({ name, language, playlist, isDefault }: AudioTrackTag): string {
+  return `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="${AUDIO_GROUP_ID}",NAME="${name}",LANGUAGE="${language}",DEFAULT=${isDefault ? 'YES' : 'NO'},AUTOSELECT=YES,URI="${playlist}"\n`;
 }
 
 /**
@@ -716,6 +815,10 @@ interface AbrPipelineContext {
    * encoded independently and spliced together afterward without filename
    * collisions. */
   segmentPrefix: string;
+  /** When true, every rendition's own (still-encoded, just discarded)
+   * audio is left out of its segments — the shared "aud" group built by
+   * `buildAudioOnlyRenditions` carries audio instead. See `writeRenditionSegment`. */
+  hasDubAudio: boolean;
 }
 
 interface RenditionSink {
@@ -913,8 +1016,15 @@ async function writeRenditionSegment(sink: RenditionSink, cut: CutSegment, isFin
 
   const videoData = concatChunks(cut.videoChunks);
   const videoMeta = cut.videoChunks.map((c) => ({ size: c.data.byteLength, timestampUs: c.timestampUs, isKeyframe: c.isKeyframe }));
-  const audioData = concatChunks(cut.audioChunks);
-  const audioMeta = cut.audioChunks.map((c) => ({ size: c.data.byteLength, timestampUs: c.timestampUs, isKeyframe: false }));
+  // With dub-audio active, this rendition's own audio encoder still ran
+  // (simplest to leave it be — the discarded work is small next to the
+  // video encode) but its output is dropped here: the shared "aud" group
+  // built by buildAudioOnlyRenditions carries audio for every rendition
+  // instead of each having its own embedded copy.
+  const audioData = sink.pipeline.hasDubAudio ? new Uint8Array(0) : concatChunks(cut.audioChunks);
+  const audioMeta = sink.pipeline.hasDubAudio
+    ? []
+    : cut.audioChunks.map((c) => ({ size: c.data.byteLength, timestampUs: c.timestampUs, isKeyframe: false }));
 
   const tsBytes = sink.pipeline.processor.mux_encoded_segment(
     videoData,
@@ -961,6 +1071,23 @@ function extractPlaylistBody(playlistText: string): string {
     .join('\n');
 }
 
+/** Every individual `#EXTINF` duration, in playlist order — unlike
+ * `totalDurationFromPlaylist` (which only needs the sum), this is used to
+ * recover a rendition's *real* per-segment cut points for
+ * `buildAudioOnlyRenditions`, since ABR renditions are cut by forced
+ * keyframes at encode time, not by any pre-computed boundary list the way
+ * the fast path's are. */
+function durationsFromPlaylist(playlistText: string): number[] {
+  return [...playlistText.matchAll(/#EXTINF:([\d.]+)/g)].map((m) => parseFloat(m[1]));
+}
+
+/** Individual segment durations → cumulative end times, the boundary shape
+ * `buildAudioOnlyRenditions`/`segment_audio_at_boundaries` expect. */
+function cumulativeBoundaries(durations: number[]): number[] {
+  let acc = 0;
+  return durations.map((d) => (acc += d));
+}
+
 /** Concatenates 1-3 already-complete variant playlists (intro/main/outro,
  * in that order) for the *same* rendition into one, with an
  * #EXT-X-DISCONTINUITY between each — the ABR counterpart of
@@ -982,6 +1109,59 @@ function spliceM3U8Texts(playlistTexts: string[]): string {
 }
 
 /**
+ * Builds the "Original" audio plus every dub track as audio-only HLS
+ * renditions sharing one `#EXT-X-MEDIA:TYPE=AUDIO` group — used identically
+ * whether the video came from the fast path or either ABR path. Audio
+ * quality doesn't need to scale with video rendition the way video does, so
+ * this doesn't run once per rendition: one shared track per language serves
+ * every video quality, reusing `remuxDubAudioTrack` (byte-copied when the
+ * source is already an MP4-family container, FFmpeg-normalized otherwise —
+ * see its own comment) for both the source's own audio and every dub file.
+ *
+ * `boundaries` must be the *real* cumulative segment end times of whichever
+ * video rendition these tracks need to line up with — ABR renditions are
+ * cut by forced keyframes at encode time (see `nextForceKeyframeUs` in the
+ * WebCodecs path, or FFmpeg's own `-hls_time`), not by a pre-computed list
+ * the way the fast path's are, so the caller has to recover them from a
+ * produced rendition's own playlist rather than assume a fixed cadence.
+ *
+ * Returns an error string instead of throwing when a track ends up with
+ * fewer segments than the video (same "shorter than main content" problem
+ * the UI already rejects up front — this is the ABR paths' second line of
+ * defense against a resumed/stale session slipping past that check, mirror
+ * of the fast path's same guard in `runWithHandle`).
+ */
+async function buildAudioOnlyRenditions(
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  boundaries: number[],
+): Promise<AudioTrackTag[] | { error: string }> {
+  const { playlistText: origText, segmentCount: origCount } = await remuxDubAudioTrack(
+    session.sourceFilePath,
+    ORIGINAL_AUDIO_SEGMENT_PREFIX,
+    boundaries,
+    outputFolderHandle,
+  );
+  if (origCount < boundaries.length) {
+    return { error: "The main content's own audio ended up with fewer segments than its video — please retry the conversion." };
+  }
+  await writeOutputFile(outputFolderHandle, ORIGINAL_AUDIO_PLAYLIST, origText);
+  const audioTags: AudioTrackTag[] = [{ name: 'Original', language: 'und', playlist: ORIGINAL_AUDIO_PLAYLIST, isDefault: true }];
+
+  for (const track of session.dubAudioTracks ?? []) {
+    const segmentPrefix = `dub_${track.language}_`;
+    const playlist = `dub_${track.language}.m3u8`;
+    const { playlistText, segmentCount } = await remuxDubAudioTrack(track.fileName, segmentPrefix, boundaries, outputFolderHandle);
+    if (segmentCount < boundaries.length) {
+      return { error: `Dub audio "${track.label}" is shorter than the main content and would produce broken playback — use a dub at least as long.` };
+    }
+    await writeOutputFile(outputFolderHandle, playlist, playlistText);
+    audioTags.push({ name: track.label, language: track.language, playlist, isDefault: false });
+  }
+  return audioTags;
+}
+
+/**
  * Splices intro/outro onto every produced rendition (matched by height) and
  * writes the combined result to each rendition's canonical
  * `${label}.m3u8` — the same filename `buildMasterM3U8` already points
@@ -996,6 +1176,7 @@ async function finalizeAbrResults(
   introResults: AbrSourceResult[] | null,
   outroResults: AbrSourceResult[] | null,
   subtitleTag: SubtitleTag | undefined,
+  audioTags?: AudioTrackTag[],
 ): Promise<{ masterM3u8: string; highestM3u8: string }> {
   if (mainResults.length === 0) {
     throw new Error('No rendition produced any output.');
@@ -1032,7 +1213,7 @@ async function finalizeAbrResults(
     await writeOutputFile(outputFolderHandle, SUBTITLE_PLAYLIST_FILENAME, buildSubtitlePlaylist(totalDuration));
   }
 
-  const masterM3u8 = buildMasterM3U8(streamInfos, subtitleTag);
+  const masterM3u8 = buildMasterM3U8(streamInfos, subtitleTag, audioTags);
   await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
 
   return { masterM3u8, highestM3u8 };
@@ -1054,11 +1235,15 @@ async function runAbrTranscodingWebCodecs(
   const sourceHeight = session.sourceHeight ?? 0;
   const introName = session.introOutro?.introFileName;
   const outroName = session.introOutro?.outroFileName;
+  // Mutually exclusive with intro/outro (checked in runTranscoding before
+  // this ever runs), so introName/outroName are never both set alongside
+  // this — no special-casing needed for that combination here.
+  const hasDubAudio = !!session.dubAudioTracks?.length;
 
   let introResults: AbrSourceResult[] | null = null;
   if (introName) {
     try {
-      introResults = await runAbrEncodeForSource(introName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'intro_');
+      introResults = await runAbrEncodeForSource(introName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'intro_', false);
     } catch (err) {
       if (cancelled) return;
       log(`Could not encode the intro (${err}) — continuing without it.`, 'ERROR');
@@ -1066,13 +1251,13 @@ async function runAbrTranscodingWebCodecs(
   }
   if (cancelled) return;
 
-  const mainResults = await runAbrEncodeForSource(session.sourceFilePath, outputFolderHandle, renditions, sourceWidth, sourceHeight, '');
+  const mainResults = await runAbrEncodeForSource(session.sourceFilePath, outputFolderHandle, renditions, sourceWidth, sourceHeight, '', hasDubAudio);
   if (cancelled) return;
 
   let outroResults: AbrSourceResult[] | null = null;
   if (outroName) {
     try {
-      outroResults = await runAbrEncodeForSource(outroName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'outro_');
+      outroResults = await runAbrEncodeForSource(outroName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'outro_', false);
     } catch (err) {
       if (cancelled) return;
       log(`Could not encode the outro (${err}) — continuing without it.`, 'ERROR');
@@ -1080,7 +1265,25 @@ async function runAbrTranscodingWebCodecs(
   }
   if (cancelled) return;
 
-  const { masterM3u8, highestM3u8 } = await finalizeAbrResults(outputFolderHandle, mainResults, introResults, outroResults, subtitleTag);
+  let audioTags: AudioTrackTag[] | undefined;
+  if (hasDubAudio) {
+    if (mainResults.length === 0) {
+      post({ type: 'ERROR', error: 'No rendition produced any output.' });
+      return;
+    }
+    // Any produced rendition's real cut points work — they're all forced to
+    // the same keyframe schedule (see nextForceKeyframeUs in
+    // runAbrWebCodecsWithHandle), so they agree on where each segment ends.
+    const boundaries = cumulativeBoundaries(durationsFromPlaylist(mainResults[0].playlistText));
+    const result = await buildAudioOnlyRenditions(session, outputFolderHandle, boundaries);
+    if ('error' in result) {
+      post({ type: 'ERROR', error: result.error });
+      return;
+    }
+    audioTags = result;
+  }
+
+  const { masterM3u8, highestM3u8 } = await finalizeAbrResults(outputFolderHandle, mainResults, introResults, outroResults, subtitleTag, audioTags);
   post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
 }
 
@@ -1096,12 +1299,13 @@ async function runAbrEncodeForSource(
   sourceWidth: number,
   sourceHeight: number,
   segmentPrefix: string,
+  hasDubAudio: boolean,
 ): Promise<AbrSourceResult[]> {
   const opfsRoot = await navigator.storage.getDirectory();
   const fileHandle = await opfsRoot.getFileHandle(opfsFileName);
   const syncHandle = await fileHandle.createSyncAccessHandle();
   try {
-    return await runAbrWebCodecsWithHandle(syncHandle, outputFolderHandle, renditions, sourceWidth, sourceHeight, segmentPrefix);
+    return await runAbrWebCodecsWithHandle(syncHandle, outputFolderHandle, renditions, sourceWidth, sourceHeight, segmentPrefix, hasDubAudio);
   } finally {
     syncHandle.close();
   }
@@ -1114,6 +1318,7 @@ async function runAbrWebCodecsWithHandle(
   sourceWidth: number,
   sourceHeight: number,
   segmentPrefix: string,
+  hasDubAudio: boolean,
 ): Promise<AbrSourceResult[]> {
   const renditionLabels = renditions.map((r) => r.label).join(', ');
   const logPrefix = segmentPrefix ? `[${segmentPrefix.replace(/_$/, '')}] ` : '';
@@ -1161,6 +1366,7 @@ async function runAbrWebCodecsWithHandle(
     audioSampleRate: codecConfig.audioSampleRate,
     audioChannels: codecConfig.audioChannels,
     segmentPrefix,
+    hasDubAudio,
   };
 
   const sinks = renditions.map((r) =>
@@ -1631,6 +1837,18 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
 
   const subtitleTag = await resolveSubtitleTrack(session, outputFolderHandle);
 
+  // Dub-audio + intro/outro splicing together isn't supported yet: the
+  // audio-only renditions built by buildAudioOnlyRenditions only ever cover
+  // the main content's own duration, with no equivalent of spliceIntroOutro
+  // to extend them across spliced-on intro/outro. Adaptive HLS on its own is
+  // supported (see runAbrTranscodingWebCodecs/runAbrTranscoding). Failing
+  // clearly here beats silently shipping audio renditions shorter than the
+  // spliced video.
+  if (session.dubAudioTracks?.length && (session.introOutro?.introFileName || session.introOutro?.outroFileName)) {
+    post({ type: 'ERROR', error: 'Dub-audio tracks are not yet supported together with intro/outro.' });
+    return;
+  }
+
   if (session.abrHeights && session.abrHeights.length > 0) {
     await runAdaptiveHls(session, outputFolderHandle, subtitleTag);
     return;
@@ -1723,6 +1941,19 @@ async function runWithHandle(
   log(`Found ${segmentCount} segments.`);
   post({ type: 'INITIALIZED', totalSegments: segmentCount });
 
+  // Real-world HLS multi-audio doesn't mux alternate tracks into the video
+  // segments — it uses separate audio-only segments per track, switched via
+  // an #EXT-X-MEDIA:TYPE=AUDIO group (see buildAudioMediaTag). Once any dub
+  // track exists, the main content's own video segments go audio-less too,
+  // and its original audio becomes just another rendition in that same
+  // group — no special casing, no lost audio, one consistent model. Both
+  // come from this same `processor`/`segments`, so their cuts are
+  // automatically identical — no alignment work needed for this pair
+  // specifically (unlike a genuinely separate dub file, see
+  // `remuxDubAudioTrack`).
+  const hasDubAudio = !!session.dubAudioTracks?.length;
+  const EMPTY = new Uint8Array(0);
+
   const startIndex = isResume ? Math.max(0, session.lastSegmentIndex + 1) : 0;
   const durations = isResume ? [...session.segmentDurations] : [];
   let retryCount = 0;
@@ -1760,7 +1991,10 @@ async function runWithHandle(
 
     let tsBytes: Uint8Array;
     try {
-      tsBytes = processor.mux_segment(videoData, audioData, i) as Uint8Array;
+      // Passing an empty Uint8Array (rather than omitting real bytes) is
+      // what tells the Rust muxer this track isn't present — see
+      // mux_segment_inner's has_video/has_audio checks in wasm/src/lib.rs.
+      tsBytes = processor.mux_segment(videoData, hasDubAudio ? EMPTY : audioData, i) as Uint8Array;
     } catch (err) {
       if (retryCount < 3) {
         retryCount++;
@@ -1779,6 +2013,19 @@ async function runWithHandle(
     } catch (err) {
       post({ type: 'ERROR', error: `Failed to write ${segName}: ${err}`, sessionId: session.id });
       return;
+    }
+
+    if (hasDubAudio) {
+      // The "original" audio, split out as its own audio-only rendition in
+      // the same #EXT-X-MEDIA group dub tracks join — same segment index,
+      // same processor, so its cuts land exactly where the video's do.
+      try {
+        const origAudioBytes = processor.mux_segment(EMPTY, audioData, i) as Uint8Array;
+        await writeOutputFile(outputFolderHandle, `${ORIGINAL_AUDIO_SEGMENT_PREFIX}${String(i).padStart(4, '0')}.ts`, origAudioBytes);
+      } catch (err) {
+        post({ type: 'ERROR', error: `Failed to write original-audio segment ${i}: ${err}`, sessionId: session.id });
+        return;
+      }
     }
 
     log(`Segment ${i + 1} saved (${(tsBytes.byteLength / 1024).toFixed(0)} KiB)`);
@@ -1818,21 +2065,65 @@ async function runWithHandle(
     await writeOutputFile(outputFolderHandle, 'index.m3u8', outputM3u8);
   }
 
+  // Dub-audio: the "original" audio-only rendition split out of the main
+  // content's own segments above shares this same `finalDurations` array —
+  // same segments, same durations, just a different filename pattern —
+  // plus one more audio-only rendition per dub file, cut at the exact same
+  // wall-clock boundaries (see remuxDubAudioTrack). Mutually exclusive with
+  // intro/outro (checked in runTranscoding), so `outputM3u8`'s duration
+  // here is always just the main content's own — no splicing to account for.
+  let audioTags: AudioTrackTag[] | undefined;
+  if (hasDubAudio) {
+    await writeOutputFile(
+      outputFolderHandle,
+      ORIGINAL_AUDIO_PLAYLIST,
+      buildIntermediateM3U8(finalDurations, true, (i) => `${ORIGINAL_AUDIO_SEGMENT_PREFIX}${String(i).padStart(4, '0')}.ts`),
+    );
+    audioTags = [{ name: 'Original', language: 'und', playlist: ORIGINAL_AUDIO_PLAYLIST, isDefault: true }];
+
+    const boundaries = segments.map((s) => s.startPtsSec + s.durationSec);
+    for (const track of session.dubAudioTracks ?? []) {
+      log(`Adding dub audio: ${track.label}…`);
+      const segmentPrefix = `dub_${track.language}_`;
+      const playlist = `dub_${track.language}.m3u8`;
+      const { playlistText, segmentCount: dubSegmentCount } = await remuxDubAudioTrack(track.fileName, segmentPrefix, boundaries, outputFolderHandle);
+      // The UI already rejects a dub shorter than the main content before a
+      // conversion can even start (see selectDubAudioTrack) — this is a
+      // second line of defense for a resumed/stale session that slipped
+      // past that check. A rendition with fewer segments than its video
+      // counterpart is exactly what produced the real VIDEO_ERROR this
+      // guards against: better to fail the job clearly than ship a
+      // manifest that looks fine and breaks partway through playback.
+      if (dubSegmentCount < boundaries.length) {
+        post({
+          type: 'ERROR',
+          error: `Dub audio "${track.label}" is shorter than the main content and would produce broken playback — use a dub at least as long.`,
+          sessionId: session.id,
+        });
+        return;
+      }
+      await writeOutputFile(outputFolderHandle, playlist, playlistText);
+      audioTags.push({ name: track.label, language: track.language, playlist, isDefault: false });
+    }
+  }
+
   // The fast path has no ladder of renditions, so — unlike the ABR paths —
   // it normally never needs a master playlist. #EXT-X-MEDIA only has
-  // meaning inside one, though, so a subtitle track forces a minimal,
-  // single-variant master.m3u8 into existence here.
+  // meaning inside one, though, so a subtitle or dub-audio track forces a
+  // minimal, single-variant master.m3u8 into existence here.
   let masterM3u8: string | undefined;
-  if (subtitleTag) {
+  if (subtitleTag || audioTags) {
     // Derived from the *final* playlist (post intro/outro splicing, if any)
     // rather than summing `finalDurations` directly, so both the subtitle
     // wrapper and the bandwidth estimate below account for spliced-on
     // intro/outro duration too, not just the main content's.
     const totalDuration = totalDurationFromPlaylist(outputM3u8);
-    await writeOutputFile(outputFolderHandle, SUBTITLE_PLAYLIST_FILENAME, buildSubtitlePlaylist(totalDuration));
+    if (subtitleTag) {
+      await writeOutputFile(outputFolderHandle, SUBTITLE_PLAYLIST_FILENAME, buildSubtitlePlaylist(totalDuration));
+    }
 
     const bandwidth = totalDuration > 0 ? Math.round((totalBytes * 8) / totalDuration) : 1_000_000;
-    masterM3u8 = buildFastPathMasterM3U8(subtitleTag, bandwidth, session.sourceWidth, session.sourceHeight);
+    masterM3u8 = buildFastPathMasterM3U8(bandwidth, session.sourceWidth, session.sourceHeight, subtitleTag, audioTags);
     await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
   }
 
@@ -1846,11 +2137,20 @@ async function runWithHandle(
   });
 }
 
-function buildFastPathMasterM3U8(subtitleTag: SubtitleTag, bandwidth: number, width?: number, height?: number): string {
+function buildFastPathMasterM3U8(
+  bandwidth: number,
+  width: number | undefined,
+  height: number | undefined,
+  subtitleTag: SubtitleTag | undefined,
+  audioTags: AudioTrackTag[] | undefined,
+): string {
   let m = '#EXTM3U\n#EXT-X-VERSION:3\n';
-  m += buildSubtitleMediaTag(subtitleTag);
+  if (subtitleTag) m += buildSubtitleMediaTag(subtitleTag);
+  if (audioTags) for (const tag of audioTags) m += buildAudioMediaTag(tag);
   const resAttr = width && height ? `,RESOLUTION=${width}x${height}` : '';
-  m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth}${resAttr},SUBTITLES="${SUBTITLES_GROUP_ID}"\n`;
+  const subsAttr = subtitleTag ? `,SUBTITLES="${SUBTITLES_GROUP_ID}"` : '';
+  const audioAttr = audioTags?.length ? `,AUDIO="${AUDIO_GROUP_ID}"` : '';
+  m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth}${resAttr}${subsAttr}${audioAttr}\n`;
   m += 'index.m3u8\n';
   return m;
 }
@@ -1900,7 +2200,7 @@ async function encodeAuxiliaryClipMatchingMain(
 
   if (await canUseWebCodecsAbr([rendition], mainWidth, mainHeight)) {
     try {
-      const results = await runAbrEncodeForSource(opfsFileName, outputFolderHandle, [rendition], mainWidth, mainHeight, segmentPrefix);
+      const results = await runAbrEncodeForSource(opfsFileName, outputFolderHandle, [rendition], mainWidth, mainHeight, segmentPrefix, false);
       if (results.length > 0) return results[0].playlistText;
       log(`${segmentPrefix}: hardware letterboxing produced no output, falling back to FFmpeg…`, 'ERROR');
     } catch (err) {
@@ -1992,6 +2292,68 @@ async function remuxAuxiliaryClip(
       durations.push(seg.durationSec);
     }
     return buildIntermediateM3U8(durations, true, segmentName);
+  } finally {
+    syncHandle.close();
+  }
+}
+
+/** Remuxes one dub-audio file (audio, or a video file whose audio track is
+ * read) into its own audio-only HLS rendition — the dub-track counterpart
+ * of `remuxAuxiliaryClip` above. Cuts at `boundaries` (the main content's
+ * own cumulative segment end times) rather than an independently computed
+ * target duration: two files of nearly-but-not-quite-identical length,
+ * each cut on its own schedule, would drift apart by a few frames every
+ * segment — fine on their own, but exactly what breaks a clean switch
+ * between audio renditions mid-playback. `parse_audio_only` populates the
+ * track; `segment_audio_at_boundaries` immediately re-cuts it at the real
+ * boundaries before anything reads segment count or muxes (see both in
+ * wasm/src/lib.rs). */
+async function remuxDubAudioTrack(
+  opfsFileName: string,
+  segmentPrefix: string,
+  boundaries: number[],
+  outputFolderHandle: FileSystemDirectoryHandle,
+): Promise<{ playlistText: string; segmentCount: number }> {
+  // parse_audio_only reads an MP4-family box structure directly — anything
+  // else (.mp3, .wav, ...) needs FFmpeg to normalize it to .m4a first, same
+  // relationship convertToMp4 has to the main content's own fast path.
+  const isNativeAudioContainer = isNativeContainer(opfsFileName) || opfsFileName.toLowerCase().endsWith('.m4a');
+  const resolvedOpfsName = isNativeAudioContainer ? opfsFileName : await convertAudioToM4a(opfsFileName, opfsFileName);
+
+  const opfsRoot = await navigator.storage.getDirectory();
+  const fileHandle = await opfsRoot.getFileHandle(resolvedOpfsName);
+  const syncHandle = await fileHandle.createSyncAccessHandle();
+
+  try {
+    const fileSize = syncHandle.getSize();
+    const HEADER_READ = Math.min(32 * 1024 * 1024, fileSize);
+    const headerBuf = readAt(syncHandle, 0, HEADER_READ);
+
+    const { HlsProcessor } = await loadWasm();
+    const processor = new HlsProcessor();
+
+    try {
+      processor.parse_audio_only(headerBuf);
+    } catch {
+      const tailOffset = Math.max(0, fileSize - 32 * 1024 * 1024);
+      const tailBuf = readAt(syncHandle, tailOffset, fileSize - tailOffset);
+      processor.parse_audio_only(tailBuf);
+    }
+
+    const jsonStr = processor.segment_audio_at_boundaries(JSON.stringify(boundaries)) as unknown as string;
+    const parseResult = JSON.parse(jsonStr) as AudioOnlyParseResult;
+
+    const segmentName = (i: number) => `${segmentPrefix}${String(i).padStart(4, '0')}.ts`;
+    const empty = new Uint8Array(0);
+    const durations: number[] = [];
+    for (let i = 0; i < parseResult.segmentCount; i++) {
+      const seg = parseResult.segments[i];
+      const audioData = readSamples(syncHandle, seg.audioSamples);
+      const tsBytes = processor.mux_segment(empty, audioData, i) as Uint8Array;
+      await writeOutputFile(outputFolderHandle, segmentName(i), tsBytes);
+      durations.push(seg.durationSec);
+    }
+    return { playlistText: buildIntermediateM3U8(durations, true, segmentName), segmentCount: parseResult.segmentCount };
   } finally {
     syncHandle.close();
   }

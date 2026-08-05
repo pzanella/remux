@@ -164,6 +164,7 @@ export default function App() {
           outroFile={t.outroFile}
           subtitleTrack={t.subtitleTrack}
           subtitleVttText={t.subtitleVttText}
+          dubAudioTracks={t.dubAudioTracks}
           selectedClip={selectedClip}
           playheadTime={playheadTime}
           muted={previewMuted}
@@ -179,6 +180,9 @@ export default function App() {
           onClearSubtitle={t.clearSubtitleTrack}
           onSaveSubtitleEdits={t.saveSubtitleEdits}
           onSubtitleLanguageChange={t.setSubtitleLanguage}
+          onSelectDubAudio={t.selectDubAudioTrack}
+          onRemoveDubAudio={t.removeDubAudioTrack}
+          onDubAudioLanguageChange={t.setDubAudioTrackLanguage}
         />
 
         <ActivityPanel
