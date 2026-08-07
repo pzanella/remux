@@ -27,13 +27,16 @@ export interface TranscodingSession {
    */
   abrHeights?: number[];
   /**
-   * Optional sidecar subtitle track (WebVTT, or SRT converted to WebVTT by
-   * the worker). `fileName` is the OPFS filename of the raw uploaded file.
-   * When set, the worker always emits a master.m3u8 — even on the fast
+   * Optional sidecar subtitle tracks (WebVTT, or SRT converted to WebVTT by
+   * the worker) — any number of them, each its own `#EXT-X-MEDIA:
+   * TYPE=SUBTITLES` rendition sharing one GROUP-ID, the same "several
+   * tracks, one group" shape `dubAudioTracks` below already uses for audio.
+   * `fileName` is the OPFS filename of the raw uploaded file. When
+   * non-empty, the worker always emits a master.m3u8 — even on the fast
    * path, which otherwise has none — since #EXT-X-MEDIA only has meaning
    * inside a multivariant playlist.
    */
-  subtitleTrack?: { fileName: string; label: string; language: string };
+  subtitleTracks?: { fileName: string; label: string; language: string }[];
   /**
    * Optional intro/outro clips (OPFS filenames of native MP4/MOV files),
    * spliced onto the start/end of the output — on the fast path directly,
@@ -66,6 +69,28 @@ export interface TranscodingSession {
    * master.m3u8 on the fast path, same reason as `subtitleTrack`.
    */
   dubAudioTracks?: { fileName: string; language: string; label: string }[];
+  /**
+   * Ordered, trimmed sub-ranges of the main source file — the vertical
+   * timeline editor's split/trim/delete/reorder edits, flattened into a cut
+   * list. Each entry is stream-copied out of the main file with FFmpeg and
+   * re-spliced with `#EXT-X-DISCONTINUITY` between them (see
+   * `cutSegmentClip`/`runSegmentedFastPath`/`runAdaptiveHlsSegmented` in
+   * remux.worker.ts) — the same splice mechanism `introOutro` above already
+   * uses for up to 3 named clips, generalized to an arbitrary-length list
+   * all drawn from the one source. Present (even as a single full-span
+   * entry) for every session the current editor creates; a single entry
+   * spanning the whole source is treated as "no real edit" and skips the
+   * extra cut+remux pass. Mutually exclusive with `introOutro` and
+   * `dubAudioTracks` for now — see the worker's guards in `runTranscoding`.
+   */
+  segments?: { sourceStart: number; sourceEnd: number }[];
+  /**
+   * Source duration in seconds, probed client-side when the file is picked
+   * (same probe that fills `sourceWidth`/`sourceHeight`). Lets the worker
+   * tell a trivial single full-span `segments` entry (no real edit) apart
+   * from a genuine trim.
+   */
+  sourceDuration?: number;
 }
 
 // ── Adaptive bitrate (multi-resolution) ────────────────────────────

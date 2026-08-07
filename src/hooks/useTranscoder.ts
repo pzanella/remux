@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppStatus, LogEntry, TranscodingSession, WorkerCommand, WorkerEvent } from '../types';
 import { saveFileToOpfs, writeOpfsTextFile, usePersistence } from './usePersistence';
 import { createZipBlob } from '../lib/zip';
+import { isTrivialEdit } from '../lib/segments';
 import RemuxWorker from '../worker/remux.worker.ts?worker';
 
 /** An intro/outro clip's OPFS pointer plus everything the timeline needs to
@@ -68,14 +69,12 @@ export function useTranscoder() {
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [abrEnabled, setAbrEnabled] = useState(false);
   const [abrHeights, setAbrHeightsState] = useState<number[]>([]);
-  const [subtitleTrack, setSubtitleTrackState] = useState<{ fileName: string; label: string; language: string } | null>(
-    null,
-  );
-  /** The current subtitle content as editable text — kept alongside
-   * `subtitleTrack` (which is just the OPFS pointer + display metadata) so
-   * the cue editor has something to show immediately without a round trip
-   * through OPFS. */
-  const [subtitleVttText, setSubtitleVttText] = useState('');
+  const [subtitleTracks, setSubtitleTracksState] = useState<{ fileName: string; label: string; language: string }[]>([]);
+  /** Each track's current subtitle content as editable text, keyed by its
+   * OPFS filename — kept alongside `subtitleTracks` (which is just the
+   * OPFS pointer + display metadata per track) so the cue editor has
+   * something to show immediately without a round trip through OPFS. */
+  const [subtitleVttTextByFile, setSubtitleVttTextByFile] = useState<Record<string, string>>({});
   const [introFile, setIntroFileState] = useState<ClipFile | null>(null);
   const [outroFile, setOutroFileState] = useState<ClipFile | null>(null);
   const [dubAudioTracks, setDubAudioTracksState] = useState<{ fileName: string; label: string; language: string }[]>([]);
@@ -183,7 +182,7 @@ export function useTranscoder() {
           probeVideoMetadata(file),
         ]);
         const newSession = await createSession(file.name, opfsPath, file.size, 0, outputFolder);
-        setSession({ ...newSession, sourceWidth: dims?.width, sourceHeight: dims?.height });
+        setSession({ ...newSession, sourceWidth: dims?.width, sourceHeight: dims?.height, sourceDuration: dims?.duration });
         setSourceResolution(dims);
         setSourceDuration(dims?.duration);
         setSourceFile(file);
@@ -203,8 +202,8 @@ export function useTranscoder() {
       try {
         const [opfsPath, text] = await Promise.all([saveFileToOpfs(file), file.text()]);
         const label = file.name.replace(/\.(srt|vtt)$/i, '');
-        setSubtitleTrackState({ fileName: opfsPath, label, language: 'en' });
-        setSubtitleVttText(text);
+        setSubtitleTracksState((prev) => [...prev, { fileName: opfsPath, label, language: 'en' }]);
+        setSubtitleVttTextByFile((prev) => ({ ...prev, [opfsPath]: text }));
         addLog(`Subtitles: ${file.name}`, 'success');
       } catch (err) {
         addLog(`Could not save the subtitle file: ${err}`, 'error');
@@ -213,31 +212,54 @@ export function useTranscoder() {
     [addLog],
   );
 
-  const setSubtitleLanguage = useCallback((language: string) => {
-    setSubtitleTrackState((prev) => (prev ? { ...prev, language } : prev));
+  // Mints a fresh, empty subtitle track and writes a minimal valid VTT file
+  // for it immediately — the "write from scratch" flow's starting point.
+  // Written eagerly (rather than lazily on first save, the single-track
+  // version's approach) so every entry in `subtitleTracks` always has a
+  // real OPFS file behind it, even if the cue editor is opened and closed
+  // without adding a single cue. Returns the new filename so the caller
+  // can open the cue editor for this specific track right away.
+  const addBlankSubtitleTrack = useCallback(async (): Promise<string | null> => {
+    const fileName = `subtitles_${Date.now()}.vtt`;
+    const emptyVtt = 'WEBVTT\n\n';
+    try {
+      await writeOpfsTextFile(fileName, emptyVtt);
+      setSubtitleTracksState((prev) => [...prev, { fileName, label: 'Subtitles', language: 'en' }]);
+      setSubtitleVttTextByFile((prev) => ({ ...prev, [fileName]: emptyVtt }));
+      return fileName;
+    } catch (err) {
+      addLog(`Could not create a new subtitle track: ${err}`, 'error');
+      return null;
+    }
+  }, [addLog]);
+
+  const setSubtitleTrackLanguage = useCallback((fileName: string, language: string) => {
+    setSubtitleTracksState((prev) => prev.map((t) => (t.fileName === fileName ? { ...t, language } : t)));
   }, []);
 
-  const clearSubtitleTrack = useCallback(() => {
-    setSubtitleTrackState(null);
-    setSubtitleVttText('');
+  const removeSubtitleTrack = useCallback((fileName: string) => {
+    setSubtitleTracksState((prev) => prev.filter((t) => t.fileName !== fileName));
+    setSubtitleVttTextByFile((prev) => {
+      if (!(fileName in prev)) return prev;
+      const next = { ...prev };
+      delete next[fileName];
+      return next;
+    });
   }, []);
 
-  // Writes edited cue text back to the *same* OPFS filename a track already
-  // has (so the worker's reference to it stays valid across edits), or
-  // mints a fresh one for a track created from scratch in the cue editor.
+  // Writes edited cue text back to the given track's own OPFS filename, so
+  // the worker's reference to it stays valid across edits.
   const saveSubtitleEdits = useCallback(
-    async (vttText: string) => {
+    async (fileName: string, vttText: string) => {
       try {
-        const fileName = subtitleTrack?.fileName ?? `subtitles_${Date.now()}.vtt`;
         await writeOpfsTextFile(fileName, vttText);
-        setSubtitleVttText(vttText);
-        setSubtitleTrackState((prev) => prev ?? { fileName, label: 'Subtitles', language: 'en' });
+        setSubtitleVttTextByFile((prev) => ({ ...prev, [fileName]: vttText }));
         addLog('Subtitles updated.', 'success');
       } catch (err) {
         addLog(`Could not save subtitle edits: ${err}`, 'error');
       }
     },
-    [subtitleTrack, addLog],
+    [addLog],
   );
 
   const selectIntroFile = useCallback(
@@ -358,7 +380,7 @@ export function useTranscoder() {
     };
   }, [outputMode, session?.id, resumableSession?.id, outputFolder, addLog]);
 
-  const start = useCallback(() => {
+  const start = useCallback((editorSegments?: { sourceStart: number; sourceEnd: number }[]) => {
     if (!session || !outputFolder) return;
 
     setStatus('processing');
@@ -388,9 +410,10 @@ export function useTranscoder() {
     // implicitly.
     const sessionWithExtras: TranscodingSession = {
       ...session,
-      subtitleTrack: subtitleTrack ?? undefined,
+      subtitleTracks: subtitleTracks.length > 0 ? subtitleTracks : undefined,
       introOutro,
       dubAudioTracks: dubAudioTracks.length > 0 ? dubAudioTracks : undefined,
+      segments: editorSegments,
     };
     setSession(sessionWithExtras);
 
@@ -410,7 +433,7 @@ export function useTranscoder() {
       setStatus('error');
       addLog(`Could not talk to the worker: ${err}`, 'error');
     }
-  }, [session, outputFolder, abrEnabled, abrHeights, subtitleTrack, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
+  }, [session, outputFolder, abrEnabled, abrHeights, subtitleTracks, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
 
   const resume = useCallback(async () => {
     const src = resumableSession ?? session;
@@ -495,8 +518,8 @@ export function useTranscoder() {
     setSourceFile(null);
     setAbrEnabled(false);
     setAbrHeightsState([]);
-    setSubtitleTrackState(null);
-    setSubtitleVttText('');
+    setSubtitleTracksState([]);
+    setSubtitleVttTextByFile({});
     setIntroFileState(null);
     setOutroFileState(null);
     setDubAudioTracksState([]);
@@ -523,10 +546,22 @@ export function useTranscoder() {
     }
   }, [outputFolder, session, addLog]);
 
+  // A session with a real (non-trivial) edited segment list, like an ABR
+  // job, isn't checkpointed mid-export — resuming it would replay
+  // runWithHandle's whole-file per-.ts-segment logic against a job that
+  // never took that path in the first place. See hasEditedSegments in
+  // remux.worker.ts for the worker-side twin of this check.
+  const hasNonResumableEdit = (s: TranscodingSession | null) =>
+    !!s?.segments?.length && !(s.sourceDuration !== undefined && isTrivialEdit(s.segments, s.sourceDuration));
+
   const isRunning = status === 'processing' || status === 'converting';
   const canStart = !!session && !!outputFolder && !isRunning && status !== 'complete';
   const canResume =
-    (!!resumableSession || (!!session && (session.lastSegmentIndex ?? -1) >= 0)) && !!outputFolder && !isRunning;
+    (!!resumableSession || (!!session && (session.lastSegmentIndex ?? -1) >= 0)) &&
+    !!outputFolder &&
+    !isRunning &&
+    !hasNonResumableEdit(resumableSession) &&
+    !hasNonResumableEdit(session);
 
   return {
     status,
@@ -546,8 +581,8 @@ export function useTranscoder() {
     sourceFile,
     abrEnabled,
     abrHeights,
-    subtitleTrack,
-    subtitleVttText,
+    subtitleTracks,
+    subtitleVttTextByFile,
     introFile,
     outroFile,
     dubAudioTracks,
@@ -558,6 +593,7 @@ export function useTranscoder() {
     selectOutputFolder,
     setOutputMode,
     selectSubtitleFile,
+    addBlankSubtitleTrack,
     saveSubtitleEdits,
     selectIntroFile,
     clearIntroFile,
@@ -566,8 +602,8 @@ export function useTranscoder() {
     selectDubAudioTrack,
     removeDubAudioTrack,
     setDubAudioTrackLanguage,
-    clearSubtitleTrack,
-    setSubtitleLanguage,
+    removeSubtitleTrack,
+    setSubtitleTrackLanguage,
     setAbrEnabled,
     toggleAbrHeight,
     start,

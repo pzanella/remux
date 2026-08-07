@@ -9,11 +9,15 @@ no install.
 
 **[Try it live →](https://pzanella.github.io/remux/)**
 
-![Remux UI: an in-browser video-editor timeline with intro/main/outro tracks, waveform and subtitle rows, above a draft preview and a Shaka Player-powered final result](docs/screenshot.png)
+![Remux UI: a draft preview next to the vertical timeline rail, showing a clip split into three trimmed segments](docs/screenshot.png)
 
-A drag-and-drop timeline for intro/outro clips and subtitles sits below the
-preview, which itself shows a "Draft" edit while you're arranging clips and
-swaps to the real Shaka Player-driven HLS result once you press Start.
+A vertical timeline for trimming, splitting, and reordering the clip sits
+next to the preview, which itself shows a live draft while you're editing and
+swaps to the real Shaka Player-driven HLS result once you press Start. A
+persistent caption lane under the preview and an intro/outro-and-dub-audio
+strip above the timeline are both visible throughout editing — not hidden
+behind the "Export HLS" button, which now only opens a final review (output
+destination, a recap of what's attached, renditions) before the job starts.
 
 ## Why
 
@@ -37,15 +41,25 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
 - **Optional adaptive (multi-resolution) HLS** — generate a master playlist
   with 240p/360p/480p/720p renditions, picked in the UI. This mode re-encodes,
   using hardware acceleration when the browser supports it (see below).
-- **In-browser timeline editor** — drag intro/outro clips and a subtitle file
-  onto the timeline, or drop them straight from Finder/Explorer. Tracks are
-  drawn proportional to real clip duration, with thumbnails and a waveform,
-  and a draft preview plays intro → main → outro back to back (Space to
-  play/pause) so you can check the cut before converting anything.
-- **Subtitles** — attach a `.srt`/`.vtt` file, or double-click the subtitle
-  track to write cues from scratch in a built-in editor. Shipped as a proper
-  HLS sidecar track (`#EXT-X-MEDIA:TYPE=SUBTITLES`), selectable from the
-  player's own subtitle menu.
+- **In-browser timeline editor** — trim, split, and reorder clips on a
+  vertical rail, with a live draft preview (Space to play/pause, Ctrl/Cmd+Z
+  to undo) so you can check the cut before converting anything.
+- **Subtitles (multi-language)** — attach one or more `.srt`/`.vtt` files, or
+  write cues from scratch, in the persistent caption lane under the preview.
+  Cues render as blocks positioned against the real (possibly trimmed/split)
+  timeline, not just raw timestamps — and a cue that no longer fits inside
+  any current segment shows up as a warning right there, rather than only
+  as a playback surprise later. Each track ships as its own
+  `#EXT-X-MEDIA:TYPE=SUBTITLES` rendition, switchable from the player's own
+  subtitle menu.
+- **Intro / outro clips** — attach clips to splice onto the start/end of the
+  output, from the collapsed "Intro/outro · Dub audio" strip above the
+  timeline. Letterboxed/pillarboxed to match the main content's own
+  dimensions if they don't already match.
+- **Dub audio (multi-language)** — attach one or more alternate audio tracks
+  from that same strip; each shipped as its own `#EXT-X-MEDIA:TYPE=AUDIO`
+  rendition alongside the original, switchable from the player's own audio
+  menu.
 - **Shaka Player result** — the final HLS output plays through
   [Shaka Player](https://github.com/shaka-project/shaka-player), with its
   stock quality/track selection UI, reading segments straight from disk (or
@@ -83,19 +97,24 @@ remux/
     ├── index.css                 # all styles, no CSS framework
     │
     ├── components/
-    │   ├── Timeline.tsx           # intro/outro/subtitle tracks, drag & drop, playhead
-    │   ├── RawPreview.tsx         # draft preview during editing (plain <video>, no HLS yet)
-    │   ├── Player.tsx             # final HLS result, via Shaka Player
+    │   ├── VerticalTimeline.tsx   # segment trim/split/reorder rail, playhead
+    │   ├── PreviewPane.tsx        # draft preview during editing (plain <video>, no HLS yet)
+    │   ├── CaptionLane.tsx        # persistent subtitle-track lane under the preview
+    │   ├── MediaExtrasPanel.tsx   # collapsed intro/outro + dub-audio strip
     │   ├── SubtitleCueEditor.tsx  # in-browser WebVTT cue editor
-    │   ├── Waveform.tsx           # canvas waveform for the audio track
+    │   ├── Player.tsx             # final HLS result, via Shaka Player
+    │   ├── ExportModal.tsx        # final review (output/renditions) + progress + completion
     │   └── ...                    # one small job each
     ├── lib/
+    │   ├── segments.ts            # pure split/trim/reorder/layout logic for the timeline
+    │   ├── hls-playlist.ts        # pure HLS playlist-building + rendition geometry, shared with the worker
     │   ├── vtt.ts                 # WebVTT/SRT cue parsing, shared main-thread ⇄ worker
     │   ├── mediaPreview.ts        # client-side thumbnails + waveform peaks
     │   └── zip.ts                 # zips an output folder for download
     ├── hooks/
-    │   ├── useTranscoder.ts      # runs the worker, tracks progress
-    │   └── usePersistence.ts     # saves progress so you can resume later
+    │   ├── useTranscoder.ts       # runs the worker, tracks progress
+    │   ├── useEditorSegments.ts   # owns the timeline's segment list, selection, undo/redo
+    │   └── usePersistence.ts      # saves progress so you can resume later
     ├── worker/remux.worker.ts    # does the heavy work off the main thread
     └── types/
 ```
@@ -103,7 +122,8 @@ remux/
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) `>=22.20.0` (this repo pins that version in
-  `.nvmrc` — run `nvm use` if you have nvm)
+  `package.json`'s `engines` field — run `nvm install 22.20.0 && nvm use
+  22.20.0` if you have nvm)
 - [Rust](https://rustup.rs/), installed with `rustup` (not Homebrew)
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -164,31 +184,63 @@ output goes to browser storage by default, no folder picker needed (see
 
 ## Editing the Timeline
 
-Before pressing Start, the timeline underneath the preview is a small
-drag-and-drop editor:
+The vertical rail next to the preview trims, splits, and reorders the main
+clip before anything is exported:
 
-- **Intro / outro** — drop a clip onto the "+ Intro"/"+ Outro" slot on
-  either side of the main track. Tracks are drawn proportional to each
-  clip's real duration, with thumbnails and a waveform, so the cut is
-  visible before you commit to it. If a clip's own resolution or aspect
-  ratio doesn't match the main content, it is letterboxed/pillarboxed to
-  match (black bars, never stretched or cropped) — on the fast path and
-  both Adaptive HLS paths alike.
-- **Subtitles** — drop a `.srt`/`.vtt` file onto the subtitle track, or
-  double-click the track to write cues from scratch in the built-in editor.
-  Cues are authored relative to the main content; if an intro is attached,
-  their timestamps are shifted forward automatically so they still land on
-  the right moment in the final, spliced output. Cues that run past the end
-  of the whole edit are flagged with a warning icon rather than silently
-  clipped or left to overflow the timeline.
-- **Preview vs. result** — the "Editing preview" above the timeline (marked
-  **Draft**) plays intro → main → outro back to back in a plain
-  `<video>` element, purely so you can check the cut — press Space to
-  play/pause. It is not the packaged output. Press **Start** to actually
-  remux/encode everything; the panel switches to the real HLS result,
-  marked **Packaged**, played through Shaka Player.
-- **Start over** clears the current file, timeline, and any in-progress
-  session, so you can begin again from a clean slate.
+- **Trim** — drag a selected clip's top/bottom handle to move its in/out
+  point.
+- **Split** — with the playhead inside a selected clip, a floating "Split
+  here" control cuts it into two at that point.
+- **Reorder** — drag a clip card to a new position in the stack.
+- **Undo/redo** — Ctrl/Cmd+Z (+ Shift), or the buttons above the rail.
+- **Preview vs. result** — the editing preview plays the trimmed/reordered
+  cut in a plain `<video>` element, purely so you can check it before
+  converting — press Space to play/pause. It is not the packaged output.
+  Once a job starts, the panel switches to the real HLS result, played
+  through Shaka Player.
+- **Start over** (the logo/wordmark) clears the current file, timeline, and
+  any in-progress session, so you can begin again from a clean slate.
+
+## Extras: Subtitles, Intro/Outro, Dub Audio
+
+Unlike the output/rendition choices reviewed in the "Export HLS" screen,
+these three are attached from the main editing view itself — no need to
+open the export screen just to see whether they're available.
+
+- **Subtitles** — the caption lane under the preview. Attach one or more
+  `.srt`/`.vtt` files with "+ Add captions", or "+ Write from scratch" to
+  start a track with the built-in cue editor. Each track gets its own
+  language field; the first attached becomes the player's default. Existing
+  cues render as blocks positioned against the actual (possibly trimmed/
+  split) output timeline, and "+ Cue" drops a new one in at wherever the
+  playhead currently is, instead of typing a timestamp blind. Cues are
+  authored in the *source file's own* time — the same time the cue editor
+  and an attached `.srt`/`.vtt` both already use — and are automatically
+  remapped into the edited output: a cue inside footage you've kept moves
+  to its new position; a cue in footage that's been trimmed away, or that
+  straddles a cut a split introduced, is dropped rather than shipped
+  misaligned, and the lane shows a **⚠ N** count right on the track so
+  that's visible while editing, not just in the export log. If an intro is
+  attached, timestamps shift forward on top of that so cues still land
+  alongside the right footage once it's spliced in front.
+- **Intro / outro** — the collapsed "Intro/outro · Dub audio" strip above
+  the timeline (click to expand). Attach a clip with "+ Intro"/"+ Outro";
+  it's spliced onto the start/end of the output. If a clip's own resolution
+  or aspect ratio doesn't match the main content, it is letterboxed/
+  pillarboxed to match (black bars, never stretched or cropped) — on the
+  fast path and both Adaptive HLS paths alike. Only native MP4/MOV-family
+  clips are accepted (no FFmpeg pre-conversion step exists for these,
+  unlike the main file).
+- **Dub audio** — same strip. Attach one or more alternate audio tracks with
+  "+ Dub audio track"; each gets its own language code (edit the field next
+  to it) and becomes a switchable `#EXT-X-MEDIA:TYPE=AUDIO` rendition
+  alongside the original. A dub shorter than the main content is rejected at
+  attach time — every rendition in the group has to span the same duration.
+- Dub-audio and intro/outro are mutually exclusive with each other, and with
+  an edited (trimmed/split) timeline, for now — attaching an unsupported
+  combination fails clearly at export time rather than producing broken
+  output. Subtitles don't have this restriction — they're supported
+  alongside an edited timeline, per the per-cue remap/drop behavior above.
 
 ## Output Modes
 
@@ -345,8 +397,8 @@ generic multi-track API and no DASH/CMAF output.
 Every push and pull request runs through
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml): `cargo clippy` and
 `cargo test` for the Rust crate, then building the Wasm module, `eslint`,
-`tsc --noEmit`, and a production build. Pushes to `main` additionally deploy
-`dist/` to GitHub Pages.
+`tsc --noEmit`, `vitest run`, and a production build. Pushes to `main`
+additionally deploy `dist/` to GitHub Pages.
 
 ## Acknowledgments
 

@@ -4,5 +4,6 @@ packages/remux-core/
 wasm/target/
 *.tsbuildinfo
 vite.config.d.ts
+vitest.config.d.ts
 .DS_Store
 *.local

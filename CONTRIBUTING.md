@@ -18,7 +18,7 @@ Follow [Prerequisites](README.md#prerequisites) and
 [Getting Started](README.md#getting-started) in the README. In short:
 
 ```bash
-nvm use              # Node version pinned in .nvmrc
+nvm install 22.20.0 && nvm use 22.20.0   # matches package.json's "engines"
 npm install
 npm run build:wasm   # compiles wasm/ — required once, and again after any wasm/ change
 npm run dev
@@ -50,17 +50,21 @@ cargo test --release --manifest-path wasm/Cargo.toml
 npm run build:wasm
 npm run lint
 npm run typecheck
+npm run test
 npm run build
 ```
 
-**There is no automated test suite on the TypeScript side yet** — only the
-Rust crate has unit tests. Until that changes, PRs that touch
-`remux.worker.ts` or anything encoding/muxing-related need to be verified by
-hand: convert a real file end to end (fast path and, if relevant, Adaptive
-HLS) and confirm it plays back correctly in the app's own Shaka player.
-Describe what you tested in the PR description — reviewers have no other
-way to know a change works. If you're adding a new Rust function, unit
-tests for it (alongside the existing ones in `wasm/src/lib.rs`) are expected.
+**Vitest coverage on the TypeScript side is still thin** — currently just
+`src/lib/segments.ts` (the pure split/trim/reorder/layout logic behind the
+timeline editor) and the `useEditorSegments` hook built on top of it. Beyond
+that, PRs that touch `remux.worker.ts` or anything encoding/muxing-related
+still need to be verified by hand: convert a real file end to end (fast path
+and, if relevant, Adaptive HLS) and confirm it plays back correctly in the
+app's own Shaka player. Describe what you tested in the PR description —
+reviewers have no other way to know a change works. If you're adding a new
+Rust function, unit tests for it (alongside the existing ones in
+`wasm/src/lib.rs`) are expected; if you're adding new pure TypeScript
+editing/timeline logic, Vitest coverage for it is expected too.
 
 ## Commit messages
 

@@ -5,10 +5,13 @@
 ## How was this tested?
 
 <!--
-There's no automated test suite on the TypeScript side yet, so this section
-carries real weight in review — see CONTRIBUTING.md#before-opening-a-pr.
+Vitest coverage on the TypeScript side is still thin (currently just
+src/lib/segments.ts and useEditorSegments.ts) — for most changes this
+section still carries real weight in review, see CONTRIBUTING.md#before-opening-a-pr.
 
 - If you touched wasm/src/lib.rs: did you add/update unit tests? (expected)
+- If you touched pure editing/timeline logic (src/lib/segments.ts and
+  friends): did you add/update Vitest coverage? (expected)
 - If you touched remux.worker.ts or anything encoding/muxing-related: which
   file(s) did you convert end to end, on which path (fast / Adaptive HLS /
   FFmpeg fallback), and did the result play back correctly in the app's own
@@ -22,5 +25,6 @@ carries real weight in review — see CONTRIBUTING.md#before-opening-a-pr.
 - [ ] `cargo test --release --manifest-path wasm/Cargo.toml` passes
 - [ ] `npm run lint` passes
 - [ ] `npm run typecheck` passes
+- [ ] `npm run test` passes
 - [ ] `npm run build` succeeds
 - [ ] I tested this against a real file end to end (see above), not just a type-check

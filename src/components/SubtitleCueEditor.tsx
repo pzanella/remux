@@ -1,20 +1,5 @@
 import { useState } from 'react';
-import { formatTimestamp, parseCues, serializeVtt, type Cue } from '../lib/vtt';
-
-/** Parses `HH:MM:SS.mmm`, `MM:SS.mmm`, or plain seconds — whatever's least
- * fiddly to type while nudging a cue's timing. Falls back to the previous
- * value on anything unparseable rather than silently zeroing it out. */
-function parseTimeInput(value: string, fallback: number): number {
-  const parts = value.trim().split(':');
-  if (parts.length === 1) {
-    const n = Number(parts[0]);
-    return Number.isFinite(n) ? n : fallback;
-  }
-  const nums = parts.map(Number);
-  if (nums.some((n) => !Number.isFinite(n))) return fallback;
-  if (nums.length === 2) return nums[0] * 60 + nums[1];
-  return nums[0] * 3600 + nums[1] * 60 + nums[2];
-}
+import { formatTimestamp, parseCues, parseTimeInput, serializeVtt, type Cue } from '../lib/vtt';
 
 let nextCueId = 0;
 

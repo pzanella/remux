@@ -7,9 +7,31 @@
  * FFmpeg.wasm first.
  */
 
-import type { WorkerCommand, WorkerEvent, ParseHeadersResult, AudioOnlyParseResult, SegmentInfoJs, AbrRendition } from '../types';
+import type { WorkerCommand, WorkerEvent, ParseHeadersResult, AudioOnlyParseResult, SegmentInfoJs } from '../types';
 import { isNativeContainer, ABR_LADDER } from '../types';
 import { parseCues, serializeVtt, shiftCues } from '../lib/vtt';
+import { remapSourceRangeToGlobal } from '../lib/segments';
+import {
+  type SubtitleTag,
+  type AudioTrackTag,
+  ORIGINAL_AUDIO_PLAYLIST,
+  ORIGINAL_AUDIO_SEGMENT_PREFIX,
+  subtitleVttFilename,
+  subtitlePlaylistFilename,
+  computeRenditionWidth,
+  computeLetterboxRect,
+  matchMainRendition,
+  buildSubtitlePlaylist,
+  buildMasterM3U8,
+  buildFastPathMasterM3U8,
+  buildIntermediateM3U8,
+  totalDurationFromPlaylist,
+  durationsFromPlaylist,
+  cumulativeBoundaries,
+  spliceM3U8Texts,
+  concatChunks,
+  hasEditedSegments,
+} from '../lib/hls-playlist';
 
 // Registered before any async work, so a stalled Wasm/FFmpeg load or a Rust
 // panic always reaches the UI instead of hanging silently.
@@ -335,6 +357,52 @@ async function loadFFmpegInput(
   return { data, inputName: `input${ext}` };
 }
 
+/**
+ * Stream-copies `[sourceStart, sourceEnd)` out of an OPFS-resident source
+ * file into its own OPFS file via FFmpeg's `-c copy` — no re-encode, so
+ * this is fast, but (being a stream copy, not a frame-accurate re-encode)
+ * cuts land on the nearest keyframe rather than the exact requested time,
+ * the same precision tradeoff every other fast-path operation in this file
+ * already makes. `-ss` before `-i` is input-side (fast) seeking; `-t` after
+ * `-i` is a duration relative to that seek point, not an absolute end time,
+ * which is what makes this correct regardless of where the clip sits in
+ * the source. Used to materialize one segment of the vertical timeline
+ * editor's cut list before it's remuxed/encoded like any other clip — see
+ * `runSegmentedFastPath` / `runAdaptiveHlsSegmented`.
+ */
+async function cutSegmentClip(
+  opfsRoot: FileSystemDirectoryHandle,
+  sourceOpfsName: string,
+  sourceStart: number,
+  sourceEnd: number,
+  outputOpfsName: string,
+): Promise<void> {
+  const { FFmpeg } = await loadFFmpegModule();
+  const ffmpeg = new FFmpeg();
+  try {
+    await loadFFmpegCore(ffmpeg);
+    const { data, inputName } = await loadFFmpegInput(opfsRoot, sourceOpfsName);
+    await ffmpeg.writeFile(inputName, data);
+    const outputName = 'cut_output.mp4';
+    await ffmpeg.exec([
+      '-ss', sourceStart.toFixed(3),
+      '-i', inputName,
+      '-t', Math.max(0, sourceEnd - sourceStart).toFixed(3),
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
+      '-y',
+      outputName,
+    ]);
+    const outputData = await ffmpeg.readFile(outputName) as Uint8Array;
+    const outHandle = await opfsRoot.getFileHandle(outputOpfsName, { create: true });
+    const writable = await outHandle.createWritable();
+    await writable.write(outputData.buffer.slice(0) as ArrayBuffer);
+    await writable.close();
+  } finally {
+    ffmpeg.terminate();
+  }
+}
+
 /** Encodes every selected rendition for one source clip in parallel FFmpeg
  * instances — the FFmpeg counterpart of `runAbrEncodeForSource` above, used
  * once for the main content and, when present, once each for intro/outro. */
@@ -409,7 +477,7 @@ async function encodeRenditionsForSource(
 async function runAbrTranscoding(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
-  subtitleTag?: SubtitleTag,
+  subtitleTags: SubtitleTag[],
 ): Promise<void> {
   if (cancelled) {
     log('Cancelled.');
@@ -533,61 +601,11 @@ async function runAbrTranscoding(
     toAbrSourceResults(mainResults) ?? [],
     toAbrSourceResults(introResults),
     toAbrSourceResults(outroResults),
-    subtitleTag,
+    subtitleTags,
     audioTags,
   );
 
   post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
-}
-
-/** Standard 16:9 widths, used only when the source's real aspect ratio wasn't probed. */
-const FALLBACK_WIDTH_BY_HEIGHT: Record<number, number> = { 240: 426, 360: 640, 480: 854, 720: 1280 };
-
-function computeRenditionWidth(sourceWidth: number, sourceHeight: number, targetHeight: number): number {
-  if (sourceWidth > 0 && sourceHeight > 0) {
-    return Math.round((sourceWidth / sourceHeight) * (targetHeight / 2)) * 2;
-  }
-  return FALLBACK_WIDTH_BY_HEIGHT[targetHeight] ?? targetHeight;
-}
-
-/** Fits a `srcW x srcH` frame into a `dstW x dstH` box without changing its
- * own aspect ratio — letterboxed (black bars top/bottom) or pillarboxed
- * (black bars left/right) as needed, never stretched or cropped. Used to
- * draw a decoded video frame onto a differently-shaped rendition canvas —
- * matters whenever a source frame's own aspect ratio doesn't already match
- * the canvas it's being drawn onto (main content never hits this in
- * practice, since its own canvases are always sized from its own aspect
- * ratio; an intro/outro clip with a different native aspect ratio than the
- * main content routinely does). */
-function computeLetterboxRect(srcW: number, srcH: number, dstW: number, dstH: number): { x: number; y: number; w: number; h: number } {
-  if (srcW <= 0 || srcH <= 0) return { x: 0, y: 0, w: dstW, h: dstH };
-  const scale = Math.min(dstW / srcW, dstH / srcH);
-  const w = Math.max(2, Math.round((srcW * scale) / 2) * 2);
-  const h = Math.max(2, Math.round((srcH * scale) / 2) * 2);
-  return { x: Math.round((dstW - w) / 2), y: Math.round((dstH - h) / 2), w, h };
-}
-
-function buildMasterM3U8(
-  streamInfos: { rendition: (typeof ABR_LADDER)[number]; playlist: string; width: number }[],
-  subtitleTag?: SubtitleTag,
-  audioTags?: AudioTrackTag[],
-): string {
-  let m = '#EXTM3U\n#EXT-X-VERSION:3\n';
-  if (subtitleTag) m += buildSubtitleMediaTag(subtitleTag);
-  if (audioTags) for (const tag of audioTags) m += buildAudioMediaTag(tag);
-  for (const { rendition, playlist, width } of streamInfos) {
-    // With dub-audio, every rendition's own audio was dropped in favor of
-    // the shared "aud" group (see buildAudioOnlyRenditions) — the
-    // audioBitrateKbps folded into BANDWIDTH here is nominal in that case
-    // (no per-rendition audio encode happened), same tradeoff subtitles
-    // already make by not affecting BANDWIDTH at all.
-    const bandwidth = (rendition.videoBitrateKbps + rendition.audioBitrateKbps) * 1000;
-    const subsAttr = subtitleTag ? `,SUBTITLES="${SUBTITLES_GROUP_ID}"` : '';
-    const audioAttr = audioTags?.length ? `,AUDIO="${AUDIO_GROUP_ID}"` : '';
-    m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${rendition.height}${subsAttr}${audioAttr}\n`;
-    m += `${playlist}\n`;
-  }
-  return m;
 }
 
 // ── Subtitles (optional sidecar WebVTT track) ───────────────────────
@@ -595,63 +613,8 @@ function buildMasterM3U8(
 // HLS subtitles are a sidecar playlist referenced from the master/
 // multivariant playlist via #EXT-X-MEDIA, never muxed into the video/audio
 // segments themselves — so wiring them in never touches the Rust remuxer or
-// its fixed-PID MPEG-TS muxer, only the JS playlist-building layer here.
-
-const SUBTITLES_GROUP_ID = 'subs';
-const SUBTITLE_OUTPUT_FILENAME = 'subtitles.vtt';
-/** Per RFC 8216 §4.3.4.1, #EXT-X-MEDIA's URI for TYPE=SUBTITLES must point
- * to a *Media Playlist*, not a raw WebVTT file directly — Shaka (and any
- * spec-correct HLS player) fetches that URI expecting `#EXTM3U` as the
- * first line, and errors (HLS_PLAYLIST_HEADER_MISSING) on raw VTT content.
- * This wraps the single whole-file VTT in a one-segment VOD playlist, the
- * standard pattern for "not actually segmented" WebVTT in HLS. */
-const SUBTITLE_PLAYLIST_FILENAME = 'subtitles.m3u8';
-
-interface SubtitleTag {
-  name: string;
-  /** BCP-47 code, e.g. "en", "it". Without this, HLS defaults the track's
-   * language to "und" (undetermined) — which is what made Shaka's UI show
-   * "Undetermined" in the subtitle menu instead of a real language name;
-   * the NAME attribute isn't what stock player UIs surface there. */
-  language: string;
-}
-
-function buildSubtitleMediaTag({ name, language }: SubtitleTag): string {
-  return `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="${SUBTITLES_GROUP_ID}",NAME="${name}",LANGUAGE="${language}",DEFAULT=YES,AUTOSELECT=YES,URI="${SUBTITLE_PLAYLIST_FILENAME}"\n`;
-}
-
-/** Writes the one-segment media playlist that wraps `subtitles.vtt` — see
- * `SUBTITLE_PLAYLIST_FILENAME`'s comment for why this has to exist at all.
- * `totalDurationSec` should be the *video's* total duration (main content
- * plus any spliced intro/outro), not the VTT's own span: a WebVTT file
- * with cues shorter or longer than the video is fine either way — cues
- * keep their own internal timestamps regardless of this wrapper, and any
- * past the video's end simply never get reached. */
-function buildSubtitlePlaylist(totalDurationSec: number): string {
-  const target = Math.max(1, Math.ceil(totalDurationSec));
-  return (
-    '#EXTM3U\n' +
-    '#EXT-X-VERSION:3\n' +
-    `#EXT-X-TARGETDURATION:${target}\n` +
-    '#EXT-X-MEDIA-SEQUENCE:0\n' +
-    '#EXT-X-PLAYLIST-TYPE:VOD\n' +
-    `#EXTINF:${totalDurationSec.toFixed(6)},\n` +
-    `${SUBTITLE_OUTPUT_FILENAME}\n` +
-    '#EXT-X-ENDLIST\n'
-  );
-}
-
-/** Sums every #EXTINF value in an already-built playlist — used to get the
- * *actual* total duration (main content plus any spliced intro/outro) for
- * the subtitle playlist wrapper, without threading a separate duration
- * figure through every call site that can produce a final playlist. */
-function totalDurationFromPlaylist(playlistText: string): number {
-  let total = 0;
-  for (const match of playlistText.matchAll(/#EXTINF:([\d.]+)/g)) {
-    total += parseFloat(match[1]);
-  }
-  return total;
-}
+// its fixed-PID MPEG-TS muxer, only the JS playlist-building layer
+// (src/lib/hls-playlist.ts).
 
 // ── Dub-audio (optional alternate #EXT-X-MEDIA:TYPE=AUDIO renditions) ──
 //
@@ -662,108 +625,121 @@ function totalDurationFromPlaylist(playlistText: string): number {
 // AUDIO="aud" wiring in buildFastPathMasterM3U8 and the "original" audio
 // split out of the main content's own segments in runWithHandle.
 
-const AUDIO_GROUP_ID = 'aud';
-const ORIGINAL_AUDIO_PLAYLIST = 'audio_orig.m3u8';
-const ORIGINAL_AUDIO_SEGMENT_PREFIX = 'audio_orig_';
-
-interface AudioTrackTag {
-  name: string;
-  language: string;
-  playlist: string;
-  isDefault: boolean;
-}
-
-function buildAudioMediaTag({ name, language, playlist, isDefault }: AudioTrackTag): string {
-  return `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="${AUDIO_GROUP_ID}",NAME="${name}",LANGUAGE="${language}",DEFAULT=${isDefault ? 'YES' : 'NO'},AUTOSELECT=YES,URI="${playlist}"\n`;
-}
-
 /**
- * Reads the raw subtitle file the UI saved to OPFS, converts it to WebVTT
- * with FFmpeg.wasm if it's SRT, and writes the result into the output
- * folder. Returns the display label to use in #EXT-X-MEDIA, or undefined if
- * there's no subtitle track or it couldn't be prepared — a subtitle problem
- * degrades to "no subtitles" rather than failing the whole conversion.
+ * Reads every raw subtitle file the UI saved to OPFS, converts each to
+ * WebVTT with FFmpeg.wasm if it's SRT, and writes the result into the
+ * output folder as its own sidecar VTT file. Returns one SubtitleTag per
+ * track that prepared successfully, first one marked DEFAULT — a track that
+ * fails to prepare is dropped and logged rather than failing the whole
+ * conversion (or the other tracks), same "degrade rather than fail"
+ * tolerance the single-track version had.
  */
-async function resolveSubtitleTrack(
+async function resolveSubtitleTracks(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
-): Promise<SubtitleTag | undefined> {
-  const track = session.subtitleTrack;
-  if (!track) return undefined;
+): Promise<SubtitleTag[]> {
+  const tracks = session.subtitleTracks ?? [];
+  const tags: SubtitleTag[] = [];
 
-  try {
-    const opfsRoot = await navigator.storage.getDirectory();
-    const fileHandle = await opfsRoot.getFileHandle(track.fileName);
-    const file = await fileHandle.getFile();
+  for (const track of tracks) {
+    try {
+      const opfsRoot = await navigator.storage.getDirectory();
+      const fileHandle = await opfsRoot.getFileHandle(track.fileName);
+      const file = await fileHandle.getFile();
 
-    // Trust content over filename: a mislabeled extension (real SRT saved
-    // as .vtt, a .vtt that's actually SRT-formatted, unusual encoding, ...)
-    // would otherwise sail through untouched and only fail later, deep
-    // inside Shaka's strict WebVTT parser (INVALID_TEXT_HEADER) — by which
-    // point there's no good way to recover. Sniffing the actual text and
-    // normalizing through FFmpeg whenever it doesn't already look like
-    // WebVTT catches all of those cases the same way, regardless of cause.
-    let vttText = await file.text();
-    // `File.text()` decodes as UTF-8 but doesn't strip a leading byte-order
-    // mark, so one — common from Windows-authored subtitle files — would
-    // otherwise sit right before "WEBVTT" and make the check below miss a
-    // file that's actually fine.
-    if (vttText.charCodeAt(0) === 0xfeff) vttText = vttText.slice(1);
-    const looksLikeWebVtt = /^WEBVTT($|[ \t\r\n])/.test(vttText);
-    if (!looksLikeWebVtt) {
-      // Not WebVTT-shaped and, per the catch block below, potentially not
-      // SRT-shaped either — logging what the browser actually decoded (as
-      // opposed to what the file is *named*) is the only way to tell
-      // "wrong format entirely" apart from "wrong text encoding" without
-      // access to the file itself.
-      const preview = JSON.stringify(vttText.slice(0, 150));
-      log(`Subtitle file doesn't look like WebVTT — first ~150 chars as decoded: ${preview}`);
+      // Trust content over filename: a mislabeled extension (real SRT saved
+      // as .vtt, a .vtt that's actually SRT-formatted, unusual encoding, ...)
+      // would otherwise sail through untouched and only fail later, deep
+      // inside Shaka's strict WebVTT parser (INVALID_TEXT_HEADER) — by which
+      // point there's no good way to recover. Sniffing the actual text and
+      // normalizing through FFmpeg whenever it doesn't already look like
+      // WebVTT catches all of those cases the same way, regardless of cause.
+      let vttText = await file.text();
+      // `File.text()` decodes as UTF-8 but doesn't strip a leading byte-order
+      // mark, so one — common from Windows-authored subtitle files — would
+      // otherwise sit right before "WEBVTT" and make the check below miss a
+      // file that's actually fine.
+      if (vttText.charCodeAt(0) === 0xfeff) vttText = vttText.slice(1);
+      const looksLikeWebVtt = /^WEBVTT($|[ \t\r\n])/.test(vttText);
+      if (!looksLikeWebVtt) {
+        // Not WebVTT-shaped and, per the catch block below, potentially not
+        // SRT-shaped either — logging what the browser actually decoded (as
+        // opposed to what the file is *named*) is the only way to tell
+        // "wrong format entirely" apart from "wrong text encoding" without
+        // access to the file itself.
+        const preview = JSON.stringify(vttText.slice(0, 150));
+        log(`Subtitle file "${track.label}" doesn't look like WebVTT — first ~150 chars as decoded: ${preview}`);
 
-      // Feed FFmpeg the file as SRT regardless of its original extension:
-      // the content just failed a WebVTT-shaped check, and SRT is the only
-      // other format the file picker accepts — trusting the extension here
-      // is exactly the assumption that got us into this branch in the
-      // first place (e.g. asking FFmpeg to read genuinely SRT-formatted
-      // content as `sub.vtt` makes its WebVTT demuxer choke on SRT's
-      // comma-decimal timestamps instead of converting anything).
-      log('Normalizing subtitles to WebVTT…');
-      const { FFmpeg } = await loadFFmpegModule();
-      const ffmpeg = new FFmpeg();
-      // FFmpeg's own stderr is the only thing that can actually explain a
-      // conversion failure — without it, a failed exec just surfaces later
-      // as an opaque "file not found" from the readFile() below, when the
-      // real reason is whatever FFmpeg logged and discarded.
-      const ffmpegLog: string[] = [];
-      ffmpeg.on('log', ({ message }) => ffmpegLog.push(message));
-      try {
-        await loadFFmpegCore(ffmpeg);
-        await ffmpeg.writeFile('sub.srt', new Uint8Array(await file.arrayBuffer()));
-        await ffmpeg.exec(['-i', 'sub.srt', 'sub.vtt']);
-        vttText = (await ffmpeg.readFile('sub.vtt', 'utf8')) as string;
-      } catch (ffmpegErr) {
-        throw new Error(`FFmpeg could not read this as SRT either (${ffmpegErr}). FFmpeg said: ${ffmpegLog.slice(-6).join(' / ') || '(no output)'}`);
-      } finally {
-        ffmpeg.terminate();
+        // Feed FFmpeg the file as SRT regardless of its original extension:
+        // the content just failed a WebVTT-shaped check, and SRT is the only
+        // other format the file picker accepts — trusting the extension here
+        // is exactly the assumption that got us into this branch in the
+        // first place (e.g. asking FFmpeg to read genuinely SRT-formatted
+        // content as `sub.vtt` makes its WebVTT demuxer choke on SRT's
+        // comma-decimal timestamps instead of converting anything).
+        log(`Normalizing "${track.label}" to WebVTT…`);
+        const { FFmpeg } = await loadFFmpegModule();
+        const ffmpeg = new FFmpeg();
+        // FFmpeg's own stderr is the only thing that can actually explain a
+        // conversion failure — without it, a failed exec just surfaces later
+        // as an opaque "file not found" from the readFile() below, when the
+        // real reason is whatever FFmpeg logged and discarded.
+        const ffmpegLog: string[] = [];
+        ffmpeg.on('log', ({ message }) => ffmpegLog.push(message));
+        try {
+          await loadFFmpegCore(ffmpeg);
+          await ffmpeg.writeFile('sub.srt', new Uint8Array(await file.arrayBuffer()));
+          await ffmpeg.exec(['-i', 'sub.srt', 'sub.vtt']);
+          vttText = (await ffmpeg.readFile('sub.vtt', 'utf8')) as string;
+        } catch (ffmpegErr) {
+          throw new Error(`FFmpeg could not read this as SRT either (${ffmpegErr}). FFmpeg said: ${ffmpegLog.slice(-6).join(' / ') || '(no output)'}`);
+        } finally {
+          ffmpeg.terminate();
+        }
       }
-    }
 
-    // Cues are authored relative to the main content, same as the timeline
-    // editor shows them — but once an intro is spliced in front of it, the
-    // main content itself starts later in the final output, so every cue
-    // needs to shift forward by exactly that much or they'd play back
-    // during the intro instead of alongside the footage they were written
-    // for.
-    const introDuration = session.introOutro?.introDuration;
-    if (introDuration && introDuration > 0) {
-      vttText = serializeVtt(shiftCues(parseCues(vttText), introDuration));
-    }
+      // Cues are always authored in the *source file's own* time — that's
+      // what an attached .srt/.vtt naturally means, and it's what the cue
+      // editor shows too. Getting them into the flattened output's time
+      // needs two steps: first remap each cue through the current segment
+      // list (a no-op shift for the untrimmed common case, but a real
+      // reposition — or an honest drop — once the timeline's been trimmed/
+      // split/reordered; see remapSourceRangeToGlobal's own comment for why
+      // a cue that doesn't land entirely inside one current segment is
+      // dropped rather than guessed at), then shift everything forward by
+      // any spliced-on intro's duration, same as before.
+      const introDuration = session.introOutro?.introDuration ?? 0;
+      const segments = session.segments;
+      const sourceCues = parseCues(vttText);
+      let outputCues = sourceCues;
+      if (segments && segments.length > 0) {
+        outputCues = [];
+        let droppedCount = 0;
+        for (const cue of sourceCues) {
+          const remapped = remapSourceRangeToGlobal(segments, cue.start, cue.end);
+          if (remapped) {
+            outputCues.push({ ...cue, start: remapped.start, end: remapped.end });
+          } else {
+            droppedCount++;
+          }
+        }
+        if (droppedCount > 0) {
+          log(`${droppedCount} cue(s) in "${track.label}" fell in trimmed-out or split-across-a-boundary footage and were dropped.`);
+        }
+      }
+      if (introDuration > 0) {
+        outputCues = shiftCues(outputCues, introDuration);
+      }
+      vttText = serializeVtt(outputCues);
 
-    await writeOutputFile(outputFolderHandle, SUBTITLE_OUTPUT_FILENAME, vttText);
-    return { name: track.label, language: track.language };
-  } catch (err) {
-    log(`Could not prepare subtitles (${err}) — continuing without them.`, 'ERROR');
-    return undefined;
+      await writeOutputFile(outputFolderHandle, subtitleVttFilename(track.language), vttText);
+      tags.push({ name: track.label, language: track.language, playlist: subtitlePlaylistFilename(track.language), isDefault: tags.length === 0 });
+    } catch (err) {
+      log(`Could not prepare subtitles "${track.label}" (${err}) — continuing without them.`, 'ERROR');
+    }
   }
+
+  return tags;
 }
 
 // ── Adaptive HLS via WebCodecs (primary ABR path) ───────────────────
@@ -914,17 +890,6 @@ function closeQuietly(codec: { close(): void; state: CodecState }): void {
   }
 }
 
-function concatChunks(chunks: EncodedChunkInfo[]): Uint8Array {
-  const total = chunks.reduce((sum, c) => sum + c.data.byteLength, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c.data, offset);
-    offset += c.data.byteLength;
-  }
-  return out;
-}
-
 function createRenditionSink(
   rendition: (typeof ABR_LADDER)[number],
   width: number,
@@ -1059,55 +1024,6 @@ interface AbrSourceResult {
   playlistText: string;
 }
 
-/** Keeps only the `#EXTINF`/segment-name pairs from a playlist, dropping its
- * own header (`#EXTM3U`, `#EXT-X-TARGETDURATION`, ...) and footer
- * (`#EXT-X-ENDLIST`) — the piece that's actually source-specific when
- * splicing several playlists (WebCodecs- or FFmpeg-generated, both are
- * plain text either way) into one. */
-function extractPlaylistBody(playlistText: string): string {
-  return playlistText
-    .split('\n')
-    .filter((line) => line.startsWith('#EXTINF') || (line.trim() !== '' && !line.startsWith('#')))
-    .join('\n');
-}
-
-/** Every individual `#EXTINF` duration, in playlist order — unlike
- * `totalDurationFromPlaylist` (which only needs the sum), this is used to
- * recover a rendition's *real* per-segment cut points for
- * `buildAudioOnlyRenditions`, since ABR renditions are cut by forced
- * keyframes at encode time, not by any pre-computed boundary list the way
- * the fast path's are. */
-function durationsFromPlaylist(playlistText: string): number[] {
-  return [...playlistText.matchAll(/#EXTINF:([\d.]+)/g)].map((m) => parseFloat(m[1]));
-}
-
-/** Individual segment durations → cumulative end times, the boundary shape
- * `buildAudioOnlyRenditions`/`segment_audio_at_boundaries` expect. */
-function cumulativeBoundaries(durations: number[]): number[] {
-  let acc = 0;
-  return durations.map((d) => (acc += d));
-}
-
-/** Concatenates 1-3 already-complete variant playlists (intro/main/outro,
- * in that order) for the *same* rendition into one, with an
- * #EXT-X-DISCONTINUITY between each — the ABR counterpart of
- * `buildSplicedM3U8`, which does the same thing for the fast path's
- * duration-array-based playlists instead of pre-built playlist text. */
-function spliceM3U8Texts(playlistTexts: string[]): string {
-  const targetDuration = Math.max(
-    1,
-    ...playlistTexts.map((t) => parseInt(t.match(/#EXT-X-TARGETDURATION:(\d+)/)?.[1] ?? '0', 10)),
-  );
-  let m = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${targetDuration}\n#EXT-X-MEDIA-SEQUENCE:0\n`;
-  playlistTexts.forEach((text, i) => {
-    if (i > 0) m += '#EXT-X-DISCONTINUITY\n';
-    const body = extractPlaylistBody(text);
-    if (body) m += `${body}\n`;
-  });
-  m += '#EXT-X-ENDLIST\n';
-  return m;
-}
-
 /**
  * Builds the "Original" audio plus every dub track as audio-only HLS
  * renditions sharing one `#EXT-X-MEDIA:TYPE=AUDIO` group — used identically
@@ -1175,7 +1091,7 @@ async function finalizeAbrResults(
   mainResults: AbrSourceResult[],
   introResults: AbrSourceResult[] | null,
   outroResults: AbrSourceResult[] | null,
-  subtitleTag: SubtitleTag | undefined,
+  subtitleTags: SubtitleTag[],
   audioTags?: AudioTrackTag[],
 ): Promise<{ masterM3u8: string; highestM3u8: string }> {
   if (mainResults.length === 0) {
@@ -1208,12 +1124,14 @@ async function finalizeAbrResults(
     if (outro) await removeOutputFileQuietly(outputFolderHandle, `outro_${main.rendition.label}.m3u8`);
   }
 
-  if (subtitleTag) {
+  if (subtitleTags.length > 0) {
     const totalDuration = totalDurationFromPlaylist(highestM3u8);
-    await writeOutputFile(outputFolderHandle, SUBTITLE_PLAYLIST_FILENAME, buildSubtitlePlaylist(totalDuration));
+    for (const tag of subtitleTags) {
+      await writeOutputFile(outputFolderHandle, tag.playlist, buildSubtitlePlaylist(totalDuration, subtitleVttFilename(tag.language)));
+    }
   }
 
-  const masterM3u8 = buildMasterM3U8(streamInfos, subtitleTag, audioTags);
+  const masterM3u8 = buildMasterM3U8(streamInfos, subtitleTags, audioTags);
   await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
 
   return { masterM3u8, highestM3u8 };
@@ -1229,7 +1147,7 @@ async function runAbrTranscodingWebCodecs(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
   renditions: (typeof ABR_LADDER)[number][],
-  subtitleTag?: SubtitleTag,
+  subtitleTags: SubtitleTag[],
 ): Promise<void> {
   const sourceWidth = session.sourceWidth ?? 0;
   const sourceHeight = session.sourceHeight ?? 0;
@@ -1283,7 +1201,7 @@ async function runAbrTranscodingWebCodecs(
     audioTags = result;
   }
 
-  const { masterM3u8, highestM3u8 } = await finalizeAbrResults(outputFolderHandle, mainResults, introResults, outroResults, subtitleTag, audioTags);
+  const { masterM3u8, highestM3u8 } = await finalizeAbrResults(outputFolderHandle, mainResults, introResults, outroResults, subtitleTags, audioTags);
   post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
 }
 
@@ -1711,7 +1629,7 @@ async function runAbrWebCodecsWithHandle(
 async function runAdaptiveHls(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
-  subtitleTag?: SubtitleTag,
+  subtitleTags: SubtitleTag[],
 ): Promise<void> {
   const heights = [...(session.abrHeights ?? [])].sort((a, b) => a - b);
   if (heights.length === 0) {
@@ -1726,7 +1644,7 @@ async function runAdaptiveHls(
 
   if (canUseHardware) {
     try {
-      await runAbrTranscodingWebCodecs(session, outputFolderHandle, renditions, subtitleTag);
+      await runAbrTranscodingWebCodecs(session, outputFolderHandle, renditions, subtitleTags);
       return;
     } catch (err) {
       if (cancelled) {
@@ -1739,7 +1657,7 @@ async function runAdaptiveHls(
     log('Hardware-accelerated encoding is not available here — using FFmpeg instead.');
   }
 
-  await runAbrTranscoding(session, outputFolderHandle, subtitleTag);
+  await runAbrTranscoding(session, outputFolderHandle, subtitleTags);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -1835,7 +1753,7 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
-  const subtitleTag = await resolveSubtitleTrack(session, outputFolderHandle);
+  const subtitleTags = await resolveSubtitleTracks(session, outputFolderHandle);
 
   // Dub-audio + intro/outro splicing together isn't supported yet: the
   // audio-only renditions built by buildAudioOnlyRenditions only ever cover
@@ -1849,8 +1767,26 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
+  // Edited (multi-segment) sources share the same underlying limitation:
+  // buildAudioOnlyRenditions/spliceIntroOutro only ever know about the
+  // single main-content timeline they were built for, with no equivalent
+  // of runSegmentedFastPath's splice for either combination yet.
+  const editedSegments = hasEditedSegments(session);
+  if (editedSegments && session.dubAudioTracks?.length) {
+    post({ type: 'ERROR', error: 'Dub-audio tracks are not yet supported together with edited (trimmed/split) segments.' });
+    return;
+  }
+  if (editedSegments && (session.introOutro?.introFileName || session.introOutro?.outroFileName)) {
+    post({ type: 'ERROR', error: 'Intro/outro clips are not yet supported together with edited (trimmed/split) segments.' });
+    return;
+  }
+
   if (session.abrHeights && session.abrHeights.length > 0) {
-    await runAdaptiveHls(session, outputFolderHandle, subtitleTag);
+    if (editedSegments) {
+      await runAdaptiveHlsSegmented(session, outputFolderHandle, subtitleTags);
+    } else {
+      await runAdaptiveHls(session, outputFolderHandle, subtitleTags);
+    }
     return;
   }
 
@@ -1866,6 +1802,11 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
       post({ type: 'ERROR', error: `FFmpeg conversion failed: ${err}` });
       return;
     }
+  }
+
+  if (editedSegments) {
+    await runSegmentedFastPath(effectiveSession, outputFolderHandle, subtitleTags);
+    return;
   }
 
   log('Opening source file…');
@@ -1894,7 +1835,7 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
   }
 
   try {
-    await runWithHandle(syncHandle, effectiveSession, outputFolderHandle, cmd.type === 'RESUME', subtitleTag);
+    await runWithHandle(syncHandle, effectiveSession, outputFolderHandle, cmd.type === 'RESUME', subtitleTags);
   } finally {
     syncHandle.close();
   }
@@ -1905,7 +1846,7 @@ async function runWithHandle(
   session: import('../types').TranscodingSession,
   outputFolderHandle: FileSystemDirectoryHandle,
   isResume: boolean,
-  subtitleTag?: SubtitleTag,
+  subtitleTags: SubtitleTag[],
 ): Promise<void> {
   const fileSize = syncHandle.getSize();
   log(`File size: ${(fileSize / 1024 / 1024).toFixed(1)} MiB`);
@@ -2112,18 +2053,18 @@ async function runWithHandle(
   // meaning inside one, though, so a subtitle or dub-audio track forces a
   // minimal, single-variant master.m3u8 into existence here.
   let masterM3u8: string | undefined;
-  if (subtitleTag || audioTags) {
+  if (subtitleTags.length > 0 || audioTags) {
     // Derived from the *final* playlist (post intro/outro splicing, if any)
     // rather than summing `finalDurations` directly, so both the subtitle
     // wrapper and the bandwidth estimate below account for spliced-on
     // intro/outro duration too, not just the main content's.
     const totalDuration = totalDurationFromPlaylist(outputM3u8);
-    if (subtitleTag) {
-      await writeOutputFile(outputFolderHandle, SUBTITLE_PLAYLIST_FILENAME, buildSubtitlePlaylist(totalDuration));
+    for (const tag of subtitleTags) {
+      await writeOutputFile(outputFolderHandle, tag.playlist, buildSubtitlePlaylist(totalDuration, subtitleVttFilename(tag.language)));
     }
 
     const bandwidth = totalDuration > 0 ? Math.round((totalBytes * 8) / totalDuration) : 1_000_000;
-    masterM3u8 = buildFastPathMasterM3U8(bandwidth, session.sourceWidth, session.sourceHeight, subtitleTag, audioTags);
+    masterM3u8 = buildFastPathMasterM3U8(bandwidth, session.sourceWidth, session.sourceHeight, subtitleTags, audioTags);
     await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
   }
 
@@ -2135,24 +2076,6 @@ async function runWithHandle(
     masterM3u8,
     sessionId: session.id,
   });
-}
-
-function buildFastPathMasterM3U8(
-  bandwidth: number,
-  width: number | undefined,
-  height: number | undefined,
-  subtitleTag: SubtitleTag | undefined,
-  audioTags: AudioTrackTag[] | undefined,
-): string {
-  let m = '#EXTM3U\n#EXT-X-VERSION:3\n';
-  if (subtitleTag) m += buildSubtitleMediaTag(subtitleTag);
-  if (audioTags) for (const tag of audioTags) m += buildAudioMediaTag(tag);
-  const resAttr = width && height ? `,RESOLUTION=${width}x${height}` : '';
-  const subsAttr = subtitleTag ? `,SUBTITLES="${SUBTITLES_GROUP_ID}"` : '';
-  const audioAttr = audioTags?.length ? `,AUDIO="${AUDIO_GROUP_ID}"` : '';
-  m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth}${resAttr}${subsAttr}${audioAttr}\n`;
-  m += 'index.m3u8\n';
-  return m;
 }
 
 // ── Intro/outro splicing (fast path) ────────────────────────────────
@@ -2168,21 +2091,6 @@ function buildFastPathMasterM3U8(
 // re-encoded and letterboxed to match instead, via the same single-source
 // WebCodecs/FFmpeg pipeline the ABR paths already use, just for one
 // ad-hoc rendition sized to match main exactly rather than a ladder rung.
-
-/** A one-off "rendition" matching the main content's own resolution —
- * reuses the ABR encode pipeline to letterbox/pillarbox an intro/outro
- * clip into that exact size, without it needing to be an actual ladder
- * rung. Bitrate is generous (bumpers are short; quality matters more than
- * file size here) and floored well above the 96kbps WebCodecs AAC floor
- * documented on ABR_LADDER. */
-function matchMainRendition(mainHeight: number): AbrRendition {
-  return {
-    height: mainHeight,
-    label: 'main',
-    videoBitrateKbps: Math.max(1200, Math.round(mainHeight * 6)),
-    audioBitrateKbps: 128,
-  };
-}
 
 /** Re-encodes one auxiliary clip to match the main content's exact
  * dimensions (letterboxed/pillarboxed, never stretched or cropped),
@@ -2388,24 +2296,285 @@ async function spliceIntroOutro(
   return spliceM3U8Texts(texts);
 }
 
+// ── Edited (multi-segment) export — vertical timeline editor ────────
+//
+// The timeline editor's split/trim/delete/reorder edits flatten into
+// `session.segments`: an ordered list of `{sourceStart, sourceEnd}` cuts,
+// all drawn from the one main source file. This reuses the exact same
+// splice mechanism `spliceIntroOutro` uses for up to 3 named clips from up
+// to 3 different files — cut each one out (via `cutSegmentClip`, since
+// unlike intro/outro these aren't separate files to begin with), remux it
+// independently, and splice the results with `spliceM3U8Texts`, which
+// already handles an arbitrary-length list. Every segment shares the main
+// content's own dimensions by definition, so none of intro/outro's
+// letterboxing logic applies here.
+
+/** True when `session.segments` represents a real edit — more than one
+ * segment, or a single segment that doesn't already span the whole source.
+ * Lets an unedited export (the common case: load a file, export as-is) skip
+ * the extra cut+remux pass entirely and fall through to the existing
+ * whole-file fast/ABR paths unchanged. */
+/**
+ * Fast-path export for a source cut into N ordered, trimmed segments. Each
+ * segment is stream-copied out via `cutSegmentClip`, remuxed independently
+ * through its own `HlsProcessor` (`remuxAuxiliaryClip` — safe here with no
+ * letterboxing, since every segment shares the main content's own
+ * dimensions), and the results spliced together. Not resumable, like the
+ * ABR paths — a restart begins the whole job over rather than checkpointing
+ * mid-cut.
+ */
+async function runSegmentedFastPath(
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  subtitleTags: SubtitleTag[],
+): Promise<void> {
+  const segments = session.segments ?? [];
+  const opfsRoot = await navigator.storage.getDirectory();
+  const tempFiles: string[] = [];
+  const texts: string[] = [];
+
+  post({ type: 'INITIALIZED', totalSegments: segments.length });
+
+  try {
+    for (let i = 0; i < segments.length; i++) {
+      if (cancelled) {
+        log('Cancelled.');
+        return;
+      }
+      const { sourceStart, sourceEnd } = segments[i];
+      log(`Clip ${i + 1}/${segments.length}: cutting ${sourceStart.toFixed(2)}s–${sourceEnd.toFixed(2)}s…`);
+      const tempName = `__segcut_${session.id}_${i}.mp4`;
+      await cutSegmentClip(opfsRoot, session.sourceFilePath, sourceStart, sourceEnd, tempName);
+      tempFiles.push(tempName);
+
+      log(`Clip ${i + 1}/${segments.length}: remuxing…`);
+      texts.push(await remuxAuxiliaryClip(tempName, `seg${i}_`, outputFolderHandle));
+
+      post({
+        type: 'SEGMENT_DONE',
+        segmentIndex: i,
+        totalSegments: segments.length,
+        log: `Clip ${i + 1}/${segments.length} done`,
+        sessionId: session.id,
+      });
+    }
+  } catch (err) {
+    post({ type: 'ERROR', error: `Edited export failed: ${err}`, sessionId: session.id });
+    return;
+  } finally {
+    for (const f of tempFiles) await removeOutputFileQuietly(opfsRoot, f);
+  }
+
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
+
+  const outputM3u8 = spliceM3U8Texts(texts);
+  await writeOutputFile(outputFolderHandle, 'index.m3u8', outputM3u8);
+
+  // Same reasoning as the whole-file fast path's own tail (runWithHandle):
+  // #EXT-X-MEDIA only has meaning inside a multivariant playlist, so a
+  // subtitle track forces a minimal master.m3u8 into existence here too.
+  let masterM3u8: string | undefined;
+  if (subtitleTags.length > 0) {
+    const totalDuration = totalDurationFromPlaylist(outputM3u8);
+    for (const tag of subtitleTags) {
+      await writeOutputFile(outputFolderHandle, tag.playlist, buildSubtitlePlaylist(totalDuration, subtitleVttFilename(tag.language)));
+    }
+    masterM3u8 = buildFastPathMasterM3U8(1_000_000, session.sourceWidth, session.sourceHeight, subtitleTags, undefined);
+    await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+  }
+
+  post({
+    type: 'COMPLETE',
+    totalSegments: segments.length,
+    log: masterM3u8 ? 'Done! master.m3u8 is ready.' : 'Done! index.m3u8 is ready.',
+    m3u8: outputM3u8,
+    masterM3u8,
+    sessionId: session.id,
+  });
+}
+
+/** ABR counterpart of `finalizeAbrResults`, generalized from a fixed
+ * intro/main/outro triple to an ordered list of per-segment,
+ * per-rendition results — one entry in `segmentResultsList` per timeline
+ * segment, each already encoded across every selected rendition. Splices
+ * per rendition the same way, across however many segments there are. */
+async function finalizeAbrResultsSegmented(
+  outputFolderHandle: FileSystemDirectoryHandle,
+  segmentResultsList: AbrSourceResult[][],
+  subtitleTags: SubtitleTag[],
+  audioTags?: AudioTrackTag[],
+): Promise<{ masterM3u8: string; highestM3u8: string }> {
+  const reference = segmentResultsList.find((r) => r.length > 0);
+  if (!reference) {
+    throw new Error('No rendition produced any output.');
+  }
+
+  const streamInfos: { rendition: (typeof ABR_LADDER)[number]; playlist: string; width: number }[] = [];
+  let highestM3u8 = '';
+
+  for (const { rendition } of reference) {
+    const texts: string[] = [];
+    let width = 0;
+    for (const segResults of segmentResultsList) {
+      const match = segResults.find((r) => r.rendition.height === rendition.height);
+      if (match) {
+        texts.push(match.playlistText);
+        width = match.width;
+      }
+    }
+    if (texts.length === 0) continue;
+
+    const spliced = texts.length > 1 ? spliceM3U8Texts(texts) : texts[0];
+    const playlistName = `${rendition.label}.m3u8`;
+    await writeOutputFile(outputFolderHandle, playlistName, spliced);
+    streamInfos.push({ rendition, playlist: playlistName, width });
+    highestM3u8 = spliced;
+
+    // Each segment's own standalone playlist (e.g. `seg2_480p.m3u8`) was
+    // only ever a byproduct of encoding it with the same per-source
+    // machinery as the main content — nothing references it once its
+    // segments are folded into the spliced playlist above.
+    for (let i = 0; i < segmentResultsList.length; i++) {
+      await removeOutputFileQuietly(outputFolderHandle, `seg${i}_${rendition.label}.m3u8`);
+    }
+  }
+
+  if (subtitleTags.length > 0) {
+    const totalDuration = totalDurationFromPlaylist(highestM3u8);
+    for (const tag of subtitleTags) {
+      await writeOutputFile(outputFolderHandle, tag.playlist, buildSubtitlePlaylist(totalDuration, subtitleVttFilename(tag.language)));
+    }
+  }
+
+  const masterM3u8 = buildMasterM3U8(streamInfos, subtitleTags, audioTags);
+  await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+
+  return { masterM3u8, highestM3u8 };
+}
+
+/** Encodes one pre-cut segment clip across every selected rendition via
+ * FFmpeg (software fallback) and maps the result to the shape
+ * `finalizeAbrResultsSegmented` expects — the segmented counterpart of the
+ * inline FFmpeg calls in `runAbrTranscoding`. */
+async function encodeSegmentWithFfmpeg(
+  FFmpeg: FFmpegModule['FFmpeg'],
+  coreURL: string,
+  wasmURL: string,
+  opfsRoot: FileSystemDirectoryHandle,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  clipOpfsName: string,
+  renditions: (typeof ABR_LADDER)[number][],
+  sourceWidth: number,
+  sourceHeight: number,
+  segmentPrefix: string,
+): Promise<AbrSourceResult[]> {
+  const { data, inputName } = await loadFFmpegInput(opfsRoot, clipOpfsName);
+  const results = await encodeRenditionsForSource(
+    FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, segmentPrefix, '',
+  );
+  return results.map((r) => ({ rendition: r.rendition, width: r.width, playlistText: r.playlistText }));
+}
+
+/**
+ * Adaptive-HLS export for an edited (multi-segment) source — the ABR
+ * counterpart of `runSegmentedFastPath`. Each segment is cut once via
+ * `cutSegmentClip`, then that cut clip is encoded across every selected
+ * rendition (hardware WebCodecs first, FFmpeg fallback — same decision
+ * `runAdaptiveHls` makes once for the whole job, made once here too and
+ * reused for every segment rather than re-probed per clip), producing an
+ * `AbrSourceResult[]` per segment that `finalizeAbrResultsSegmented`
+ * splices together per rendition. Not resumable.
+ */
+async function runAdaptiveHlsSegmented(
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  subtitleTags: SubtitleTag[],
+): Promise<void> {
+  const heights = [...(session.abrHeights ?? [])].sort((a, b) => a - b);
+  if (heights.length === 0) {
+    post({ type: 'ERROR', error: 'No renditions selected for the adaptive playlist.' });
+    return;
+  }
+  const renditions = heights
+    .map((h) => ABR_LADDER.find((r) => r.height === h))
+    .filter((r): r is (typeof ABR_LADDER)[number] => r !== undefined);
+
+  const segments = session.segments ?? [];
+  const sourceWidth = session.sourceWidth ?? 0;
+  const sourceHeight = session.sourceHeight ?? 0;
+  const canUseHardware = await canUseWebCodecsAbr(renditions, sourceWidth, sourceHeight);
+  if (!canUseHardware) log('Hardware-accelerated encoding is not available here — using FFmpeg instead.');
+
+  const opfsRoot = await navigator.storage.getDirectory();
+  const { FFmpeg } = await loadFFmpegModule();
+  const { coreURL, wasmURL } = await fetchFFmpegCoreBlobs();
+
+  const tempFiles: string[] = [];
+  const segmentResultsList: AbrSourceResult[][] = [];
+
+  post({ type: 'INITIALIZED', totalSegments: segments.length });
+
+  try {
+    for (let i = 0; i < segments.length; i++) {
+      if (cancelled) {
+        log('Cancelled.');
+        return;
+      }
+      const { sourceStart, sourceEnd } = segments[i];
+      log(`Clip ${i + 1}/${segments.length}: cutting ${sourceStart.toFixed(2)}s–${sourceEnd.toFixed(2)}s…`);
+      const tempName = `__segcut_${session.id}_${i}.mp4`;
+      await cutSegmentClip(opfsRoot, session.sourceFilePath, sourceStart, sourceEnd, tempName);
+      tempFiles.push(tempName);
+
+      const prefix = `seg${i}_`;
+      let results: AbrSourceResult[];
+      if (canUseHardware) {
+        try {
+          results = await runAbrEncodeForSource(tempName, outputFolderHandle, renditions, sourceWidth, sourceHeight, prefix, false);
+        } catch (err) {
+          if (cancelled) {
+            log('Cancelled.');
+            return;
+          }
+          log(`Clip ${i + 1}: hardware encoding failed (${err}), falling back to FFmpeg…`, 'ERROR');
+          results = await encodeSegmentWithFfmpeg(FFmpeg, coreURL, wasmURL, opfsRoot, outputFolderHandle, tempName, renditions, sourceWidth, sourceHeight, prefix);
+        }
+      } else {
+        results = await encodeSegmentWithFfmpeg(FFmpeg, coreURL, wasmURL, opfsRoot, outputFolderHandle, tempName, renditions, sourceWidth, sourceHeight, prefix);
+      }
+      segmentResultsList.push(results);
+
+      post({
+        type: 'SEGMENT_DONE',
+        segmentIndex: i,
+        totalSegments: segments.length,
+        log: `Clip ${i + 1}/${segments.length} encoded`,
+        sessionId: session.id,
+      });
+    }
+  } catch (err) {
+    if (cancelled) {
+      log('Cancelled.');
+      return;
+    }
+    post({ type: 'ERROR', error: `Edited adaptive export failed: ${err}`, sessionId: session.id });
+    return;
+  } finally {
+    for (const f of tempFiles) await removeOutputFileQuietly(opfsRoot, f);
+  }
+
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
+
+  const { masterM3u8, highestM3u8 } = await finalizeAbrResultsSegmented(outputFolderHandle, segmentResultsList, subtitleTags, undefined);
+  post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8, sessionId: session.id });
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function defaultSegmentName(i: number): string {
-  return `segment_${String(i).padStart(4, '0')}.ts`;
-}
-
-function buildIntermediateM3U8(durations: number[], isFinal: boolean, segmentName: (i: number) => string = defaultSegmentName): string {
-  const maxDur = Math.ceil(Math.max(...durations, 0)) + 1;
-  let m = '#EXTM3U\n';
-  m += '#EXT-X-VERSION:3\n';
-  m += `#EXT-X-TARGETDURATION:${maxDur}\n`;
-  m += '#EXT-X-MEDIA-SEQUENCE:0\n';
-  for (let i = 0; i < durations.length; i++) {
-    m += `#EXTINF:${durations[i].toFixed(6)},\n`;
-    m += `${segmentName(i)}\n`;
-  }
-  if (isFinal) m += '#EXT-X-ENDLIST\n';
-  return m;
 }

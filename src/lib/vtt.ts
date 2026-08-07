@@ -69,3 +69,20 @@ export function shiftCues(cues: Cue[], offsetSeconds: number): Cue[] {
   if (!offsetSeconds) return cues;
   return cues.map((c) => ({ ...c, start: c.start + offsetSeconds, end: c.end + offsetSeconds }));
 }
+
+/** Parses `HH:MM:SS.mmm`, `MM:SS.mmm`, or plain seconds — whatever's least
+ * fiddly to type while nudging a cue's timing in the editor. Falls back to
+ * the previous value on anything unparseable rather than silently zeroing
+ * it out. The input counterpart to `formatTimestamp` above, but more
+ * permissive than what it actually emits, since a person is typing it. */
+export function parseTimeInput(value: string, fallback: number): number {
+  const parts = value.trim().split(':');
+  if (parts.length === 1) {
+    const n = Number(parts[0]);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  const nums = parts.map(Number);
+  if (nums.some((n) => !Number.isFinite(n))) return fallback;
+  if (nums.length === 2) return nums[0] * 60 + nums[1];
+  return nums[0] * 3600 + nums[1] * 60 + nums[2];
+}
