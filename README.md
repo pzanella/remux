@@ -410,4 +410,48 @@ additionally deploy `dist/` to GitHub Pages.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) for this repository's own code, including the Rust crate in
+`wasm/`. This does **not** cover the FFmpeg core Remux loads at runtime —
+see below.
+
+### Third-party licensing note: the FFmpeg core is GPL
+
+`@ffmpeg/ffmpeg` and `@ffmpeg/util` (the JS wrapper libraries listed in
+`package.json`, bundled into this app's own code) are MIT-licensed. The
+actual FFmpeg engine — `@ffmpeg/core`, the compiled WebAssembly binary that
+does the real encoding work — is a separate thing: **GPL-2.0-or-later**,
+per its own [npm registry
+entry](https://registry.npmjs.org/@ffmpeg/core). That's not an oversight on
+ffmpeg.wasm's part — Remux's own code asks it to encode H.264 via libx264
+(see `-c:v libx264` in `src/worker/remux.worker.ts`), and libx264 itself is
+GPL, so any FFmpeg build capable of what this app actually does is GPL by
+necessity.
+
+In practice, this repository never bundles or redistributes that GPL
+binary: `remux.worker.ts` fetches it live, at runtime, from a public CDN
+(`unpkg.com`) that the ffmpeg.wasm project itself publishes to — the same
+pattern as loading a script from a CDN `<script src>` tag. That's what
+keeps this repo's own source (and its MIT license) clean today.
+
+**Where this matters is monetization or redistribution.** If Remux is ever
+packaged/sold as something that bundles the FFmpeg core itself — rather
+than a browser fetching it live from ffmpeg.wasm's own CDN the way it does
+now — that redistribution would be subject to GPL obligations, which
+doesn't mix cleanly with a closed-source or purely-proprietary offering.
+Whether *runtime-loaded, unmodified WebAssembly fetched from an
+unaffiliated third party* even counts as GPL "linking" in the first place
+is a genuinely unsettled question — see [this open issue on the
+ffmpeg.wasm
+repo](https://github.com/ffmpegwasm/ffmpeg.wasm/issues/902) raising exactly
+that — so treat "we don't bundle it" as a reasonable current position, not
+a guarantee. (This is a summary for engineering purposes, not legal advice
+— get an actual license review before shipping a paid product built on
+this.)
+
+If GPL exposure ever needs to go away entirely, the concrete options are:
+a commercial FFmpeg license (several vendors sell one), or a custom-built
+LGPL-only ffmpeg.wasm core using [OpenH264](https://www.openh264.org/)
+(BSD-licensed, Cisco-sponsored) instead of libx264 for the H.264 encode
+path — no such LGPL build is currently published to npm by the
+ffmpeg.wasm project, so this would mean compiling and hosting one
+yourself, and accepting libx264's usual quality/speed edge over OpenH264.
