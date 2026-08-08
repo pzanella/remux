@@ -58,6 +58,12 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
   const uiRef = useRef<shaka.ui.Overlay | null>(null);
   const manifestContentRef = useRef(m3u8Content);
   manifestContentRef.current = m3u8Content;
+  // Only whether there's *any* content yet, not the string itself, drives
+  // the load effect below — see its dependency array for why.
+  const hasContent = m3u8Content.length > 0;
+  // Which folder handle the current Shaka player was built for, so the
+  // effect below only creates a new one for a genuinely new session.
+  const loadedHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
 
   const destroyPlayer = useCallback(() => {
@@ -65,10 +71,13 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
     uiRef.current = null;
     void playerRef.current?.destroy();
     playerRef.current = null;
+    loadedHandleRef.current = null;
   }, []);
 
   useEffect(() => {
-    if (!m3u8Content || !outputFolderHandle || !videoRef.current || !containerRef.current) return;
+    if (!hasContent || !outputFolderHandle || !videoRef.current || !containerRef.current) return;
+    if (loadedHandleRef.current === outputFolderHandle) return;
+    loadedHandleRef.current = outputFolderHandle;
 
     let cancelled = false;
 
@@ -116,8 +125,27 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
         videoRef.current?.play().catch(() => {
           // Autoplay may be blocked; the user can press play.
         });
+        // `load()` resolving isn't proof playback actually works: WebKit's
+        // MediaSource can silently accept a segment append that never
+        // produces decodable data (confirmed against a real MPEG-TS HLS
+        // output — no error event, no rejection, the video just sits at
+        // readyState HAVE_NOTHING forever). A blank, indefinitely-loading
+        // player reads as broken with no explanation; give it one instead
+        // of waiting forever for an error that isn't coming. 8s is well
+        // past how long a real small segment takes to buffer once load()
+        // has already resolved, so this shouldn't fire for a genuinely
+        // slow-but-working load.
+        const video = videoRef.current;
+        const stallTimer = window.setTimeout(() => {
+          if (cancelled || !video || video.readyState > 0) return;
+          setPlayerError("Live preview isn't available in this browser for this output yet — your download will still work once conversion finishes.");
+        }, 8000);
+        video?.addEventListener('loadeddata', () => window.clearTimeout(stallTimer), { once: true });
       } catch (err) {
         if (!cancelled) {
+          // Let a later retry attempt happen instead of leaving this
+          // session permanently marked "already loaded" after a failure.
+          loadedHandleRef.current = null;
           setPlayerError(`Playback error: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
@@ -127,7 +155,23 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
       cancelled = true;
       destroyPlayer();
     };
-  }, [m3u8Content, outputFolderHandle, destroyPlayer]);
+    // `hasContent`, not `m3u8Content` itself, is the dependency on purpose:
+    // a live conversion updates `m3u8Content` on every segment (often
+    // several times within ~100ms right around completion, confirmed
+    // empirically), and depending on the raw string would tear this whole
+    // effect's player down and rebuild it on every single tick. That's not
+    // just wasteful, it hangs WebKit outright: destroying one Shaka player
+    // and immediately attaching a new one to the same <video> element in
+    // rapid succession never resolves there (confirmed against real WebKit
+    // — `player.attach()` simply never settles on the second attempt),
+    // leaving a permanently blank preview with no error. None of that
+    // rebuilding is needed for a same-session content update anyway:
+    // `manifestContentRef` above already serves the latest content to
+    // Shaka's own scheme plugin, and Shaka re-fetches a still-live manifest
+    // on its own timer. `hasContent` only flips once, false→true, the
+    // moment there's anything to load at all — which is the one transition
+    // that actually needs a fresh player.
+  }, [hasContent, outputFolderHandle, destroyPlayer]);
 
   useEffect(() => () => destroyPlayer(), [destroyPlayer]);
 
