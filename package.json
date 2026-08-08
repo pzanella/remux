@@ -34,6 +34,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test",
     "build:wasm": "cd wasm && RUSTUP_TOOLCHAIN=stable wasm-pack build --target bundler --out-dir ../packages/remux-core && cp ../LICENSE ../packages/remux-core/",
     "dev:full": "npm run build:wasm && vite"
   },
@@ -46,7 +47,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
+    "@playwright/test": "^1.62.1",
     "@testing-library/react": "^16.3.2",
+    "@types/node": "^26.2.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",

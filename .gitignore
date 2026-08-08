@@ -5,5 +5,9 @@ wasm/target/
 *.tsbuildinfo
 vite.config.d.ts
 vitest.config.d.ts
+playwright.config.d.ts
+e2e/*.d.ts
 .DS_Store
 *.local
+playwright-report/
+test-results/
