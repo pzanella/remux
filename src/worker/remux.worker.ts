@@ -1792,9 +1792,34 @@ async function needsConversionForUnsupportedCodec(sourceOpfsName: string): Promi
   }
 }
 
+/**
+ * A real user-picked folder (`outputMode: 'folder'`) has to arrive via
+ * postMessage — there's no other way for the worker to get at a handle
+ * backed by a one-time user permission grant made on the main thread.
+ * OPFS-mode's handle, by contrast, arrives as `null` on purpose (see
+ * useTranscoder's start/resume): WebKit can't structured-clone a
+ * FileSystemDirectoryHandle across postMessage at all — confirmed
+ * empirically (`DataCloneError: The object can not be cloned`), even for
+ * one sourced from OPFS itself, even though Chromium has no such
+ * restriction. So instead of receiving it, the worker resolves the
+ * identical `output_${session.id}` directory itself — navigator.storage is
+ * available in a worker too, and this mirrors useTranscoder's own
+ * OPFS-directory-resolving effect exactly.
+ */
+async function resolveOutputFolderHandle(cmd: WorkerCommand): Promise<FileSystemDirectoryHandle | null> {
+  if (cmd.outputFolderHandle) return cmd.outputFolderHandle;
+  if (cmd.session.outputFolderHandle) return cmd.session.outputFolderHandle;
+  try {
+    const opfsRoot = await navigator.storage.getDirectory();
+    return await opfsRoot.getDirectoryHandle(`output_${cmd.session.id}`, { create: true });
+  } catch {
+    return null;
+  }
+}
+
 async function runTranscoding(cmd: WorkerCommand): Promise<void> {
   const { session } = cmd;
-  const outputFolderHandle = cmd.outputFolderHandle ?? session.outputFolderHandle;
+  const outputFolderHandle = await resolveOutputFolderHandle(cmd);
 
   if (!outputFolderHandle) {
     post({ type: 'ERROR', error: 'No output folder selected.' });

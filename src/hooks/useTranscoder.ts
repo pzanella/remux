@@ -417,15 +417,25 @@ export function useTranscoder() {
     };
     setSession(sessionWithExtras);
 
+    // WebKit can't structured-clone a FileSystemDirectoryHandle across
+    // postMessage at all (confirmed empirically — DataCloneError, even for
+    // one sourced from OPFS itself), so an OPFS-mode handle is withheld
+    // here on purpose: the worker resolves the identical `output_${id}`
+    // directory itself instead (see resolveOutputFolderHandle). A real
+    // user-picked folder has no such alternative — it only exists because
+    // of a permission grant made on this thread — so it still has to be
+    // sent, which is fine since that mode is Chromium-only anyway (it
+    // needs showDirectoryPicker) and Chromium has no cloning restriction.
+    const handleForWorker = outputMode === 'folder' ? outputFolder : null;
     const worker = spawnWorker();
     const cmd: WorkerCommand = {
       type: 'START',
       session: {
         ...sessionWithExtras,
-        outputFolderHandle: outputFolder,
+        outputFolderHandle: handleForWorker,
         abrHeights: isAbrJob ? abrHeights : undefined,
       },
-      outputFolderHandle: outputFolder,
+      outputFolderHandle: handleForWorker ?? undefined,
     };
     try {
       worker.postMessage(cmd);
@@ -433,7 +443,7 @@ export function useTranscoder() {
       setStatus('error');
       addLog(`Could not talk to the worker: ${err}`, 'error');
     }
-  }, [session, outputFolder, abrEnabled, abrHeights, subtitleTracks, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
+  }, [session, outputFolder, outputMode, abrEnabled, abrHeights, subtitleTracks, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
 
   const resume = useCallback(async () => {
     const src = resumableSession ?? session;
@@ -442,11 +452,12 @@ export function useTranscoder() {
     setStatus('processing');
     addLog(`Resuming from segment ${src.lastSegmentIndex + 2}…`);
 
+    const handleForWorker = outputMode === 'folder' ? outputFolder : null;
     const worker = spawnWorker();
     const cmd: WorkerCommand = {
       type: 'RESUME',
-      session: { ...src, outputFolderHandle: outputFolder },
-      outputFolderHandle: outputFolder,
+      session: { ...src, outputFolderHandle: handleForWorker },
+      outputFolderHandle: handleForWorker ?? undefined,
     };
     try {
       worker.postMessage(cmd);
@@ -457,7 +468,7 @@ export function useTranscoder() {
     }
     setSession(src);
     setResumableSession(null);
-  }, [resumableSession, session, outputFolder, addLog, spawnWorker]);
+  }, [resumableSession, session, outputFolder, outputMode, addLog, spawnWorker]);
 
   const pause = useCallback(() => {
     workerRef.current?.postMessage({ type: 'PAUSE' } as WorkerCommand);
