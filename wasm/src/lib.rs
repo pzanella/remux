@@ -1,6 +1,8 @@
 use wasm_bindgen::prelude::*;
 use serde::{Deserialize, Serialize};
 
+mod fmp4;
+
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = log)]
@@ -1691,6 +1693,25 @@ impl HlsProcessor {
             audio_channels,
         );
         Ok(ts_bytes.into_boxed_slice())
+    }
+
+    /// Fragmented-MP4 (CMAF-style) init segment for the video track —
+    /// `ftyp` + `moov`, no sample data. Written once per rendition ahead of
+    /// its `moof`/`mdat` fragments; see fmp4.rs for the box layout and why
+    /// this is video-only rather than combined with audio. `width`/
+    /// `height` come from the caller (this project tracks source
+    /// dimensions client-side, not in the Rust parser — see
+    /// TranscodingSession.sourceWidth/sourceHeight).
+    pub fn init_segment_video(&self, width: u16, height: u16) -> Result<Box<[u8]>, JsValue> {
+        let vid = self.video.as_ref().ok_or_else(|| JsValue::from_str("Not initialised"))?;
+        Ok(fmp4::init_segment_video(vid, width, height).into_boxed_slice())
+    }
+
+    /// Fragmented-MP4 init segment for the audio track — see
+    /// `init_segment_video`.
+    pub fn init_segment_audio(&self) -> Result<Box<[u8]>, JsValue> {
+        let aud = self.audio.as_ref().ok_or_else(|| JsValue::from_str("Not initialised"))?;
+        Ok(fmp4::init_segment_audio(aud).into_boxed_slice())
     }
 
     /// Mux one segment into MPEG-TS bytes.
