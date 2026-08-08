@@ -1744,6 +1744,54 @@ self.addEventListener('message', async (e: MessageEvent<WorkerCommand>) => {
   }
 });
 
+/**
+ * Cheap upfront check for the fast (Rust remux) path only: a native
+ * extension (.mp4/.mov/...) doesn't guarantee a compatible video codec. An
+ * iPhone's "High Efficiency" recording mode writes HEVC into a .mov/.mp4
+ * container — same extension as H.264, incompatible bitstream. Left
+ * undetected, the fast path doesn't error, it copies the (wrong) codec's
+ * samples through as-is and reports success on an undecodable segment; see
+ * `UNSUPPORTED_VIDEO_CODEC` in wasm/src/lib.rs's parse_headers for the
+ * actual gate. Only that specific signal routes here — any other parse
+ * failure is left for the real run to hit and report normally, so a
+ * genuinely malformed file doesn't get a misleading "needs conversion"
+ * detour before failing anyway.
+ */
+async function needsConversionForUnsupportedCodec(sourceOpfsName: string): Promise<boolean> {
+  try {
+    const opfsRoot = await navigator.storage.getDirectory();
+    const fileHandle = await opfsRoot.getFileHandle(sourceOpfsName);
+    const syncHandle = await fileHandle.createSyncAccessHandle();
+    try {
+      const fileSize = syncHandle.getSize();
+      const HEADER_READ = Math.min(32 * 1024 * 1024, fileSize);
+      const { HlsProcessor } = await loadWasm();
+      const probe = new HlsProcessor();
+      const isUnsupportedCodecError = (err: unknown) => String(err).includes('UNSUPPORTED_VIDEO_CODEC');
+
+      try {
+        probe.parse_headers(readAt(syncHandle, 0, HEADER_READ));
+        return false;
+      } catch (err) {
+        if (isUnsupportedCodecError(err)) return true;
+        try {
+          const tailOffset = Math.max(0, fileSize - 32 * 1024 * 1024);
+          probe.parse_headers(readAt(syncHandle, tailOffset, fileSize - tailOffset));
+          return false;
+        } catch (err2) {
+          return isUnsupportedCodecError(err2);
+        }
+      }
+    } finally {
+      syncHandle.close();
+    }
+  } catch {
+    // Can't even open/read the file here -- let the real run surface that
+    // error properly instead of masking it behind a wrong verdict.
+    return false;
+  }
+}
+
 async function runTranscoding(cmd: WorkerCommand): Promise<void> {
   const { session } = cmd;
   const outputFolderHandle = cmd.outputFolderHandle ?? session.outputFolderHandle;
@@ -1790,17 +1838,23 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
-  // Non-native containers go through FFmpeg first, producing an MP4 the Rust
-  // remuxer can read.
+  // Non-native containers, and native containers whose video track isn't
+  // actually AVC/H.264 (e.g. HEVC from an iPhone's "High Efficiency" mode —
+  // see needsConversionForUnsupportedCodec above), go through FFmpeg first,
+  // producing an MP4 the Rust remuxer can read.
   let effectiveSession = session;
-  if (!isNativeContainer(session.sourceFileName) && !session.preConverted) {
-    try {
-      const convertedOpfsName = await convertToMp4(session.sourceFilePath, session.sourceFileName);
-      effectiveSession = { ...session, sourceFilePath: convertedOpfsName, preConverted: true };
-      log('File converted. Starting HLS segmentation…');
-    } catch (err) {
-      post({ type: 'ERROR', error: `FFmpeg conversion failed: ${err}` });
-      return;
+  if (!session.preConverted) {
+    const needsConversion =
+      !isNativeContainer(session.sourceFileName) || (await needsConversionForUnsupportedCodec(session.sourceFilePath));
+    if (needsConversion) {
+      try {
+        const convertedOpfsName = await convertToMp4(session.sourceFilePath, session.sourceFileName);
+        effectiveSession = { ...session, sourceFilePath: convertedOpfsName, preConverted: true };
+        log('File converted. Starting HLS segmentation…');
+      } catch (err) {
+        post({ type: 'ERROR', error: `FFmpeg conversion failed: ${err}` });
+        return;
+      }
     }
   }
 

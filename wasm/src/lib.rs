@@ -440,6 +440,17 @@ struct TrackData {
     /// time and a real-world file may only carry the edit list on one of
     /// its tracks (see `parse_headers` for why).
     edit_list_end: Option<u64>,
+    /// The video track's own `stsd` sample-entry FourCC (e.g. `avc1`,
+    /// `hev1`), captured regardless of whether it turned out to be a codec
+    /// this muxer can actually handle — `None` for an audio track, or if
+    /// `stsd` itself couldn't be read. Purely diagnostic: what actually
+    /// gates the fast path is `avc1_profile` being present, not this: a
+    /// codec check by FourCC alone is inherently a partial list (`avc1` is
+    /// not the only valid AVC entry type, `avc3` carries in-band parameter
+    /// sets this parser doesn't handle either), whereas "did we find a
+    /// usable `avcC`" is precise by construction. This just lets the error
+    /// message name the real codec instead of only saying what's missing.
+    video_codec_fourcc: Option<[u8; 4]>,
 }
 
 /// Returns (SPS+PPS in Annex-B form, NALU length size, the first SPS's
@@ -559,6 +570,15 @@ fn parse_aac_config(esds: &[u8]) -> [u8; 3] {
         }
     }
     [2, 4, 2] // fallback: AAC-LC, 44100 Hz, stereo
+}
+
+/// The first `stsd` sample entry's own FourCC (e.g. `avc1`, `hev1`) —
+/// what actually names the codec, as opposed to `find_box_in_stsd_entries`
+/// below, which looks *inside* an entry for a specific child box.
+fn stsd_first_entry_fourcc(stbl: &[u8]) -> Option<[u8; 4]> {
+    let stsd = find_box(stbl, b"stsd")?;
+    let (_, type_off, _) = box_header(stsd, 8)?;
+    stsd.get(type_off..type_off + 4)?.try_into().ok()
 }
 
 /// Find `box_type` inside the first `stsd` sample entry, skipping the
@@ -700,7 +720,9 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Option<TrackData> {
     let mut avc1_profile = None;
     let mut avcc_raw = Vec::new();
 
+    let mut video_codec_fourcc = None;
     if &handler == b"vide" {
+        video_codec_fourcc = stsd_first_entry_fourcc(stbl);
         // 8-byte SampleEntry + 70-byte VisualSampleEntry fixed header.
         if let Some(avcc) = find_box_in_stsd_entries(stbl, 78, b"avcC") {
             let (hdr, nls, profile) = parse_avcc_header(avcc);
@@ -716,7 +738,7 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Option<TrackData> {
         }
     }
 
-    Some(TrackData { timescale, handler, samples, annexb_header, nalu_len_size, aac_config, avc1_profile, avcc_raw, edit_list_end })
+    Some(TrackData { timescale, handler, samples, annexb_header, nalu_len_size, aac_config, avc1_profile, avcc_raw, edit_list_end, video_codec_fourcc })
 }
 
 // ── Segmentation ────────────────────────────────────────────────
@@ -1416,6 +1438,30 @@ impl HlsProcessor {
         }
 
         let mut vid = video.ok_or_else(|| JsValue::from_str("No video track found"))?;
+
+        // `avc1_profile` is only ever set from a successfully-parsed `avcC`
+        // box (see `parse_track`) — its absence means this video track
+        // isn't AVC/H.264, the only codec this muxer knows how to copy
+        // through. Left unchecked, the fast path would still "succeed": no
+        // Annex-B header, a hardcoded fallback codec string, and the
+        // track's real (e.g. HEVC) sample bytes copied through unexamined
+        // — a segment that reports success while being undecodable by any
+        // real player. HEVC from a recent iPhone's default "High
+        // Efficiency" recording mode is the case this actually catches in
+        // practice; failing clearly here is what lets the worker fall back
+        // to converting the file with FFmpeg first, the same as it already
+        // does for a non-native container.
+        if vid.avc1_profile.is_none() {
+            let codec = vid
+                .video_codec_fourcc
+                .map(|f| String::from_utf8_lossy(&f).trim_end().to_string())
+                .filter(|s| s.chars().all(|c| c.is_ascii_graphic() || c == ' '))
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(JsValue::from_str(&format!(
+                "UNSUPPORTED_VIDEO_CODEC:{codec}"
+            )));
+        }
+
         let mut aud = audio.unwrap_or_else(|| TrackData {
             timescale: 44100,
             handler: *b"soun",
@@ -1426,6 +1472,7 @@ impl HlsProcessor {
             avc1_profile: None,
             avcc_raw: vec![],
             edit_list_end: None,
+            video_codec_fourcc: None,
         });
 
         // Trim both tracks to whichever edit list gives the tighter (i.e.
@@ -1923,5 +1970,38 @@ mod tests {
         assert_eq!(pmt_section_length(&pkt), 9 + 5 + 4);
         assert_eq!(pmt_pcr_pid(&pkt), AUD_PID, "no video track to anchor PCR to — falls back to audio");
         assert_eq!(pkt[17], 0x0F, "sole stream entry is AAC/ADTS audio, not the video 0x1B seen when video is present");
+    }
+
+    /// A `stsd` box wrapping one sample entry with the given FourCC — the
+    /// entry's own payload content is irrelevant to `stsd_first_entry_fourcc`,
+    /// which only reads the FourCC itself.
+    fn make_stsd_with_entry(fourcc: &[u8; 4]) -> Vec<u8> {
+        let entry = make_box(fourcc, &[0u8; 78]);
+        let mut stsd_payload = vec![0u8; 8]; // version+flags(4), entry_count(4)
+        stsd_payload[7] = 1;
+        stsd_payload.extend_from_slice(&entry);
+        make_box(b"stsd", &stsd_payload)
+    }
+
+    #[test]
+    fn stsd_first_entry_fourcc_reads_avc1_for_h264() {
+        // stbl's own "content" is just its child boxes concatenated — here,
+        // that's the one stsd box, not stsd wrapped in another stbl layer.
+        let stbl = make_stsd_with_entry(b"avc1");
+        assert_eq!(stsd_first_entry_fourcc(&stbl), Some(*b"avc1"));
+    }
+
+    #[test]
+    fn stsd_first_entry_fourcc_reads_hev1_for_hevc() {
+        // The case that actually happens in practice: a recent iPhone's
+        // default "High Efficiency" recording mode.
+        let stbl = make_stsd_with_entry(b"hev1");
+        assert_eq!(stsd_first_entry_fourcc(&stbl), Some(*b"hev1"));
+    }
+
+    #[test]
+    fn stsd_first_entry_fourcc_none_without_an_stsd_box() {
+        let stbl: Vec<u8> = vec![];
+        assert_eq!(stsd_first_entry_fourcc(&stbl), None);
     }
 }
