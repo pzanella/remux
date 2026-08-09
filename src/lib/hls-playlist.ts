@@ -193,6 +193,28 @@ export function buildIntermediateM3U8(durations: number[], isFinal: boolean, seg
   return m;
 }
 
+/** HLS-on-fMP4 media playlist: one `#EXT-X-MAP` pointing at a rendition's
+ * shared init segment, then one `.m4s` fragment per `#EXTINF` — the CMAF-
+ * style counterpart of `buildIntermediateM3U8`'s MPEG-TS segment list.
+ * Version 7 is what `#EXT-X-MAP` needs outside an I-frame-only playlist
+ * (RFC 8216 §7); MPEG-TS output elsewhere in this codebase only ever needs
+ * version 3, which is why this isn't just `buildIntermediateM3U8` with an
+ * extra parameter. */
+export function buildFmp4MediaPlaylist(durations: number[], initFilename: string, fragmentName: (i: number) => string): string {
+  const maxDur = Math.ceil(Math.max(...durations, 0)) + 1;
+  let m = '#EXTM3U\n';
+  m += '#EXT-X-VERSION:7\n';
+  m += `#EXT-X-TARGETDURATION:${maxDur}\n`;
+  m += '#EXT-X-MEDIA-SEQUENCE:0\n';
+  m += `#EXT-X-MAP:URI="${initFilename}"\n`;
+  for (let i = 0; i < durations.length; i++) {
+    m += `#EXTINF:${durations[i].toFixed(6)},\n`;
+    m += `${fragmentName(i)}\n`;
+  }
+  m += '#EXT-X-ENDLIST\n';
+  return m;
+}
+
 // ── Playlist text parsing/splicing ──────────────────────────────────
 
 /** Sums every #EXTINF value in an already-built playlist — used to get the

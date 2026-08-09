@@ -4,6 +4,7 @@ import {
   SUBTITLES_GROUP_ID,
   buildAudioMediaTag,
   buildFastPathMasterM3U8,
+  buildFmp4MediaPlaylist,
   buildIntermediateM3U8,
   buildMasterM3U8,
   buildSubtitleMediaTag,
@@ -222,6 +223,30 @@ describe('buildIntermediateM3U8', () => {
 
   it('does not throw on an empty duration list', () => {
     expect(() => buildIntermediateM3U8([], true)).not.toThrow();
+  });
+});
+
+describe('buildFmp4MediaPlaylist', () => {
+  it('references the init segment via #EXT-X-MAP before any #EXTINF', () => {
+    const m = buildFmp4MediaPlaylist([6, 4], 'init.mp4', (i) => `frag_${i}.m4s`);
+    const mapPos = m.indexOf('#EXT-X-MAP:URI="init.mp4"');
+    const firstExtinfPos = m.indexOf('#EXTINF');
+    expect(mapPos).toBeGreaterThan(-1);
+    expect(mapPos).toBeLessThan(firstExtinfPos);
+  });
+
+  it('emits one #EXTINF/fragment pair per duration, in order', () => {
+    const m = buildFmp4MediaPlaylist([6, 4], 'init.mp4', (i) => `frag_${i}.m4s`);
+    expect(m).toContain('#EXTINF:6.000000,\nfrag_0.m4s');
+    expect(m).toContain('#EXTINF:4.000000,\nfrag_1.m4s');
+  });
+
+  it('is version 7, unlike the MPEG-TS playlists', () => {
+    expect(buildFmp4MediaPlaylist([6], 'init.mp4', (i) => `frag_${i}.m4s`)).toContain('#EXT-X-VERSION:7');
+  });
+
+  it('always ends the list — unlike buildIntermediateM3U8, there is no in-progress fMP4 output yet', () => {
+    expect(buildFmp4MediaPlaylist([6], 'init.mp4', (i) => `frag_${i}.m4s`)).toContain('#EXT-X-ENDLIST');
   });
 });
 
