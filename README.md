@@ -44,6 +44,12 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
 - **Optional adaptive (multi-resolution) HLS** — generate a master playlist
   with 240p/360p/480p/720p renditions, picked in the UI. This mode re-encodes,
   using hardware acceleration when the browser supports it (see below).
+- **Scrubbing-preview thumbnails** — every export gets a sprite-sheet
+  storyboard (`thumbnails.jpg` + `thumbnails.vtt`) alongside the HLS/DASH
+  output, generated in the background so it never slows down the fast path.
+  Shown automatically in the in-app player's own seek bar; ships in the
+  export too, ready for any player that reads the same WebVTT `#xywh=`
+  convention.
 - **In-browser timeline editor** — trim, split, and reorder clips on a
   vertical rail, with a live draft preview (Space to play/pause, Ctrl/Cmd+Z
   to undo) so you can check the cut before converting anything.
@@ -425,6 +431,11 @@ fallback exists for it, unlike adaptive MPEG-TS.
   encoding — there's no FFmpeg fallback for it the way plain adaptive HLS has.
 - The FFmpeg fallback downloads its engine (~32 MB) from a public CDN the
   first time it runs, then caches it for later sessions.
+- Thumbnail sprite generation runs in the background (it uses FFmpeg even
+  for an otherwise-FFmpeg-free fast-path job) and isn't guaranteed to be
+  done the instant a job completes — downloading the ZIP within the first
+  second or two of a very fast export can occasionally miss it; downloading
+  again once the export screen has sat idle for a moment picks it up.
 - Adaptive HLS's audio floor is 96 kbps, even for the 240p rung — Chrome's
   WebCodecs AAC encoder was found (empirically, against real stereo footage)
   to reliably fail to finish encoding stereo audio below that, regardless of

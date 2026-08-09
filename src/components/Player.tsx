@@ -45,6 +45,70 @@ function registerLocalDirScheme(dirHandle: FileSystemDirectoryHandle, readManife
   shaka.net.NetworkingEngine.registerScheme(SCHEME, plugin);
 }
 
+/**
+ * Loads the scrubbing-preview thumbnail sprite (see generateThumbnailSprite
+ * in remux.worker.ts) as a real thumbnails track, or does nothing if it
+ * doesn't exist (an older session predating this feature, or generation
+ * failed — both non-fatal, see the worker's own tolerance for this).
+ *
+ * `localdir://` URIs only resolve through Shaka's own `NetworkingEngine` —
+ * exactly what `registerLocalDirScheme` above wires up for the manifest and
+ * every reference Shaka itself fetches (segments, subtitle tracks, ...).
+ * The seek bar's own hover-preview `<img>` element isn't one of those: for
+ * a plain image (not an mp4-wrapped "mjpg" track), Shaka assigns the raw
+ * thumbnail URI straight to `img.src`, which the *browser* then has to
+ * resolve — and no browser understands a scheme Shaka invented for itself.
+ * Confirmed empirically: the `<img>` gets the right `localdir://...` src
+ * and the seek bar's own crop/positioning math all runs correctly, but
+ * `naturalWidth` stays 0 forever — a silently broken image, not an error
+ * anywhere. Sidestepped by reading the sprite through the folder handle
+ * directly here and rewriting the VTT to point at a real `blob:` URL
+ * instead, which *is* something every browser can load as an `<img src>`
+ * on its own, regardless of which internal path Shaka's seek bar takes to
+ * get there.
+ */
+async function loadThumbnailsTrack(player: shaka.Player, dirHandle: FileSystemDirectoryHandle): Promise<boolean> {
+  try {
+    const vttText = await (await (await dirHandle.getFileHandle('thumbnails.vtt')).getFile()).text();
+    const spriteFile = await (await dirHandle.getFileHandle('thumbnails.jpg')).getFile();
+    const spriteUrl = URL.createObjectURL(spriteFile);
+    const rewrittenVtt = vttText.replaceAll('thumbnails.jpg', spriteUrl);
+    const vttUrl = URL.createObjectURL(new Blob([rewrittenVtt], { type: 'text/vtt' }));
+    await player.addThumbnailsTrack(vttUrl, 'text/vtt');
+    // Deliberately not revoked: the sprite/VTT blob URLs need to stay valid
+    // for the rest of this player's lifetime, and there's no long-running
+    // app process here for a per-load leak to accumulate in — the tab
+    // going away cleans every blob URL up regardless.
+    return true;
+  } catch {
+    // Optional feature — see this function's own doc comment. Doesn't
+    // distinguish "file doesn't exist yet" from any other failure; the
+    // caller's own retry loop treats every failure the same way (try
+    // again later, give up eventually).
+    return false;
+  }
+}
+
+/** `generateThumbnailSprite` in remux.worker.ts runs as a fire-and-forget
+ * background task, deliberately not blocking the main export (see its own
+ * comment) — so the sprite may well not exist yet the instant this player
+ * first loads, especially for a fast native-remux job that can finish
+ * before an FFmpeg-based background task does. Retries a few times on a
+ * fixed interval rather than giving up after one miss, so a live preview
+ * (or a fast job's final result) still picks up thumbnails once they land,
+ * not just a slow job's. Stops as soon as it succeeds, `isCancelled()`
+ * turns true (component unmounted / a new load superseded this one), or
+ * attempts run out — whichever comes first. */
+async function loadThumbnailsTrackWithRetry(player: shaka.Player, dirHandle: FileSystemDirectoryHandle, isCancelled: () => boolean): Promise<void> {
+  const RETRY_DELAYS_MS = [500, 1500, 3000, 5000, 8000];
+  if (await loadThumbnailsTrack(player, dirHandle)) return;
+  for (const delay of RETRY_DELAYS_MS) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    if (isCancelled()) return;
+    if (await loadThumbnailsTrack(player, dirHandle)) return;
+  }
+}
+
 interface PlayerProps {
   m3u8Content: string;
   outputFolderHandle: FileSystemDirectoryHandle | null;
@@ -139,6 +203,11 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
         videoRef.current?.play().catch(() => {
           // Autoplay may be blocked; the user can press play.
         });
+        // Scrubbing-preview thumbnails (see generateThumbnailSprite in
+        // remux.worker.ts and loadThumbnailsTrackWithRetry's own doc
+        // comment above) — the seek bar's own hover preview picks this up
+        // automatically once added, no further wiring needed here.
+        void loadThumbnailsTrackWithRetry(player, outputFolderHandle, () => cancelled);
         // `load()` resolving isn't proof playback actually works: WebKit's
         // MediaSource can silently accept a segment append that never
         // produces decodable data (confirmed against a real MPEG-TS HLS

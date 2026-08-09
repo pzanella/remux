@@ -337,6 +337,129 @@ async function normalizeLoudness(sourceOpfsName: string, originalFileName: strin
   return outputOpfsName;
 }
 
+// ── Thumbnail sprite / trick-play ───────────────────────────────────
+//
+// A scrubbing-preview storyboard: one JPEG tiling many small thumbnails
+// (thumbnails.jpg) plus a WebVTT file (thumbnails.vtt) mapping each time
+// range to its own tile via the "#xywh=x,y,w,h" media-fragment convention —
+// the exact shape Shaka Player's own seek bar already knows how to read via
+// `player.addThumbnailsTrack()` (see Player.tsx). Main content only, one
+// shared sprite regardless of rendition, matching how dub-audio's shared
+// audio-only rendition already established "generate once, reference
+// everywhere" for this project. A real limitation worth being upfront
+// about: `fps=` still decodes every source frame sequentially to pick out
+// the ones it keeps, so this costs roughly a full decode pass even though
+// only a handful of frames end up in the sprite — a per-thumbnail seek
+// (`-ss`) would avoid that but needs many small FFmpeg invocations instead
+// of one, not worth the added complexity for what's a "nice to have"
+// scrubbing aid, not the main deliverable.
+
+const THUMBNAIL_TILE_WIDTH = 160;
+const THUMBNAIL_TILE_HEIGHT = 90;
+/** Caps both the sprite's own size and how long generating it takes —
+ * plenty of resolution for a scrub preview even on a long source. */
+const THUMBNAIL_MAX_TILES = 100;
+
+function formatVttTimestamp(seconds: number): string {
+  const clamped = Math.max(0, seconds);
+  const h = Math.floor(clamped / 3600);
+  const m = Math.floor((clamped % 3600) / 60);
+  const s = clamped % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s.toFixed(3).padStart(6, '0')}`;
+}
+
+/**
+ * `srcBytes` must already be the source's own bytes, fully read — not an
+ * OPFS filename or `File` this function reads itself — see this section's
+ * own call site in `runTranscoding` for why: this runs fire-and-forget,
+ * concurrently with the main pipeline, and the instant that pipeline's own
+ * `COMPLETE` event reaches React, `deleteSession` deletes the OPFS source
+ * file — for a fast native-remux job, confirmed happening well under a
+ * second, before this function would otherwise get around to reading it.
+ * Tried keeping just a `File` object (`FileSystemFileHandle.getFile()`)
+ * across that window first, expecting it to behave as an independent
+ * snapshot the way the underlying spec describes — it doesn't, at least for
+ * an OPFS-backed handle in practice: reading it after the backing entry is
+ * gone throws a bare "NotReadableError: The file could not be read! Code=8".
+ * Reading the actual bytes before returning to the caller is the only
+ * version of this that's actually safe, at the cost of paying for that read
+ * up front rather than lazily — the same trade-off `convertToMp4`/
+ * `normalizeLoudness` already make for their own (much larger) FFmpeg work.
+ */
+async function generateThumbnailSprite(srcBytes: Uint8Array, originalFileName: string, outputFolderHandle: FileSystemDirectoryHandle): Promise<void> {
+  const { FFmpeg } = await loadFFmpegModule();
+
+  const ffmpeg = new FFmpeg();
+  await loadFFmpegCore(ffmpeg);
+
+  const ext = originalFileName.includes('.') ? originalFileName.slice(originalFileName.lastIndexOf('.')) : '.video';
+  const inputName = `input${ext}`;
+  await ffmpeg.writeFile(inputName, srcBytes);
+
+  const durationLines: string[] = [];
+  const onDurationLog = ({ message }: { message: string }) => durationLines.push(message);
+  ffmpeg.on('log', onDurationLog);
+  await ffmpeg.ffprobe(['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', inputName, '-o', 'duration.txt']);
+  ffmpeg.off('log', onDurationLog);
+  const durationText = (await ffmpeg.readFile('duration.txt', 'utf8')) as string;
+  const durationSec = parseFloat(durationText.trim());
+  await ffmpeg.deleteFile('duration.txt');
+  if (!(durationSec > 0)) {
+    throw new Error(`Could not read source duration: ${durationLines.slice(-5).join(' / ') || durationText}`);
+  }
+
+  // Sized to fill the grid the sprite actually has (cols*rows), not the
+  // rougher initial estimate — otherwise a rounding-up in cols/rows would
+  // leave trailing cells black for no reason.
+  const roughTileCount = Math.max(1, Math.min(THUMBNAIL_MAX_TILES, Math.ceil(durationSec / 2)));
+  const cols = Math.ceil(Math.sqrt(roughTileCount));
+  const rows = Math.ceil(roughTileCount / cols);
+  const tileCount = cols * rows;
+  const intervalSec = durationSec / tileCount;
+
+  const outputName = 'sprite.jpg';
+  const spriteLines: string[] = [];
+  const onSpriteLog = ({ message }: { message: string }) => spriteLines.push(message);
+  ffmpeg.on('log', onSpriteLog);
+  let code: number;
+  try {
+    code = await ffmpeg.exec([
+      '-i', inputName,
+      '-vf',
+      `fps=1/${intervalSec},scale=${THUMBNAIL_TILE_WIDTH}:${THUMBNAIL_TILE_HEIGHT}:force_original_aspect_ratio=decrease,pad=${THUMBNAIL_TILE_WIDTH}:${THUMBNAIL_TILE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,tile=${cols}x${rows}`,
+      '-frames:v', '1',
+      '-q:v', '4',
+      '-y', outputName,
+    ]);
+  } finally {
+    ffmpeg.off('log', onSpriteLog);
+  }
+  if (code !== 0) {
+    ffmpeg.terminate();
+    throw new Error(`FFmpeg exited with code ${code}: ${spriteLines.slice(-10).join(' / ')}`);
+  }
+
+  const spriteData = (await ffmpeg.readFile(outputName)) as Uint8Array;
+  await writeOutputFile(outputFolderHandle, 'thumbnails.jpg', spriteData);
+
+  await ffmpeg.deleteFile(inputName);
+  await ffmpeg.deleteFile(outputName);
+  ffmpeg.terminate();
+
+  // One cue per tile, in the same left-to-right/top-to-bottom raster order
+  // `tile=` fills the sprite in.
+  let vtt = 'WEBVTT\n\n';
+  for (let i = 0; i < tileCount; i++) {
+    const start = i * intervalSec;
+    const end = Math.min((i + 1) * intervalSec, durationSec);
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    vtt += `${formatVttTimestamp(start)} --> ${formatVttTimestamp(end)}\n`;
+    vtt += `thumbnails.jpg#xywh=${col * THUMBNAIL_TILE_WIDTH},${row * THUMBNAIL_TILE_HEIGHT},${THUMBNAIL_TILE_WIDTH},${THUMBNAIL_TILE_HEIGHT}\n\n`;
+  }
+  await writeOutputFile(outputFolderHandle, 'thumbnails.vtt', vtt);
+}
+
 interface RenditionResult {
   rendition: (typeof ABR_LADDER)[number];
   playlist: string;
@@ -2208,6 +2331,37 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     } catch (err) {
       post({ type: 'ERROR', error: `Loudness normalization failed: ${err}` });
       return;
+    }
+  }
+
+  // The actual FFmpeg work (loading the core, decoding, tiling) runs fire-
+  // and-forget, not awaited: a scrubbing-preview sprite is a nice-to-have,
+  // and the fast (Rust remux) path's whole value proposition is being
+  // instant — bolting a mandatory FFmpeg pass in front of *every* job,
+  // including that one, would cost it exactly the speed it exists for. Runs
+  // concurrently with whichever path handles the main pipeline below
+  // instead. Non-fatal on failure, and skipped on RESUME — unlike loudness
+  // normalization's own re-derive-from-scratch necessity, this doesn't feed
+  // into the main pipeline at all, so re-running it on every resume would
+  // just be wasted FFmpeg work for an identical result.
+  //
+  // Reading the source's own bytes, though, genuinely can't wait: it has to
+  // happen *before* the main pipeline gets a chance to finish, or there's a
+  // real race against `deleteSession`'s own OPFS cleanup on the React side,
+  // which fires the instant that pipeline's own COMPLETE event lands —
+  // confirmed happening in well under a second for a fast native-remux job.
+  // See generateThumbnailSprite's own doc comment for why merely holding a
+  // `File` object across that window isn't actually enough on its own.
+  if (cmd.type !== 'RESUME') {
+    try {
+      const opfsRoot = await navigator.storage.getDirectory();
+      const srcFile = await (await opfsRoot.getFileHandle(session.sourceFilePath)).getFile();
+      const srcBytes = new Uint8Array(await srcFile.arrayBuffer());
+      generateThumbnailSprite(srcBytes, session.sourceFileName, outputFolderHandle).catch((err: unknown) => {
+        log(`Could not generate the scrubbing-preview thumbnail sprite: ${err}`, 'ERROR');
+      });
+    } catch (err) {
+      log(`Could not generate the scrubbing-preview thumbnail sprite: ${err}`, 'ERROR');
     }
   }
 
