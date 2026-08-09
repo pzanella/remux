@@ -367,10 +367,15 @@ same segment data `mux_segment` already reads — video and audio always as
 separate init segments/fragments, not a combined one, so a fragment stream
 can be shared across renditions the same way this project's dub-audio
 tracks already share one audio-only rendition across every video quality.
-This is a building block for CMAF/DASH output, not that output itself yet
-— nothing generates an HLS-on-fMP4 media playlist or a DASH manifest from
-these fragments yet, and the app itself doesn't call any of this; it still
-only ever produces MPEG-TS.
+The app itself now uses this too: the export screen's "Fragmented MP4
+(experimental)" output option produces an `#EXT-X-MAP`-based HLS media
+playlist referencing these init segments and `.m4s` fragments, for the
+plain single-quality fast path only — adaptive HLS, edited (trimmed/
+split) segments, dub-audio, subtitles, and intro/outro still only ever
+produce MPEG-TS (the export screen fails clearly if you combine fMP4
+output with any of those, rather than silently falling back). This is
+still a building block toward CMAF/DASH, not DASH itself — nothing
+generates a DASH manifest from these fragments yet.
 
 ## Supported Formats
 
@@ -389,6 +394,11 @@ only ever produces MPEG-TS.
   on hosts that can't set custom headers (like GitHub Pages),
   `public/coi-serviceworker.js` supplies them client-side instead.
 - HEVC and AV1 video are not supported by the fast native path.
+- The "Fragmented MP4 (experimental)" output option (an early step toward
+  CMAF/DASH) only supports the plain single-quality fast path — combine it
+  with adaptive HLS, an edited timeline, dub-audio, subtitles, or intro/
+  outro and the export fails clearly instead of silently falling back to
+  MPEG-TS.
 - The FFmpeg fallback downloads its engine (~32 MB) from a public CDN the
   first time it runs, then caches it for later sessions.
 - Adaptive HLS's audio floor is 96 kbps, even for the 240p rung — Chrome's
