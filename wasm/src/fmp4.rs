@@ -552,6 +552,7 @@ fn synthetic_track_data(timescale: u32, avcc_raw: Vec<u8>, aac_config: [u8; 3]) 
         avcc_raw,
         edit_list_end: None,
         video_codec_fourcc: None,
+        is_hevc: false,
     }
 }
 
@@ -663,6 +664,7 @@ mod tests {
             avcc_raw,
             edit_list_end: None,
             video_codec_fourcc: Some(*b"avc1"),
+            is_hevc: false,
         }
     }
 

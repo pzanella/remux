@@ -223,6 +223,11 @@ export interface ParseHeadersResult {
   audioTimescale: number;
   targetDuration: number;
   segments: SegmentInfoJs[];
+  /** 'hevc' or 'avc' — the fast path can byte-copy either into MPEG-TS
+   * output, but fMP4 output and WebCodecs ABR both still require 'avc' (see
+   * `needsConversionForUnsupportedCodec` and `HlsProcessor::codec_config`
+   * in wasm/src/lib.rs). */
+  videoCodec: 'avc' | 'hevc';
 }
 
 /** Result shape of `HlsProcessor.parse_audio_only`/`segment_audio_at_boundaries`

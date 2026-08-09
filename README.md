@@ -37,7 +37,10 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
 
 - **Works with many formats** — MP4, MOV, MKV, WebM, AVI, WMV, FLV, and more.
 - **Fast native path** — MP4/MOV files are remuxed by a small Rust program
-  compiled to WebAssembly. No quality loss, no re-encoding.
+  compiled to WebAssembly. No quality loss, no re-encoding. Covers both AVC
+  and HEVC video (e.g. an iPhone's "High Efficiency" recording mode) for
+  MPEG-TS output; fMP4 output and adaptive HLS still need AVC specifically
+  and fall back to FFmpeg first for an HEVC source.
 - **Optional adaptive (multi-resolution) HLS** — generate a master playlist
   with 240p/360p/480p/720p renditions, picked in the UI. This mode re-encodes,
   using hardware acceleration when the browser supports it (see below).
@@ -409,7 +412,10 @@ fallback exists for it, unlike adaptive MPEG-TS.
   open files the way Remux needs. `vite.config.ts` sets both for dev/preview;
   on hosts that can't set custom headers (like GitHub Pages),
   `public/coi-serviceworker.js` supplies them client-side instead.
-- HEVC and AV1 video are not supported by the fast native path.
+- HEVC video is supported by the fast native path for MPEG-TS output only
+  (byte-copied, same as AVC — see `wasm/src/hevc.rs`); fMP4 output and
+  adaptive HLS still require AVC and fall back to FFmpeg first for an HEVC
+  source. AV1 isn't supported by the fast native path at all yet.
 - The "Fragmented MP4 (experimental)" output option produces both an
   HLS-on-fMP4 playlist and a DASH manifest, for the plain single-quality
   fast path and adaptive (multi-rendition) HLS/DASH alike — but not

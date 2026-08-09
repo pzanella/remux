@@ -2,6 +2,7 @@ use wasm_bindgen::prelude::*;
 use serde::{Deserialize, Serialize};
 
 mod fmp4;
+mod hevc;
 
 #[wasm_bindgen]
 extern "C" {
@@ -453,6 +454,16 @@ struct TrackData {
     /// usable `avcC`" is precise by construction. This just lets the error
     /// message name the real codec instead of only saying what's missing.
     video_codec_fourcc: Option<[u8; 4]>,
+    /// Set when this video track's own `stsd` entry is `hev1`/`hvc1` and its
+    /// `hvcC` parsed successfully — the fast MPEG-TS path's *only* other
+    /// supported video codec besides AVC (see `hevc::parse_hvcc_header` and
+    /// `parse_headers`'s own gate). `annexb_header`/`nalu_len_size` above
+    /// are populated from `hvcC` instead of `avcC` in this case, the same
+    /// two fields either codec's Annex-B conversion actually needs;
+    /// `avc1_profile`/`avcc_raw` stay AVC-only (empty) since nothing downstream
+    /// needs an HEVC codec string or avcC passthrough yet — WebCodecs ABR and
+    /// fMP4 output both still require AVC, see `HlsProcessor::codec_config`.
+    is_hevc: bool,
 }
 
 /// Returns (SPS+PPS in Annex-B form, NALU length size, the first SPS's
@@ -723,15 +734,23 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Option<TrackData> {
     let mut avcc_raw = Vec::new();
 
     let mut video_codec_fourcc = None;
+    let mut is_hevc = false;
     if &handler == b"vide" {
         video_codec_fourcc = stsd_first_entry_fourcc(stbl);
-        // 8-byte SampleEntry + 70-byte VisualSampleEntry fixed header.
+        // 8-byte SampleEntry + 70-byte VisualSampleEntry fixed header —
+        // `hev1`/`hvc1` extend VisualSampleEntry the same way `avc1` does,
+        // so this offset is identical for either codec's own config box.
         if let Some(avcc) = find_box_in_stsd_entries(stbl, 78, b"avcC") {
             let (hdr, nls, profile) = parse_avcc_header(avcc);
             annexb_header = hdr;
             nalu_len_size = nls;
             avc1_profile = profile;
             avcc_raw = avcc.to_vec();
+        } else if let Some(hvcc) = find_box_in_stsd_entries(stbl, 78, b"hvcC") {
+            let (hdr, nls) = hevc::parse_hvcc_header(hvcc);
+            annexb_header = hdr;
+            nalu_len_size = nls;
+            is_hevc = true;
         }
     } else if &handler == b"soun" {
         // 8-byte SampleEntry + 20-byte AudioSampleEntry v0 fixed header.
@@ -740,7 +759,7 @@ fn parse_track(trak: &[u8], movie_timescale: u32) -> Option<TrackData> {
         }
     }
 
-    Some(TrackData { timescale, handler, samples, annexb_header, nalu_len_size, aac_config, avc1_profile, avcc_raw, edit_list_end, video_codec_fourcc })
+    Some(TrackData { timescale, handler, samples, annexb_header, nalu_len_size, aac_config, avc1_profile, avcc_raw, edit_list_end, video_codec_fourcc, is_hevc })
 }
 
 // ── Segmentation ────────────────────────────────────────────────
@@ -977,7 +996,15 @@ fn build_pat(cc: &mut u8) -> Vec<u8> {
     pkt.to_vec()
 }
 
-fn build_pmt(cc: &mut u8, has_video: bool, has_audio: bool) -> Vec<u8> {
+/// MPEG-2 TS `stream_type` values (ISO/IEC 13818-1 Table 2-34) this project
+/// writes for a video stream: 0x1B for AVC/H.264, 0x24 for HEVC/H.265 — the
+/// only two video codecs the fast path ever passes through untouched (see
+/// `TrackData::is_hevc`). WebCodecs ABR output is always encoded to AVC
+/// regardless of the source's own codec, so it always uses `STREAM_TYPE_AVC`.
+const STREAM_TYPE_AVC: u8 = 0x1B;
+const STREAM_TYPE_HEVC: u8 = 0x24;
+
+fn build_pmt(cc: &mut u8, has_video: bool, has_audio: bool, video_stream_type: u8) -> Vec<u8> {
     let num_streams = (has_video as usize) + (has_audio as usize);
     let sec_len = 9 + num_streams * 5 + 4; // pmt header + streams + crc
 
@@ -999,7 +1026,7 @@ fn build_pmt(cc: &mut u8, has_video: bool, has_audio: bool) -> Vec<u8> {
     sec.extend_from_slice(&[0xF0, 0x00]); // no program info
 
     if has_video {
-        sec.push(0x1B); // H.264 video stream
+        sec.push(video_stream_type);
         sec.push(0xE0 | ((VID_PID >> 8) as u8 & 0x1F));
         sec.push((VID_PID & 0xFF) as u8);
         sec.extend_from_slice(&[0xF0, 0x00]);
@@ -1161,11 +1188,27 @@ fn avcc_to_annexb(data: &[u8], nls: u8) -> Vec<u8> {
 }
 
 /// Convert one AVCC-framed sample into a decodable Annex-B access unit: an
-/// Access Unit Delimiter, SPS/PPS on keyframes, then the sample's NAL units.
-/// Used by the fast-path TS muxer.
-fn sample_to_annexb(raw: &[u8], nalu_len_size: u8, is_keyframe: bool, annexb_header: &[u8]) -> Vec<u8> {
+/// Access Unit Delimiter (AVC only — see below), SPS/PPS on keyframes, then
+/// the sample's NAL units. Used by the fast-path TS muxer.
+///
+/// The AUD is skipped entirely for HEVC rather than translated to its own
+/// AUD NAL type (35, vs. AVC's 9): AUD is optional in both codecs' own
+/// Annex-B syntax, and each call here already covers exactly one access
+/// unit wrapped in its own PES packet, so nothing downstream actually needs
+/// it to find access-unit boundaries. Simpler and safer than constructing a
+/// new NAL type — the risk of getting *that* subtly wrong isn't worth
+/// paying for a NAL unit nothing here requires. Getting this wrong in the
+/// other direction is exactly the bug this comment is guarding against:
+/// `0x09, 0xF0` is a well-formed AVC AUD NAL (type 9), but under HEVC's own
+/// 2-byte NAL header the *same* two bytes decode as `forbidden_zero_bit=0,
+/// nal_unit_type=4` (STSA_N, a real VCL slice type) — confirmed against a
+/// real HEVC fixture: ffmpeg's decoder repeatedly logged "Failed to parse
+/// header of NALU (type 4)" for every single sample before this fix, only
+/// silently recovering because its own error tolerance happened to skip the
+/// bad NALU and decode the real slice data around it anyway.
+fn sample_to_annexb(raw: &[u8], nalu_len_size: u8, is_keyframe: bool, annexb_header: &[u8], is_hevc: bool) -> Vec<u8> {
     let nalus = avcc_to_annexb(raw, nalu_len_size);
-    let mut out = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0xF0];
+    let mut out = if is_hevc { Vec::new() } else { vec![0x00, 0x00, 0x00, 0x01, 0x09, 0xF0] };
     if is_keyframe && !annexb_header.is_empty() {
         out.extend_from_slice(annexb_header);
     }
@@ -1201,6 +1244,7 @@ fn mux_segment_inner(
     audio_data: &[u8],
     annexb_header: &[u8],
     nalu_len_size: u8,
+    is_hevc: bool,
     aac_config: [u8; 3],
     video_timescale: u32,
     audio_timescale: u32,
@@ -1224,8 +1268,9 @@ fn mux_segment_inner(
     let has_video = !video_samples.is_empty() && !video_data.is_empty();
     let has_audio = !audio_samples.is_empty() && !audio_data.is_empty();
 
+    let video_stream_type = if is_hevc { STREAM_TYPE_HEVC } else { STREAM_TYPE_AVC };
     out.extend_from_slice(&build_pat(&mut pat_cc));
-    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_video, has_audio));
+    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_video, has_audio, video_stream_type));
 
     let mut v_offset = 0usize;
     let mut is_first_vid = true;
@@ -1237,7 +1282,7 @@ fn mux_segment_inner(
         let raw = &video_data[v_offset..end];
         v_offset = end;
 
-        let annexb = sample_to_annexb(raw, nalu_len_size, sm.is_keyframe, annexb_header);
+        let annexb = sample_to_annexb(raw, nalu_len_size, sm.is_keyframe, annexb_header, is_hevc);
 
         let dts_90 = sm.dts * 90000 / video_timescale as u64;
         let pts_90 = sm.pts * 90000 / video_timescale as u64;
@@ -1328,7 +1373,11 @@ fn mux_encoded_segment_inner(
     let aac_config = [2u8, sample_rate_to_idx(audio_sample_rate), audio_channels]; // AAC-LC
 
     out.extend_from_slice(&build_pat(&mut pat_cc));
-    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_video, has_audio));
+    // Always AVC: WebCodecs ABR re-encodes every rendition to AVC
+    // regardless of the source's own codec (see ABR_ENCODE_VIDEO_CODEC in
+    // remux.worker.ts) — never HEVC passthrough, so this never needs
+    // STREAM_TYPE_HEVC the way mux_segment_inner's fast (byte-copy) path does.
+    out.extend_from_slice(&build_pmt(&mut pmt_cc, has_video, has_audio, STREAM_TYPE_AVC));
 
     let mut v_offset = 0usize;
     let mut is_first_vid = true;
@@ -1389,6 +1438,45 @@ fn mux_encoded_segment_inner(
 
 // ── Public Wasm API ──────────────────────────────────────────────
 
+/// Plain-Rust-error counterpart of `HlsProcessor::codec_config` — kept
+/// separate so it can run under a native `cargo test` (see this project's
+/// established inner/outer split for anything that touches `JsValue`,
+/// e.g. `init_segment_video_encoded_inner` in `fmp4.rs`). Explicitly
+/// errors for an HEVC video track (`vid.is_hevc`) rather than falling back
+/// to a fabricated AVC baseline codec string the way an *absent* profile
+/// used to (dead code before HEVC support existed, since `parse_headers`
+/// used to reject every non-AVC track before this could ever be reached) —
+/// a `VideoDecoder.configure()` call with a codec string that doesn't match
+/// the actual bytes it's about to decode is exactly the "reports success on
+/// undecodable content" failure mode this project has already hit twice
+/// (see `parse_headers`'s own doc comment). Erroring here is what lets
+/// adaptive HLS's existing hardware-then-FFmpeg fallback (see
+/// `runAdaptiveHls` in remux.worker.ts) keep working correctly for an HEVC
+/// source, exactly as it did before `parse_headers` learned to accept HEVC.
+fn codec_config_inner(video: Option<&TrackData>, audio: Option<&TrackData>) -> Result<String, String> {
+    let vid = video.ok_or_else(|| "Not initialised".to_string())?;
+    let aud = audio.ok_or_else(|| "Not initialised".to_string())?;
+
+    let video_codec = match vid.avc1_profile {
+        Some([p, c, l]) => format!("avc1.{:02x}{:02x}{:02x}", p, c, l),
+        None if vid.is_hevc => {
+            return Err("HEVC sources don't support WebCodecs hardware encoding yet — use the FFmpeg fallback.".to_string());
+        }
+        None => return Err("No AVC profile found on the video track.".to_string()),
+    };
+    let audio_description = audio_specific_config(aud.aac_config);
+
+    let result = serde_json::json!({
+        "videoCodec": video_codec,
+        "videoDescriptionBytes": vid.avcc_raw,
+        "audioCodec": format!("mp4a.40.{}", aud.aac_config[0].max(1)),
+        "audioSampleRate": sample_rate_from_idx(aud.aac_config[1]),
+        "audioChannels": aud.aac_config[2],
+        "audioDescriptionBytes": audio_description,
+    });
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
 #[wasm_bindgen]
 pub struct HlsProcessor {
     video: Option<TrackData>,
@@ -1441,19 +1529,20 @@ impl HlsProcessor {
 
         let mut vid = video.ok_or_else(|| JsValue::from_str("No video track found"))?;
 
-        // `avc1_profile` is only ever set from a successfully-parsed `avcC`
-        // box (see `parse_track`) — its absence means this video track
-        // isn't AVC/H.264, the only codec this muxer knows how to copy
-        // through. Left unchecked, the fast path would still "succeed": no
-        // Annex-B header, a hardcoded fallback codec string, and the
-        // track's real (e.g. HEVC) sample bytes copied through unexamined
-        // — a segment that reports success while being undecodable by any
-        // real player. HEVC from a recent iPhone's default "High
-        // Efficiency" recording mode is the case this actually catches in
-        // practice; failing clearly here is what lets the worker fall back
-        // to converting the file with FFmpeg first, the same as it already
+        // `avc1_profile`/`is_hevc` are only ever set from a successfully-
+        // parsed `avcC`/`hvcC` box (see `parse_track`) — neither means this
+        // video track isn't a codec the fast path knows how to copy through
+        // (AVC or HEVC — see `hevc.rs`'s own module doc comment for exactly
+        // how far HEVC support goes). Left unchecked, the fast path would
+        // still "succeed": no Annex-B header, a hardcoded fallback codec
+        // string, and the track's real sample bytes copied through
+        // unexamined — a segment that reports success while being
+        // undecodable by any real player. An unrecognized codec entirely
+        // (VP9, AV1, ...) is the case this actually catches in practice now;
+        // failing clearly here is what lets the worker fall back to
+        // converting the file with FFmpeg first, the same as it already
         // does for a non-native container.
-        if vid.avc1_profile.is_none() {
+        if vid.avc1_profile.is_none() && !vid.is_hevc {
             let codec = vid
                 .video_codec_fourcc
                 .map(|f| String::from_utf8_lossy(&f).trim_end().to_string())
@@ -1475,6 +1564,7 @@ impl HlsProcessor {
             avcc_raw: vec![],
             edit_list_end: None,
             video_codec_fourcc: None,
+            is_hevc: false,
         });
 
         // Trim both tracks to whichever edit list gives the tighter (i.e.
@@ -1520,6 +1610,11 @@ impl HlsProcessor {
             "audioTimescale": aud.timescale,
             "targetDuration": self.target_duration,
             "segments": seg_json,
+            // 'hevc' or 'avc' — lets the worker keep routing HEVC + fMP4 (or
+            // + adaptive HLS) through the FFmpeg pre-conversion step it
+            // already has, even though this parse itself now succeeds for
+            // HEVC too (see `hevc.rs`'s own scope note).
+            "videoCodec": if vid.is_hevc { "hevc" } else { "avc" },
         });
 
         self.segments = segments;
@@ -1639,25 +1734,7 @@ impl HlsProcessor {
     /// (in-band Annex-B, no description) throws "a key frame is required"
     /// on some real-world H.264 streams, so don't switch to it.
     pub fn codec_config(&self) -> Result<JsValue, JsValue> {
-        let vid = self.video.as_ref().ok_or_else(|| JsValue::from_str("Not initialised"))?;
-        let aud = self.audio.as_ref().ok_or_else(|| JsValue::from_str("Not initialised"))?;
-
-        let video_codec = match vid.avc1_profile {
-            Some([p, c, l]) => format!("avc1.{:02x}{:02x}{:02x}", p, c, l),
-            None => "avc1.42001e".to_string(), // fallback: Baseline profile, level 3.0
-        };
-        let audio_description = audio_specific_config(aud.aac_config);
-
-        let result = serde_json::json!({
-            "videoCodec": video_codec,
-            "videoDescriptionBytes": vid.avcc_raw,
-            "audioCodec": format!("mp4a.40.{}", aud.aac_config[0].max(1)),
-            "audioSampleRate": sample_rate_from_idx(aud.aac_config[1]),
-            "audioChannels": aud.aac_config[2],
-            "audioDescriptionBytes": audio_description,
-        });
-        let json_str = serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(JsValue::from_str(&json_str))
+        codec_config_inner(self.video.as_ref(), self.audio.as_ref()).map(|s| JsValue::from_str(&s)).map_err(|e| JsValue::from_str(&e))
     }
 
     /// Mux one Adaptive HLS rendition's segment from WebCodecs-encoded
@@ -1838,9 +1915,9 @@ impl HlsProcessor {
         // No video track at all in audio-only mode — annexb_header/
         // nalu_len_size/video_timescale only matter inside `video_samples`'
         // loop, which is empty here, so these placeholders are never read.
-        let (annexb_header, nalu_len_size, video_timescale): (&[u8], u8, u32) = match &self.video {
-            Some(vid) => (&vid.annexb_header, vid.nalu_len_size, vid.timescale),
-            None => (&[], 4, 1),
+        let (annexb_header, nalu_len_size, is_hevc, video_timescale): (&[u8], u8, bool, u32) = match &self.video {
+            Some(vid) => (&vid.annexb_header, vid.nalu_len_size, vid.is_hevc, vid.timescale),
+            None => (&[], 4, false, 1),
         };
 
         let ts_bytes = mux_segment_inner(
@@ -1850,6 +1927,7 @@ impl HlsProcessor {
             audio_data,
             annexb_header,
             nalu_len_size,
+            is_hevc,
             aud.aac_config,
             video_timescale,
             aud.timescale,
@@ -2060,7 +2138,7 @@ mod tests {
     #[test]
     fn pmt_video_and_audio_has_two_stream_entries() {
         let mut cc = 0u8;
-        let pkt = build_pmt(&mut cc, true, true);
+        let pkt = build_pmt(&mut cc, true, true, STREAM_TYPE_AVC);
         assert_eq!(pkt.len(), 188);
         assert_eq!(pmt_section_length(&pkt), 9 + 2 * 5 + 4);
         assert_eq!(pmt_pcr_pid(&pkt), VID_PID, "PCR anchors to video when video is present");
@@ -2069,16 +2147,23 @@ mod tests {
     #[test]
     fn pmt_video_only_has_one_stream_entry_and_video_pcr() {
         let mut cc = 0u8;
-        let pkt = build_pmt(&mut cc, true, false);
+        let pkt = build_pmt(&mut cc, true, false, STREAM_TYPE_AVC);
         assert_eq!(pmt_section_length(&pkt), 9 + 5 + 4);
         assert_eq!(pmt_pcr_pid(&pkt), VID_PID);
         assert_eq!(pkt[17], 0x1B, "sole stream entry is H.264 video");
     }
 
     #[test]
+    fn pmt_video_only_hevc_stream_type_is_0x24() {
+        let mut cc = 0u8;
+        let pkt = build_pmt(&mut cc, true, false, STREAM_TYPE_HEVC);
+        assert_eq!(pkt[17], 0x24, "sole stream entry is HEVC video");
+    }
+
+    #[test]
     fn pmt_audio_only_has_one_stream_entry_and_audio_pcr() {
         let mut cc = 0u8;
-        let pkt = build_pmt(&mut cc, false, true);
+        let pkt = build_pmt(&mut cc, false, true, STREAM_TYPE_AVC);
         assert_eq!(pmt_section_length(&pkt), 9 + 5 + 4);
         assert_eq!(pmt_pcr_pid(&pkt), AUD_PID, "no video track to anchor PCR to — falls back to audio");
         assert_eq!(pkt[17], 0x0F, "sole stream entry is AAC/ADTS audio, not the video 0x1B seen when video is present");
@@ -2115,6 +2200,55 @@ mod tests {
     fn stsd_first_entry_fourcc_none_without_an_stsd_box() {
         let stbl: Vec<u8> = vec![];
         assert_eq!(stsd_first_entry_fourcc(&stbl), None);
+    }
+
+    fn track_data(avc1_profile: Option<[u8; 3]>, avcc_raw: Vec<u8>, is_hevc: bool) -> TrackData {
+        TrackData {
+            timescale: 90_000,
+            handler: *b"vide",
+            samples: vec![],
+            annexb_header: vec![],
+            nalu_len_size: 4,
+            aac_config: [2, 4, 2],
+            avc1_profile,
+            avcc_raw,
+            edit_list_end: None,
+            video_codec_fourcc: None,
+            is_hevc,
+        }
+    }
+
+    fn audio_track_data() -> TrackData {
+        track_data(None, vec![], false)
+    }
+
+    #[test]
+    fn codec_config_inner_errors_for_an_hevc_video_track_instead_of_a_fake_avc_string() {
+        // The regression this guards: before HEVC support existed,
+        // parse_headers rejected every non-AVC track outright, so this
+        // function's own `avc1_profile.is_none()` branch was unreachable
+        // dead code and could safely fall back to a placeholder AVC string.
+        // Now that parse_headers accepts HEVC too (see hevc.rs), that branch
+        // is live — and must keep erroring, not silently hand back an AVC
+        // codec string + empty description that would misconfigure a real
+        // WebCodecs VideoDecoder against actual HEVC bytes.
+        let video = track_data(None, vec![], true);
+        let audio = audio_track_data();
+        let result = codec_config_inner(Some(&video), Some(&audio));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn codec_config_inner_succeeds_for_a_real_avc_profile() {
+        let video = track_data(Some([0x64, 0x00, 0x1f]), vec![1, 2, 3], false);
+        let audio = audio_track_data();
+        let json = codec_config_inner(Some(&video), Some(&audio)).expect("avc codec config");
+        assert!(json.contains("avc1.64001f"));
+    }
+
+    #[test]
+    fn codec_config_inner_errors_without_a_video_track() {
+        assert!(codec_config_inner(None, Some(&audio_track_data())).is_err());
     }
 
 }

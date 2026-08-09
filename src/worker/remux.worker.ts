@@ -2105,15 +2105,22 @@ self.addEventListener('message', async (e: MessageEvent<WorkerCommand>) => {
  * extension (.mp4/.mov/...) doesn't guarantee a compatible video codec. An
  * iPhone's "High Efficiency" recording mode writes HEVC into a .mov/.mp4
  * container — same extension as H.264, incompatible bitstream. Left
- * undetected, the fast path doesn't error, it copies the (wrong) codec's
- * samples through as-is and reports success on an undecodable segment; see
- * `UNSUPPORTED_VIDEO_CODEC` in wasm/src/lib.rs's parse_headers for the
- * actual gate. Only that specific signal routes here — any other parse
- * failure is left for the real run to hit and report normally, so a
- * genuinely malformed file doesn't get a misleading "needs conversion"
- * detour before failing anyway.
+ * undetected pre-HEVC-support, the fast path didn't error, it copied the
+ * (wrong) codec's samples through as-is and reported success on an
+ * undecodable segment; see `UNSUPPORTED_VIDEO_CODEC` in wasm/src/lib.rs's
+ * parse_headers for the actual gate. Only that specific signal routes to
+ * "needs conversion" from a genuine parse failure — any other kind is left
+ * for the real run to hit and report normally, so a genuinely malformed
+ * file doesn't get a misleading "needs conversion" detour before failing
+ * anyway.
+ *
+ * The Rust fast path can now byte-copy HEVC too (see wasm/src/hevc.rs), but
+ * only into MPEG-TS output — fMP4's sample-entry/config-record writer is
+ * still AVC-only, so an HEVC source still needs the FFmpeg pre-conversion
+ * when `outputContainer === 'fmp4'` specifically, even though `parse_headers`
+ * itself now succeeds either way.
  */
-async function needsConversionForUnsupportedCodec(sourceOpfsName: string): Promise<boolean> {
+async function needsConversionForUnsupportedCodec(sourceOpfsName: string, outputContainer: 'ts' | 'fmp4'): Promise<boolean> {
   try {
     const opfsRoot = await navigator.storage.getDirectory();
     const fileHandle = await opfsRoot.getFileHandle(sourceOpfsName);
@@ -2124,16 +2131,17 @@ async function needsConversionForUnsupportedCodec(sourceOpfsName: string): Promi
       const { HlsProcessor } = await loadWasm();
       const probe = new HlsProcessor();
       const isUnsupportedCodecError = (err: unknown) => String(err).includes('UNSUPPORTED_VIDEO_CODEC');
+      const stillNeedsConversion = (jsonStr: string) => (JSON.parse(jsonStr) as ParseHeadersResult).videoCodec === 'hevc' && outputContainer === 'fmp4';
 
       try {
-        probe.parse_headers(readAt(syncHandle, 0, HEADER_READ));
-        return false;
+        const jsonStr = probe.parse_headers(readAt(syncHandle, 0, HEADER_READ)) as unknown as string;
+        return stillNeedsConversion(jsonStr);
       } catch (err) {
         if (isUnsupportedCodecError(err)) return true;
         try {
           const tailOffset = Math.max(0, fileSize - 32 * 1024 * 1024);
-          probe.parse_headers(readAt(syncHandle, tailOffset, fileSize - tailOffset));
-          return false;
+          const jsonStr = probe.parse_headers(readAt(syncHandle, tailOffset, fileSize - tailOffset)) as unknown as string;
+          return stillNeedsConversion(jsonStr);
         } catch (err2) {
           return isUnsupportedCodecError(err2);
         }
@@ -2277,14 +2285,15 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
-  // Non-native containers, and native containers whose video track isn't
-  // actually AVC/H.264 (e.g. HEVC from an iPhone's "High Efficiency" mode —
-  // see needsConversionForUnsupportedCodec above), go through FFmpeg first,
-  // producing an MP4 the Rust remuxer can read.
+  // Non-native containers, and native containers whose video codec the
+  // chosen output container can't handle (e.g. HEVC + fMP4 output — MPEG-TS
+  // output now byte-copies HEVC natively, see needsConversionForUnsupportedCodec
+  // above), go through FFmpeg first, producing an MP4 the Rust remuxer can read.
   let effectiveSession = session;
   if (!session.preConverted) {
     const needsConversion =
-      !isNativeContainer(session.sourceFileName) || (await needsConversionForUnsupportedCodec(session.sourceFilePath));
+      !isNativeContainer(session.sourceFileName) ||
+      (await needsConversionForUnsupportedCodec(session.sourceFilePath, session.outputContainer ?? 'ts'));
     if (needsConversion) {
       try {
         const convertedOpfsName = await convertToMp4(session.sourceFilePath, session.sourceFileName);
