@@ -62,6 +62,13 @@ export function useTranscoder() {
    * files to land somewhere they can see them without an extra step.
    */
   const [outputMode, setOutputModeState] = useState<'opfs' | 'folder'>('opfs');
+  /** Fast-path output container. 'fmp4' only supports the plain
+   * single-quality case (see the outputContainer guards in
+   * remux.worker.ts's runTranscoding) — the worker rejects it clearly if
+   * ABR/edited-segments/dub-audio/subtitles/intro-outro are also present,
+   * rather than this hook trying to pre-emptively cross-disable every
+   * combination across several unrelated components. */
+  const [outputContainer, setOutputContainer] = useState<'ts' | 'fmp4'>('ts');
   const [sourceResolution, setSourceResolution] = useState<{ width: number; height: number } | null>(null);
   const [sourceDuration, setSourceDuration] = useState<number | undefined>(undefined);
   /** Kept only for the timeline's raw (pre-conversion) clip preview — never
@@ -414,6 +421,7 @@ export function useTranscoder() {
       introOutro,
       dubAudioTracks: dubAudioTracks.length > 0 ? dubAudioTracks : undefined,
       segments: editorSegments,
+      outputContainer,
     };
     setSession(sessionWithExtras);
 
@@ -443,7 +451,7 @@ export function useTranscoder() {
       setStatus('error');
       addLog(`Could not talk to the worker: ${err}`, 'error');
     }
-  }, [session, outputFolder, outputMode, abrEnabled, abrHeights, subtitleTracks, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
+  }, [session, outputFolder, outputMode, outputContainer, abrEnabled, abrHeights, subtitleTracks, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
 
   const resume = useCallback(async () => {
     const src = resumableSession ?? session;
@@ -581,6 +589,7 @@ export function useTranscoder() {
     resumableSession,
     outputFolder,
     outputMode,
+    outputContainer,
     uploadProgress,
     convertProgress,
     segmentProgress,
@@ -603,6 +612,7 @@ export function useTranscoder() {
     selectFile,
     selectOutputFolder,
     setOutputMode,
+    setOutputContainer,
     selectSubtitleFile,
     addBlankSubtitleTrack,
     saveSubtitleEdits,

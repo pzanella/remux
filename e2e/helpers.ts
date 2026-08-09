@@ -51,16 +51,26 @@ export async function selectRendition(page: Page, label: string): Promise<void> 
 }
 
 /** Opens the export review modal and starts the job, then waits for
- * either a successful completion or a reported error. Returns which. */
-export async function runExport(page: Page): Promise<'done' | 'error'> {
+ * either a successful completion or a reported error. Returns which.
+ * `beforeStart` runs after the modal is open (so its own output/container
+ * controls are visible) but before "Start conversion" is clicked — e.g. for
+ * `selectFmp4Container`. */
+export async function runExport(page: Page, beforeStart?: () => Promise<void>): Promise<'done' | 'error'> {
   await page.click('.btn-export');
   await page.waitForSelector('button:has-text("Start conversion")', { timeout: 5_000 });
+  if (beforeStart) await beforeStart();
   await page.click('button:has-text("Start conversion")');
   await Promise.race([
     page.waitForSelector('text=Done — your HLS output is ready.', { timeout: 45_000 }),
     page.waitForSelector('.export-modal-error', { timeout: 45_000 }),
   ]);
   return (await page.$('.export-modal-error')) ? 'error' : 'done';
+}
+
+/** Switches the export review modal's output container to fragmented MP4
+ * (default is MPEG-TS) — see `runExport`'s `beforeStart`. */
+export async function selectFmp4Container(page: Page): Promise<void> {
+  await page.getByLabel('Fragmented MP4 (experimental)').check();
 }
 
 export async function getLogText(page: Page): Promise<string> {

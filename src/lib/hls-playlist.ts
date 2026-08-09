@@ -175,6 +175,22 @@ export function buildFastPathMasterM3U8(
   return m;
 }
 
+/** Master playlist for the fMP4 fast path's single video rendition +
+ * shared "Original" audio group — version 7 (see `buildFmp4MediaPlaylist`
+ * for why), and always exactly one audio tag, unlike
+ * `buildFastPathMasterM3U8`'s optional subtitle/multi-dub-audio tags: the
+ * fMP4 fast path doesn't support those yet (see `outputContainer` on
+ * `TranscodingSession`), so this only ever needs to describe the one
+ * "Original" track the source's own audio becomes. */
+export function buildFmp4MasterM3U8(bandwidth: number, width: number | undefined, height: number | undefined, videoPlaylist: string, audioPlaylist: string): string {
+  const resAttr = width && height ? `,RESOLUTION=${width}x${height}` : '';
+  let m = '#EXTM3U\n#EXT-X-VERSION:7\n';
+  m += buildAudioMediaTag({ name: 'Original', language: 'und', playlist: audioPlaylist, isDefault: true });
+  m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth}${resAttr},AUDIO="${AUDIO_GROUP_ID}"\n`;
+  m += `${videoPlaylist}\n`;
+  return m;
+}
+
 function defaultSegmentName(i: number): string {
   return `segment_${String(i).padStart(4, '0')}.ts`;
 }

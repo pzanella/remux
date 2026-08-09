@@ -4,6 +4,7 @@ import {
   SUBTITLES_GROUP_ID,
   buildAudioMediaTag,
   buildFastPathMasterM3U8,
+  buildFmp4MasterM3U8,
   buildFmp4MediaPlaylist,
   buildIntermediateM3U8,
   buildMasterM3U8,
@@ -247,6 +248,27 @@ describe('buildFmp4MediaPlaylist', () => {
 
   it('always ends the list — unlike buildIntermediateM3U8, there is no in-progress fMP4 output yet', () => {
     expect(buildFmp4MediaPlaylist([6], 'init.mp4', (i) => `frag_${i}.m4s`)).toContain('#EXT-X-ENDLIST');
+  });
+});
+
+describe('buildFmp4MasterM3U8', () => {
+  it('references the given video and audio playlists', () => {
+    const m = buildFmp4MasterM3U8(1_000_000, 320, 240, 'video.m3u8', 'audio.m3u8');
+    expect(m).toContain('URI="audio.m3u8"');
+    expect(m).toContain('\nvideo.m3u8\n');
+  });
+
+  it('always includes the AUDIO group attribute, unlike buildFastPathMasterM3U8 where it is conditional', () => {
+    const m = buildFmp4MasterM3U8(1_000_000, 320, 240, 'video.m3u8', 'audio.m3u8');
+    expect(m).toContain(`AUDIO="${AUDIO_GROUP_ID}"`);
+  });
+
+  it('is version 7', () => {
+    expect(buildFmp4MasterM3U8(1_000_000, 320, 240, 'video.m3u8', 'audio.m3u8')).toContain('#EXT-X-VERSION:7');
+  });
+
+  it('includes RESOLUTION when dimensions are known', () => {
+    expect(buildFmp4MasterM3U8(1_000_000, 1920, 1080, 'video.m3u8', 'audio.m3u8')).toContain('RESOLUTION=1920x1080');
   });
 });
 

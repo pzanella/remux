@@ -24,6 +24,8 @@ import {
   buildSubtitlePlaylist,
   buildMasterM3U8,
   buildFastPathMasterM3U8,
+  buildFmp4MasterM3U8,
+  buildFmp4MediaPlaylist,
   buildIntermediateM3U8,
   totalDurationFromPlaylist,
   durationsFromPlaylist,
@@ -1854,6 +1856,26 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
+  // fMP4 output (runFmp4FastPath) only exists for the plain single-quality
+  // case so far — everything else (ABR, edited segments, dub-audio,
+  // subtitles, intro/outro, resume) still only knows how to produce
+  // MPEG-TS. Failing clearly here, before any FFmpeg conversion work below,
+  // beats silently falling back to MPEG-TS for a container the user
+  // explicitly asked for.
+  if (session.outputContainer === 'fmp4') {
+    const unsupported: string[] = [];
+    if (session.abrHeights?.length) unsupported.push('adaptive HLS');
+    if (editedSegments) unsupported.push('edited (trimmed/split) segments');
+    if (session.dubAudioTracks?.length) unsupported.push('dub-audio tracks');
+    if (subtitleTags.length > 0) unsupported.push('subtitles');
+    if (session.introOutro?.introFileName || session.introOutro?.outroFileName) unsupported.push('intro/outro');
+    if (cmd.type === 'RESUME') unsupported.push('resume');
+    if (unsupported.length > 0) {
+      post({ type: 'ERROR', error: `Fragmented MP4 output doesn't support ${unsupported.join(', ')} yet — switch back to MPEG-TS or remove them.` });
+      return;
+    }
+  }
+
   if (session.abrHeights && session.abrHeights.length > 0) {
     if (editedSegments) {
       await runAdaptiveHlsSegmented(session, outputFolderHandle, subtitleTags);
@@ -1914,7 +1936,11 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
   }
 
   try {
-    await runWithHandle(syncHandle, effectiveSession, outputFolderHandle, cmd.type === 'RESUME', subtitleTags);
+    if (session.outputContainer === 'fmp4') {
+      await runFmp4FastPath(syncHandle, effectiveSession, outputFolderHandle);
+    } else {
+      await runWithHandle(syncHandle, effectiveSession, outputFolderHandle, cmd.type === 'RESUME', subtitleTags);
+    }
   } finally {
     syncHandle.close();
   }
@@ -2152,6 +2178,149 @@ async function runWithHandle(
     totalSegments: segmentCount,
     log: masterM3u8 ? 'Done! master.m3u8 is ready.' : 'Done! index.m3u8 is ready.',
     m3u8: outputM3u8,
+    masterM3u8,
+    sessionId: session.id,
+  });
+}
+
+// ── fMP4 fast path ───────────────────────────────────────────────────
+//
+// The HLS-on-CMAF counterpart of `runWithHandle` above: same per-segment
+// read loop, but each segment becomes one video `.m4s` + one audio `.m4s`
+// fragment (via HlsProcessor::mux_video_fragment/mux_audio_fragment, see
+// wasm/src/fmp4.rs) referencing a shared init segment per track, instead of
+// one `.ts` segment holding both. Deliberately scoped to the plain
+// single-quality case only — no resume, no dub-audio, no subtitles, no
+// intro/outro — see the `outputContainer === 'fmp4'` guards in
+// `runTranscoding` that keep this the only path able to reach here.
+async function runFmp4FastPath(
+  syncHandle: FileSystemSyncAccessHandle,
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+): Promise<void> {
+  const fileSize = syncHandle.getSize();
+  log(`File size: ${(fileSize / 1024 / 1024).toFixed(1)} MiB`);
+  log('Reading video headers…');
+
+  const HEADER_READ = Math.min(32 * 1024 * 1024, fileSize);
+  const headerBuf = readAt(syncHandle, 0, HEADER_READ);
+
+  const { HlsProcessor } = await loadWasm();
+  const processor = new HlsProcessor();
+  processor.set_target_duration(6.0);
+
+  let parseResult: ParseHeadersResult;
+  try {
+    parseResult = JSON.parse(processor.parse_headers(headerBuf) as unknown as string) as ParseHeadersResult;
+  } catch {
+    try {
+      const tailOffset = Math.max(0, fileSize - 32 * 1024 * 1024);
+      const tailBuf = readAt(syncHandle, tailOffset, fileSize - tailOffset);
+      parseResult = JSON.parse(processor.parse_headers(tailBuf) as unknown as string) as ParseHeadersResult;
+    } catch (err2) {
+      post({ type: 'ERROR', error: `Could not read video headers: ${err2}` });
+      return;
+    }
+  }
+
+  const { segmentCount, segments } = parseResult;
+  log(`Found ${segmentCount} segments.`);
+  post({ type: 'INITIALIZED', totalSegments: segmentCount });
+
+  const width = session.sourceWidth ?? 0;
+  const height = session.sourceHeight ?? 0;
+
+  let initVideo: Uint8Array;
+  let initAudio: Uint8Array;
+  try {
+    initVideo = processor.init_segment_video(width, height) as Uint8Array;
+    initAudio = processor.init_segment_audio() as Uint8Array;
+  } catch (err) {
+    post({ type: 'ERROR', error: `Failed to build init segments: ${err}`, sessionId: session.id });
+    return;
+  }
+  await writeOutputFile(outputFolderHandle, 'init_video.mp4', initVideo);
+  await writeOutputFile(outputFolderHandle, 'init_audio.mp4', initAudio);
+
+  const videoFragmentName = (i: number) => `frag_video_${String(i).padStart(4, '0')}.m4s`;
+  const audioFragmentName = (i: number) => `frag_audio_${String(i).padStart(4, '0')}.m4s`;
+
+  const durations: number[] = [];
+  let retryCount = 0;
+
+  for (let i = 0; i < segmentCount; i++) {
+    while (paused && !cancelled) {
+      await sleep(200);
+    }
+    if (cancelled) {
+      log('Cancelled.');
+      return;
+    }
+
+    const seg = segments[i];
+    log(`Segment ${i + 1}/${segmentCount}…`);
+
+    let videoData: Uint8Array;
+    let audioData: Uint8Array;
+    try {
+      videoData = readSamples(syncHandle, seg.videoSamples);
+      audioData = readSamples(syncHandle, seg.audioSamples);
+    } catch (err) {
+      if (retryCount < 3) {
+        retryCount++;
+        log(`Read error on segment ${i}, retrying (${retryCount}/3)…`, 'ERROR');
+        i--;
+        await sleep(500);
+        continue;
+      }
+      post({ type: 'ERROR', error: `Failed to read segment ${i}: ${err}`, sessionId: session.id });
+      return;
+    }
+    retryCount = 0;
+
+    let fragVideo: Uint8Array;
+    let fragAudio: Uint8Array;
+    try {
+      fragVideo = processor.mux_video_fragment(videoData, i) as Uint8Array;
+      fragAudio = processor.mux_audio_fragment(audioData, i) as Uint8Array;
+    } catch (err) {
+      post({ type: 'ERROR', error: `Fragment mux failed for segment ${i}: ${err}`, sessionId: session.id });
+      return;
+    }
+
+    try {
+      await writeOutputFile(outputFolderHandle, videoFragmentName(i), fragVideo);
+      await writeOutputFile(outputFolderHandle, audioFragmentName(i), fragAudio);
+    } catch (err) {
+      post({ type: 'ERROR', error: `Failed to write segment ${i}: ${err}`, sessionId: session.id });
+      return;
+    }
+
+    durations[i] = seg.durationSec;
+    log(`Segment ${i + 1} saved (${((fragVideo.byteLength + fragAudio.byteLength) / 1024).toFixed(0)} KiB)`);
+
+    post({
+      type: 'SEGMENT_DONE',
+      segmentIndex: i,
+      totalSegments: segmentCount,
+      log: `Segment ${i + 1}/${segmentCount} done`,
+      sessionId: session.id,
+    });
+  }
+
+  const videoPlaylist = buildFmp4MediaPlaylist(durations, 'init_video.mp4', videoFragmentName);
+  const audioPlaylist = buildFmp4MediaPlaylist(durations, 'init_audio.mp4', audioFragmentName);
+  await writeOutputFile(outputFolderHandle, 'video.m3u8', videoPlaylist);
+  await writeOutputFile(outputFolderHandle, 'audio.m3u8', audioPlaylist);
+
+  const masterM3u8 = buildFmp4MasterM3U8(1_000_000, session.sourceWidth, session.sourceHeight, 'video.m3u8', 'audio.m3u8');
+  await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+
+  post({
+    type: 'COMPLETE',
+    totalSegments: segmentCount,
+    log: 'Done! master.m3u8 is ready.',
+    m3u8: videoPlaylist,
     masterM3u8,
     sessionId: session.id,
   });

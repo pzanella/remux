@@ -17,6 +17,7 @@ interface ExportModalProps {
   abrHeights: number[];
   outputFolder: FileSystemDirectoryHandle | null;
   outputMode: 'opfs' | 'folder';
+  outputContainer: 'ts' | 'fmp4';
   logs: LogEntry[];
   m3u8: string;
   introFile: ClipFile | null;
@@ -26,6 +27,7 @@ interface ExportModalProps {
   onClose: () => void;
   onSelectFolder: () => void;
   onSetOutputMode: (mode: 'opfs' | 'folder') => void;
+  onSetOutputContainer: (container: 'ts' | 'fmp4') => void;
   onResume: () => void;
   onPause: () => void;
   onCancel: () => void;
@@ -60,6 +62,7 @@ export default function ExportModal({
   abrHeights,
   outputFolder,
   outputMode,
+  outputContainer,
   logs,
   m3u8,
   introFile,
@@ -69,6 +72,7 @@ export default function ExportModal({
   onClose,
   onSelectFolder,
   onSetOutputMode,
+  onSetOutputContainer,
   onResume,
   onPause,
   onCancel,
@@ -105,7 +109,15 @@ export default function ExportModal({
         </div>
 
         {status === 'idle' && (
-          <OutputPanel outputFolder={outputFolder} outputMode={outputMode} disabled={isRunning} onSelectFolder={onSelectFolder} onSetOutputMode={onSetOutputMode} />
+          <OutputPanel
+            outputFolder={outputFolder}
+            outputMode={outputMode}
+            outputContainer={outputContainer}
+            disabled={isRunning}
+            onSelectFolder={onSelectFolder}
+            onSetOutputMode={onSetOutputMode}
+            onSetOutputContainer={onSetOutputContainer}
+          />
         )}
 
         <ProgressPanel status={status} convertProgress={convertProgress} segmentProgress={segmentProgress} renditionLabel={renditionLabel} />

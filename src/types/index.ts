@@ -7,6 +7,16 @@ export interface TranscodingSession {
   sourceFilePath: string;
   sourceFileSize: number;
   preConverted?: boolean;
+  /**
+   * Fast-path output container — `'ts'` (default, unset) or `'fmp4'`
+   * (HLS-on-CMAF: an `#EXT-X-MAP` init segment per rendition, `.m4s`
+   * fragments). Only the plain single-quality fast path supports `'fmp4'`
+   * so far — ABR, edited (trimmed/split) segments, dub-audio, subtitles,
+   * and intro/outro all still only ever produce MPEG-TS; see the
+   * `outputContainer === 'fmp4'` guards in remux.worker.ts's
+   * `runTranscoding`.
+   */
+  outputContainer?: 'ts' | 'fmp4';
   /** Index of the last segment successfully written; -1 means none yet. */
   lastSegmentIndex: number;
   totalSegments: number;

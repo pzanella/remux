@@ -195,6 +195,7 @@ export default function App() {
           abrHeights={t.abrHeights}
           outputFolder={t.outputFolder}
           outputMode={t.outputMode}
+          outputContainer={t.outputContainer}
           logs={t.logs}
           m3u8={t.masterM3u8Preview || t.m3u8Preview}
           introFile={t.introFile}
@@ -204,6 +205,7 @@ export default function App() {
           onClose={() => setExportModalOpen(false)}
           onSelectFolder={t.selectOutputFolder}
           onSetOutputMode={t.setOutputMode}
+          onSetOutputContainer={t.setOutputContainer}
           onResume={t.resume}
           onPause={t.pause}
           onCancel={t.cancel}
