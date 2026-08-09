@@ -34,6 +34,7 @@ import {
   concatChunks,
   hasEditedSegments,
 } from '../lib/hls-playlist';
+import { buildDashManifest } from '../lib/dash';
 
 // Registered before any async work, so a stalled Wasm/FFmpeg load or a Rust
 // panic always reaches the UI instead of hanging silently.
@@ -2246,6 +2247,8 @@ async function runFmp4FastPath(
   const audioFragmentName = (i: number) => `frag_audio_${String(i).padStart(4, '0')}.m4s`;
 
   const durations: number[] = [];
+  let totalVideoBytes = 0;
+  let totalAudioBytes = 0;
   let retryCount = 0;
 
   for (let i = 0; i < segmentCount; i++) {
@@ -2297,6 +2300,8 @@ async function runFmp4FastPath(
     }
 
     durations[i] = seg.durationSec;
+    totalVideoBytes += fragVideo.byteLength;
+    totalAudioBytes += fragAudio.byteLength;
     log(`Segment ${i + 1} saved (${((fragVideo.byteLength + fragAudio.byteLength) / 1024).toFixed(0)} KiB)`);
 
     post({
@@ -2313,8 +2318,47 @@ async function runFmp4FastPath(
   await writeOutputFile(outputFolderHandle, 'video.m3u8', videoPlaylist);
   await writeOutputFile(outputFolderHandle, 'audio.m3u8', audioPlaylist);
 
-  const masterM3u8 = buildFmp4MasterM3U8(1_000_000, session.sourceWidth, session.sourceHeight, 'video.m3u8', 'audio.m3u8');
+  const totalDuration = durations.reduce((a, b) => a + b, 0);
+  const videoBandwidth = totalDuration > 0 ? Math.round((totalVideoBytes * 8) / totalDuration) : 1_000_000;
+  const audioBandwidth = totalDuration > 0 ? Math.round((totalAudioBytes * 8) / totalDuration) : 128_000;
+
+  const masterM3u8 = buildFmp4MasterM3U8(videoBandwidth, session.sourceWidth, session.sourceHeight, 'video.m3u8', 'audio.m3u8');
   await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+
+  // A DASH manifest for the exact same init segments + fragments the HLS
+  // playlists above already reference — one more manifest describing
+  // files that already exist, not a second encode (see dash.ts).
+  try {
+    const codecConfig = JSON.parse(processor.codec_config() as unknown as string) as CodecConfig;
+    const dashManifest = buildDashManifest(totalDuration, [
+      {
+        id: 'video',
+        mimeType: 'video/mp4',
+        codecs: codecConfig.videoCodec,
+        bandwidth: videoBandwidth,
+        width,
+        height,
+        initFilename: 'init_video.mp4',
+        segmentDurationsSec: durations,
+        mediaTemplate: 'frag_video_$Number%04d$.m4s',
+      },
+      {
+        id: 'audio',
+        mimeType: 'audio/mp4',
+        codecs: codecConfig.audioCodec,
+        bandwidth: audioBandwidth,
+        audioSamplingRate: codecConfig.audioSampleRate,
+        initFilename: 'init_audio.mp4',
+        segmentDurationsSec: durations,
+        mediaTemplate: 'frag_audio_$Number%04d$.m4s',
+      },
+    ]);
+    await writeOutputFile(outputFolderHandle, 'manifest.mpd', dashManifest);
+  } catch (err) {
+    // Non-fatal — the HLS output above is already complete and playable;
+    // losing the DASH manifest alongside it shouldn't fail the whole job.
+    log(`Could not build the DASH manifest: ${err}`, 'ERROR');
+  }
 
   post({
     type: 'COMPLETE',

@@ -23,6 +23,14 @@ test('produces HLS-on-fMP4 output (init segments + .m4s fragments) when selected
 
   const videoPlaylist = readZipEntryText(zipPath, 'video.m3u8');
   expect(videoPlaylist).toContain('#EXT-X-MAP:URI="init_video.mp4"');
+
+  // Same init segments/fragments, described a second way — a DASH manifest
+  // referencing them alongside the HLS playlists above (see dash.ts).
+  expect(entries).toContain('manifest.mpd');
+  const manifest = readZipEntryText(zipPath, 'manifest.mpd');
+  expect(manifest).toContain('<AdaptationSet mimeType="video/mp4"');
+  expect(manifest).toContain('<AdaptationSet mimeType="audio/mp4"');
+  expect(manifest).toContain('initialization="init_video.mp4"');
 });
 
 test('rejects fMP4 output combined with adaptive HLS instead of silently falling back to MPEG-TS', async ({ page }) => {
