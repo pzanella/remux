@@ -33,6 +33,26 @@ test('produces HLS-on-fMP4 output (init segments + .m4s fragments) when selected
   expect(manifest).toContain('initialization="init_video.mp4"');
 });
 
+test('previews the exported fMP4 output via a real DASH manifest, not HLS', async ({ page }) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+
+  const result = await runExport(page, () => selectFmp4Container(page));
+  expect(result).toBe('done');
+
+  await page.click('.export-modal-close');
+
+  // Player.tsx labels itself by which manifest it's actually loaded —
+  // real proof this went through the DASH code path (manifest.mpd, read
+  // straight from the output folder) rather than silently falling back
+  // to the HLS live-preview flow every other output mode uses.
+  await expect(page.getByText('DASH result')).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText('HLS result')).toHaveCount(0);
+
+  const video = page.locator('.player-frame video');
+  await expect(video).toHaveJSProperty('readyState', 4, { timeout: 10_000 });
+});
+
 test('rejects fMP4 output combined with adaptive HLS instead of silently falling back to MPEG-TS', async ({ page }) => {
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');

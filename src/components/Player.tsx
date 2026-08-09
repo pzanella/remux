@@ -49,18 +49,32 @@ interface PlayerProps {
   m3u8Content: string;
   outputFolderHandle: FileSystemDirectoryHandle | null;
   isComplete: boolean;
+  /**
+   * When set (e.g. `'manifest.mpd'`), preview via this DASH manifest
+   * instead of the HLS live-preview flow below — read directly from
+   * `outputFolderHandle` once the job is done, the same way any other
+   * referenced file already is (see `registerLocalDirScheme`), rather
+   * than through `manifestContentRef`'s in-memory text: unlike the HLS
+   * media playlist, this project's DASH manifest is only ever written
+   * once, at the very end (see runFmp4FastPath), so there's no
+   * in-progress version to track live.
+   */
+  dashManifestFilename?: string;
 }
 
-export default function Player({ m3u8Content, outputFolderHandle, isComplete }: PlayerProps) {
+export default function Player({ m3u8Content, outputFolderHandle, isComplete, dashManifestFilename }: PlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<shaka.Player | null>(null);
   const uiRef = useRef<shaka.ui.Overlay | null>(null);
   const manifestContentRef = useRef(m3u8Content);
   manifestContentRef.current = m3u8Content;
+  const useDash = !!dashManifestFilename;
   // Only whether there's *any* content yet, not the string itself, drives
-  // the load effect below — see its dependency array for why.
-  const hasContent = m3u8Content.length > 0;
+  // the load effect below — see its dependency array for why. DASH has no
+  // such string to watch (see `dashManifestFilename` above), so "ready"
+  // just means "the job is done".
+  const hasContent = useDash ? isComplete : m3u8Content.length > 0;
   // Which folder handle the current Shaka player was built for, so the
   // effect below only creates a new one for a genuinely new session.
   const loadedHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
@@ -120,7 +134,7 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
       uiRef.current = new shaka.ui.Overlay(player, containerRef.current!, videoRef.current!);
 
       try {
-        await player.load(MANIFEST_URI);
+        await player.load(useDash ? `${URI_PREFIX}${dashManifestFilename}` : MANIFEST_URI);
         if (cancelled) return;
         videoRef.current?.play().catch(() => {
           // Autoplay may be blocked; the user can press play.
@@ -171,17 +185,17 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
     // on its own timer. `hasContent` only flips once, false→true, the
     // moment there's anything to load at all — which is the one transition
     // that actually needs a fresh player.
-  }, [hasContent, outputFolderHandle, destroyPlayer]);
+  }, [hasContent, outputFolderHandle, destroyPlayer, useDash, dashManifestFilename]);
 
   useEffect(() => () => destroyPlayer(), [destroyPlayer]);
 
-  const isReady = m3u8Content && outputFolderHandle;
+  const isReady = !!((useDash ? isComplete : m3u8Content) && outputFolderHandle);
 
   return (
     <div className="panel">
       <div className="panel-row panel-row--split">
         <span className="section-label-row">
-          <span className="section-label">HLS result</span>
+          <span className="section-label">{useDash ? 'DASH result' : 'HLS result'}</span>
           <span className="preview-badge preview-badge--final">Packaged</span>
         </span>
         {isReady && (
@@ -198,7 +212,9 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete }: 
           {isReady ? (
             <video ref={videoRef} />
           ) : (
-            <p className="player-placeholder">Your video will play here once the first segment is ready.</p>
+            <p className="player-placeholder">
+              {useDash ? 'Your video will play here once the DASH manifest is ready.' : 'Your video will play here once the first segment is ready.'}
+            </p>
           )}
         </div>
       )}

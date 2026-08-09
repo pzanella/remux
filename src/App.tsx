@@ -154,7 +154,12 @@ export default function App() {
             </>
           ) : (
             <div className="preview-pane">
-              <Player m3u8Content={t.masterM3u8Preview || t.m3u8Preview} outputFolderHandle={t.outputFolder} isComplete={t.status === 'complete'} />
+              <Player
+                m3u8Content={t.masterM3u8Preview || t.m3u8Preview}
+                outputFolderHandle={t.outputFolder}
+                isComplete={t.status === 'complete'}
+                dashManifestFilename={t.outputContainer === 'fmp4' ? 'manifest.mpd' : undefined}
+              />
             </div>
           )}
         </div>
