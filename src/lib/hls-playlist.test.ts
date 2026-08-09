@@ -6,6 +6,7 @@ import {
   buildFastPathMasterM3U8,
   buildFmp4MasterM3U8,
   buildFmp4MediaPlaylist,
+  buildFmp4MultiRenditionMasterM3U8,
   buildIntermediateM3U8,
   buildMasterM3U8,
   buildSubtitleMediaTag,
@@ -269,6 +270,31 @@ describe('buildFmp4MasterM3U8', () => {
 
   it('includes RESOLUTION when dimensions are known', () => {
     expect(buildFmp4MasterM3U8(1_000_000, 1920, 1080, 'video.m3u8', 'audio.m3u8')).toContain('RESOLUTION=1920x1080');
+  });
+});
+
+describe('buildFmp4MultiRenditionMasterM3U8', () => {
+  it('lists one #EXT-X-STREAM-INF per rendition, each pointing at the shared audio group', () => {
+    const m = buildFmp4MultiRenditionMasterM3U8(
+      [
+        { rendition: rendition({ label: '240p', height: 240, videoBitrateKbps: 400, audioBitrateKbps: 96 }), playlist: '240p.m3u8', width: 426 },
+        { rendition: rendition({ label: '480p', height: 480, videoBitrateKbps: 1400, audioBitrateKbps: 128 }), playlist: '480p.m3u8', width: 854 },
+      ],
+      'audio.m3u8',
+    );
+    expect(m).toContain('URI="audio.m3u8"');
+    expect(m).toContain('BANDWIDTH=496000');
+    expect(m).toContain('RESOLUTION=426x240');
+    expect(m).toContain('240p.m3u8');
+    expect(m).toContain('BANDWIDTH=1528000');
+    expect(m).toContain('RESOLUTION=854x480');
+    expect(m).toContain('480p.m3u8');
+    expect(m.match(/AUDIO="aud"/g)).toHaveLength(2);
+  });
+
+  it('is version 7', () => {
+    const m = buildFmp4MultiRenditionMasterM3U8([{ rendition: rendition(), playlist: '480p.m3u8', width: 854 }], 'audio.m3u8');
+    expect(m).toContain('#EXT-X-VERSION:7');
   });
 });
 

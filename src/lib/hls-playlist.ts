@@ -191,6 +191,28 @@ export function buildFmp4MasterM3U8(bandwidth: number, width: number | undefined
   return m;
 }
 
+/** Master playlist for adaptive (multi-rendition) fMP4 output — one
+ * `#EXT-X-STREAM-INF` per video rendition, same shared "Original" audio
+ * group every rendition points at (see `buildFmp4MasterM3U8`; ABR fMP4
+ * doesn't support dub-audio or subtitles yet either, same scope). Kept
+ * separate from `buildMasterM3U8` because every stream tag here needs
+ * `AUDIO="${AUDIO_GROUP_ID}"` unconditionally — the TS path's own version
+ * only adds that attribute when audio tags were actually passed in, since
+ * a TS rendition without dub-audio carries its own muxed audio instead. */
+export function buildFmp4MultiRenditionMasterM3U8(
+  streamInfos: { rendition: AbrRendition; playlist: string; width: number }[],
+  audioPlaylist: string,
+): string {
+  let m = '#EXTM3U\n#EXT-X-VERSION:7\n';
+  m += buildAudioMediaTag({ name: 'Original', language: 'und', playlist: audioPlaylist, isDefault: true });
+  for (const { rendition, playlist, width } of streamInfos) {
+    const bandwidth = (rendition.videoBitrateKbps + rendition.audioBitrateKbps) * 1000;
+    m += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${width}x${rendition.height},AUDIO="${AUDIO_GROUP_ID}"\n`;
+    m += `${playlist}\n`;
+  }
+  return m;
+}
+
 function defaultSegmentName(i: number): string {
   return `segment_${String(i).padStart(4, '0')}.ts`;
 }
