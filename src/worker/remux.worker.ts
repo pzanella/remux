@@ -26,6 +26,7 @@ import {
   buildFastPathMasterM3U8,
   buildFmp4MasterM3U8,
   buildFmp4MediaPlaylist,
+  buildFmp4MultiRenditionMasterM3U8,
   buildIntermediateM3U8,
   totalDurationFromPlaylist,
   durationsFromPlaylist,
@@ -34,7 +35,7 @@ import {
   concatChunks,
   hasEditedSegments,
 } from '../lib/hls-playlist';
-import { buildDashManifest } from '../lib/dash';
+import { buildDashManifest, type DashRendition } from '../lib/dash';
 
 // Registered before any async work, so a stalled Wasm/FFmpeg load or a Rust
 // panic always reaches the UI instead of hanging silently.
@@ -798,6 +799,17 @@ interface AbrPipelineContext {
    * audio is left out of its segments — the shared "aud" group built by
    * `buildAudioOnlyRenditions` carries audio instead. See `writeRenditionSegment`. */
   hasDubAudio: boolean;
+  /** 'ts' muxes each rendition's own video+audio together into MPEG-TS
+   * segments (see `writeRenditionSegment`'s default branch). 'fmp4' instead
+   * gives every rendition its own fMP4 video fragment stream and shares one
+   * fMP4 audio fragment stream across all of them — same "one shared
+   * audio-only stream, never duplicated per video quality" rule dub-audio
+   * already established (see fmp4.rs's module doc comment), just applied to
+   * ABR's own re-encoded audio instead of a remuxed source/dub file. Only
+   * one designated sink (`RenditionSink.isAudioOwner`) ever writes that
+   * shared stream; the others' own audio encode still runs (simplest to
+   * leave it be, see `hasDubAudio`) but its output is discarded. */
+  outputContainer: 'ts' | 'fmp4';
 }
 
 interface RenditionSink {
@@ -822,6 +834,10 @@ interface RenditionSink {
    * renditions and the shared decode pipeline keep going: one rendition's
    * encoder trouble never aborts the whole job. */
   broken: boolean;
+  /** fMP4 output only (see `AbrPipelineContext.outputContainer`) — whether
+   * this is the one sink that writes the shared audio fragment stream.
+   * Always false for 'ts' output, where every sink keeps its own audio. */
+  isAudioOwner: boolean;
 }
 
 /** Marks a rendition dead after its own encoder trouble — logged once (not
@@ -924,7 +940,11 @@ function createRenditionSink(
     videoEncoder,
     audioEncoder,
     pipeline,
-    playlistName: `${pipeline.segmentPrefix}${rendition.label}.m3u8`,
+    // fMP4's own video and audio are split into separate fragment streams
+    // (see `writeFmp4RenditionSegment`) — named distinctly from '.ts'
+    // output's one combined `${label}.m3u8` per rendition, so a video-only
+    // playlist doesn't read as if it were the whole rendition.
+    playlistName: `${pipeline.segmentPrefix}${pipeline.outputContainer === 'fmp4' ? `video_${rendition.label}` : rendition.label}.m3u8`,
     segmentIndex: 0,
     segmentStartUs: 0,
     videoChunks: [],
@@ -932,6 +952,7 @@ function createRenditionSink(
     durations: [],
     writeQueue: Promise.resolve(),
     broken: false,
+    isAudioOwner: false,
   };
   return sink;
 }
@@ -981,6 +1002,10 @@ function cutRenditionSegment(sink: RenditionSink, boundaryUs: number): CutSegmen
 
 async function writeRenditionSegment(sink: RenditionSink, cut: CutSegment, isFinal: boolean): Promise<void> {
   if (cut.videoChunks.length === 0) return;
+  if (sink.pipeline.outputContainer === 'fmp4') {
+    await writeFmp4RenditionSegment(sink, cut);
+    return;
+  }
 
   const videoData = concatChunks(cut.videoChunks);
   const videoMeta = cut.videoChunks.map((c) => ({ size: c.data.byteLength, timestampUs: c.timestampUs, isKeyframe: c.isKeyframe }));
@@ -1013,6 +1038,80 @@ async function writeRenditionSegment(sink: RenditionSink, cut: CutSegment, isFin
   const segmentName = (i: number) => `${prefix}${sink.rendition.label}_${String(i).padStart(4, '0')}.ts`;
   const m3u8 = buildIntermediateM3U8(sink.durations, isFinal, segmentName);
   await writeOutputFile(sink.pipeline.outputFolderHandle, sink.playlistName, m3u8);
+}
+
+/** Filenames for adaptive fMP4's own init segments/fragments — shared
+ * between `writeFmp4RenditionSegment` (which writes them), the
+ * `runAbrWebCodecsWithHandle` return path, and `finalizeAbrFmp4Results`
+ * (which both need to reference them again afterward) so the naming only
+ * lives in one place. */
+function fmp4VideoInitName(prefix: string, label: string): string {
+  return `${prefix}init_video_${label}.mp4`;
+}
+function fmp4AudioInitName(prefix: string): string {
+  return `${prefix}init_audio.mp4`;
+}
+function fmp4VideoFragmentName(prefix: string, label: string, i: number): string {
+  return `${prefix}frag_video_${label}_${String(i).padStart(4, '0')}.m4s`;
+}
+function fmp4AudioFragmentName(prefix: string, i: number): string {
+  return `${prefix}frag_audio_${String(i).padStart(4, '0')}.m4s`;
+}
+
+/** fMP4 counterpart of the `mux_encoded_segment`/`.ts` branch above — every
+ * rendition gets its own fMP4 video fragment stream (`init_video_${label}.mp4`
+ * + `frag_video_${label}_NNNN.m4s`), sharing exactly one fMP4 audio fragment
+ * stream (`init_audio.mp4` + `frag_audio_NNNN.m4s`) written only by
+ * `sink.isAudioOwner`'s own segments — see `AbrPipelineContext.outputContainer`.
+ * Each rendition's own init segment is built from its *first* segment's own
+ * first keyframe (its SPS/PPS never changes mid-rendition, since the encoder
+ * config is fixed for the whole job), so it only needs building once, on
+ * `sink.segmentIndex === 0`. No `isFinal` flag needed, unlike the `.ts`
+ * branch: `buildFmp4MediaPlaylist` always writes `#EXT-X-ENDLIST`. */
+async function writeFmp4RenditionSegment(sink: RenditionSink, cut: CutSegment): Promise<void> {
+  const prefix = sink.pipeline.segmentPrefix;
+  const label = sink.rendition.label;
+  const videoInitName = fmp4VideoInitName(prefix, label);
+  const audioInitName = fmp4AudioInitName(prefix);
+  const videoFragmentName = (i: number) => fmp4VideoFragmentName(prefix, label, i);
+  const audioFragmentName = (i: number) => fmp4AudioFragmentName(prefix, i);
+
+  if (sink.segmentIndex === 0) {
+    const firstKeyframe = cut.videoChunks[0].data;
+    const initVideo = sink.pipeline.processor.init_segment_video_encoded(sink.width, sink.rendition.height, firstKeyframe) as Uint8Array;
+    await writeOutputFile(sink.pipeline.outputFolderHandle, videoInitName, initVideo);
+    if (sink.isAudioOwner) {
+      const initAudio = sink.pipeline.processor.init_segment_audio_encoded(sink.pipeline.audioSampleRate, sink.pipeline.audioChannels) as Uint8Array;
+      await writeOutputFile(sink.pipeline.outputFolderHandle, audioInitName, initAudio);
+    }
+  }
+
+  const videoData = concatChunks(cut.videoChunks);
+  const videoMeta = cut.videoChunks.map((c) => ({ size: c.data.byteLength, timestampUs: c.timestampUs, isKeyframe: c.isKeyframe }));
+  const fragVideo = sink.pipeline.processor.mux_video_fragment_encoded(videoData, JSON.stringify(videoMeta), sink.segmentIndex) as Uint8Array;
+  await writeOutputFile(sink.pipeline.outputFolderHandle, videoFragmentName(sink.segmentIndex), fragVideo);
+
+  if (sink.isAudioOwner) {
+    const audioData = concatChunks(cut.audioChunks);
+    const audioMeta = cut.audioChunks.map((c) => ({ size: c.data.byteLength, timestampUs: c.timestampUs, isKeyframe: false }));
+    const fragAudio = sink.pipeline.processor.mux_audio_fragment_encoded(
+      audioData,
+      JSON.stringify(audioMeta),
+      sink.segmentIndex,
+      sink.pipeline.audioSampleRate,
+    ) as Uint8Array;
+    await writeOutputFile(sink.pipeline.outputFolderHandle, audioFragmentName(sink.segmentIndex), fragAudio);
+  }
+
+  sink.durations.push((cut.endUs - cut.startUs) / 1_000_000);
+  sink.segmentIndex++;
+
+  const videoPlaylist = buildFmp4MediaPlaylist(sink.durations, videoInitName, videoFragmentName);
+  await writeOutputFile(sink.pipeline.outputFolderHandle, sink.playlistName, videoPlaylist);
+  if (sink.isAudioOwner) {
+    const audioPlaylist = buildFmp4MediaPlaylist(sink.durations, audioInitName, audioFragmentName);
+    await writeOutputFile(sink.pipeline.outputFolderHandle, `${prefix}audio.m3u8`, audioPlaylist);
+  }
 }
 
 /** One source clip (intro, main, or outro) encoded across every selected
@@ -1140,6 +1239,75 @@ async function finalizeAbrResults(
   return { masterM3u8, highestM3u8 };
 }
 
+/** fMP4 counterpart of `finalizeAbrResults`, for adaptive fMP4/DASH output —
+ * intentionally narrower in scope, matching `runFmp4FastPath`'s own single-
+ * quality scope: no intro/outro splicing, no dub-audio, no subtitles (see
+ * the `outputContainer === 'fmp4'` guards in `runTranscoding`), so there's
+ * no per-rendition splicing step here, just one master playlist plus one
+ * DASH manifest describing the fragments `runAbrWebCodecsWithHandle`
+ * already wrote. `results` must include the rendition that ended up as
+ * `isAudioOwner` (see its own comment) — without it there's no audio
+ * track to point either manifest at, so this throws rather than shipping
+ * video-only output silently. */
+async function finalizeAbrFmp4Results(
+  outputFolderHandle: FileSystemDirectoryHandle,
+  results: AbrSourceResult[],
+  renditions: (typeof ABR_LADDER)[number][],
+  processor: InstanceType<WasmModule['HlsProcessor']>,
+): Promise<{ masterM3u8: string; highestM3u8: string }> {
+  if (results.length === 0) {
+    throw new Error('No rendition produced any output.');
+  }
+
+  const audioOwnerRendition = renditions.reduce((best, r) => (r.audioBitrateKbps > best.audioBitrateKbps ? r : best));
+  const audioResult = results.find((r) => r.rendition.label === audioOwnerRendition.label);
+  if (!audioResult) {
+    throw new Error(`${audioOwnerRendition.label} (the rendition carrying the shared audio track) failed to produce any output — no valid audio track exists to ship.`);
+  }
+
+  const streamInfos = results.map((r) => ({ rendition: r.rendition, playlist: `video_${r.rendition.label}.m3u8`, width: r.width }));
+  const masterM3u8 = buildFmp4MultiRenditionMasterM3U8(streamInfos, 'audio.m3u8');
+  await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
+
+  const codecConfig = JSON.parse(processor.codec_config() as unknown as string) as CodecConfig;
+  const videoRepresentations: DashRendition[] = results.map((r) => ({
+    id: `video_${r.rendition.label}`,
+    mimeType: 'video/mp4',
+    codecs: codecConfig.videoCodec,
+    bandwidth: r.rendition.videoBitrateKbps * 1000,
+    width: r.width,
+    height: r.rendition.height,
+    initFilename: fmp4VideoInitName('', r.rendition.label),
+    segmentDurationsSec: durationsFromPlaylist(r.playlistText),
+    mediaTemplate: `frag_video_${r.rendition.label}_$Number%04d$.m4s`,
+  }));
+  const audioDurations = durationsFromPlaylist(audioResult.playlistText);
+  const audioRepresentation: DashRendition = {
+    id: 'audio',
+    mimeType: 'audio/mp4',
+    codecs: codecConfig.audioCodec,
+    bandwidth: audioOwnerRendition.audioBitrateKbps * 1000,
+    audioSamplingRate: codecConfig.audioSampleRate,
+    initFilename: fmp4AudioInitName(''),
+    segmentDurationsSec: audioDurations,
+    mediaTemplate: 'frag_audio_$Number%04d$.m4s',
+  };
+
+  try {
+    const totalDuration = audioDurations.reduce((a, b) => a + b, 0);
+    const dashManifest = buildDashManifest(totalDuration, [...videoRepresentations, audioRepresentation]);
+    await writeOutputFile(outputFolderHandle, 'manifest.mpd', dashManifest);
+  } catch (err) {
+    // Non-fatal — see the same tolerance in runFmp4FastPath.
+    log(`Could not build the DASH manifest: ${err}`, 'ERROR');
+  }
+
+  // Matches `finalizeAbrResults`' own `highestM3u8` semantics: whichever
+  // rendition's own text was produced last, which is the highest quality
+  // one, since callers always pass `results` sorted ascending by height.
+  return { masterM3u8, highestM3u8: results[results.length - 1].playlistText };
+}
+
 /** Adaptive-HLS hardware entry point: encodes the main content across every
  * selected rendition and, when present, intro/outro clips too (each
  * independently — see `runAbrEncodeForSource`), then splices them together
@@ -1208,6 +1376,29 @@ async function runAbrTranscodingWebCodecs(
   post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
 }
 
+/** Adaptive fMP4/DASH hardware entry point — narrower in scope than
+ * `runAbrTranscodingWebCodecs`: no intro/outro, no dub-audio, no subtitles
+ * (all rejected up front by `runTranscoding`'s own `outputContainer ===
+ * 'fmp4'` guard, matching `runFmp4FastPath`'s single-quality scope), and no
+ * FFmpeg fallback either — the FFmpeg ABR path only ever produces MPEG-TS,
+ * so there's nothing for it to fall back to for a container the user
+ * explicitly asked for (`runAdaptiveHls`'s own FFmpeg fallback is only
+ * reachable for '.ts' output, see the dispatch in `runTranscoding`). Just a
+ * thin wrapper around `runAbrEncodeForSource`: `runAbrWebCodecsWithHandle`
+ * already does its own finalizing (master playlist + DASH manifest) and
+ * posts `COMPLETE` itself once `outputContainer === 'fmp4'`, since — unlike
+ * the '.ts' path — there's no intro/outro splicing step left to do
+ * afterward here. */
+async function runAbrTranscodingWebCodecsFmp4(
+  session: import('../types').TranscodingSession,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  renditions: (typeof ABR_LADDER)[number][],
+): Promise<void> {
+  const sourceWidth = session.sourceWidth ?? 0;
+  const sourceHeight = session.sourceHeight ?? 0;
+  await runAbrEncodeForSource(session.sourceFilePath, outputFolderHandle, renditions, sourceWidth, sourceHeight, '', false, 'fmp4');
+}
+
 /** Runs the hardware WebCodecs ABR pipeline for one OPFS-resident source
  * clip. Used for the main content (`segmentPrefix: ''`) and, when present,
  * for intro/outro clips (`segmentPrefix: 'intro_'`/`'outro_'`) — each call
@@ -1221,12 +1412,13 @@ async function runAbrEncodeForSource(
   sourceHeight: number,
   segmentPrefix: string,
   hasDubAudio: boolean,
+  outputContainer: 'ts' | 'fmp4' = 'ts',
 ): Promise<AbrSourceResult[]> {
   const opfsRoot = await navigator.storage.getDirectory();
   const fileHandle = await opfsRoot.getFileHandle(opfsFileName);
   const syncHandle = await fileHandle.createSyncAccessHandle();
   try {
-    return await runAbrWebCodecsWithHandle(syncHandle, outputFolderHandle, renditions, sourceWidth, sourceHeight, segmentPrefix, hasDubAudio);
+    return await runAbrWebCodecsWithHandle(syncHandle, outputFolderHandle, renditions, sourceWidth, sourceHeight, segmentPrefix, hasDubAudio, outputContainer);
   } finally {
     syncHandle.close();
   }
@@ -1240,6 +1432,7 @@ async function runAbrWebCodecsWithHandle(
   sourceHeight: number,
   segmentPrefix: string,
   hasDubAudio: boolean,
+  outputContainer: 'ts' | 'fmp4' = 'ts',
 ): Promise<AbrSourceResult[]> {
   const renditionLabels = renditions.map((r) => r.label).join(', ');
   const logPrefix = segmentPrefix ? `[${segmentPrefix.replace(/_$/, '')}] ` : '';
@@ -1288,11 +1481,22 @@ async function runAbrWebCodecsWithHandle(
     audioChannels: codecConfig.audioChannels,
     segmentPrefix,
     hasDubAudio,
+    outputContainer,
   };
 
   const sinks = renditions.map((r) =>
     createRenditionSink(r, computeRenditionWidth(sourceWidth, sourceHeight, r.height), pipeline),
   );
+
+  if (outputContainer === 'fmp4') {
+    // The highest-bitrate selected rendition's own audio encode becomes the
+    // one shared fMP4 audio stream every rendition's playlist points at (see
+    // `AbrPipelineContext.outputContainer`) — the best quality available
+    // among renditions actually being produced, not a fixed rung that might
+    // not even be selected.
+    const owner = sinks.reduce((best, s) => (s.rendition.audioBitrateKbps > best.rendition.audioBitrateKbps ? s : best));
+    owner.isAudioOwner = true;
+  }
 
   for (const sink of sinks) {
     sink.videoEncoder.configure({
@@ -1609,6 +1813,25 @@ async function runAbrWebCodecsWithHandle(
     // rather than referencing a file that doesn't exist.
     const producedSinks = sinks.filter((s) => s.durations.length > 0);
 
+    if (outputContainer === 'fmp4') {
+      const results = producedSinks.map((s) => ({
+        rendition: s.rendition,
+        width: s.width,
+        playlistText: buildFmp4MediaPlaylist(s.durations, fmp4VideoInitName(segmentPrefix, s.rendition.label), (i) =>
+          fmp4VideoFragmentName(segmentPrefix, s.rendition.label, i),
+        ),
+      }));
+      // Scoped to the main content only (see `runAbrTranscodingWebCodecsFmp4`
+      // — fMP4/DASH ABR has no intro/outro to splice, unlike the '.ts'
+      // branch below), so this is always the whole job's own final result:
+      // safe to build and write the master playlist + DASH manifest right
+      // here, using the `processor`/`codecConfig` already parsed above
+      // rather than re-parsing the source a second time just for this.
+      const { masterM3u8, highestM3u8 } = await finalizeAbrFmp4Results(outputFolderHandle, results, renditions, processor);
+      post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8 });
+      return results;
+    }
+
     return producedSinks.map((s) => ({
       rendition: s.rendition,
       width: s.width,
@@ -1857,15 +2080,14 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
-  // fMP4 output (runFmp4FastPath) only exists for the plain single-quality
-  // case so far — everything else (ABR, edited segments, dub-audio,
-  // subtitles, intro/outro, resume) still only knows how to produce
-  // MPEG-TS. Failing clearly here, before any FFmpeg conversion work below,
-  // beats silently falling back to MPEG-TS for a container the user
-  // explicitly asked for.
+  // fMP4 output (runFmp4FastPath, runAbrTranscodingWebCodecsFmp4) covers the
+  // plain single-quality case and now adaptive HLS/DASH too — everything
+  // else (edited segments, dub-audio, subtitles, intro/outro, resume) still
+  // only knows how to produce MPEG-TS. Failing clearly here, before any
+  // FFmpeg conversion work below, beats silently falling back to MPEG-TS
+  // for a container the user explicitly asked for.
   if (session.outputContainer === 'fmp4') {
     const unsupported: string[] = [];
-    if (session.abrHeights?.length) unsupported.push('adaptive HLS');
     if (editedSegments) unsupported.push('edited (trimmed/split) segments');
     if (session.dubAudioTracks?.length) unsupported.push('dub-audio tracks');
     if (subtitleTags.length > 0) unsupported.push('subtitles');
@@ -1878,6 +2100,24 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
   }
 
   if (session.abrHeights && session.abrHeights.length > 0) {
+    if (session.outputContainer === 'fmp4') {
+      // No FFmpeg fallback exists for adaptive fMP4/DASH (the FFmpeg ABR
+      // path only ever produces MPEG-TS — see runAbrTranscodingWebCodecsFmp4's
+      // own doc comment) and edited segments are already rejected above, so
+      // this is the one remaining thing to check clearly up front rather
+      // than fail deep inside the encode loop.
+      const renditions = [...session.abrHeights]
+        .sort((a, b) => a - b)
+        .map((h) => ABR_LADDER.find((r) => r.height === h))
+        .filter((r): r is (typeof ABR_LADDER)[number] => r !== undefined);
+      const canUseHardware = await canUseWebCodecsAbr(renditions, session.sourceWidth ?? 0, session.sourceHeight ?? 0);
+      if (!canUseHardware) {
+        post({ type: 'ERROR', error: 'Adaptive fMP4/DASH output needs hardware video encoding (WebCodecs), which is not available in this browser — switch back to MPEG-TS or use a browser with WebCodecs support.' });
+        return;
+      }
+      await runAbrTranscodingWebCodecsFmp4(session, outputFolderHandle, renditions);
+      return;
+    }
     if (editedSegments) {
       await runAdaptiveHlsSegmented(session, outputFolderHandle, subtitleTags);
     } else {
