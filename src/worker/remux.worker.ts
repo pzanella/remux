@@ -1933,6 +1933,20 @@ async function writeOutputFile(
   await writable.close();
 }
 
+/** Reads a previously-written output file back as text, or `null` if it
+ * doesn't exist — used by a RESUME job to recover state (e.g. pre-pause
+ * segment durations, see `runWithHandle`) from what's already on disk
+ * rather than from React-side session state, which never actually tracked
+ * it (see the removed `TranscodingSession.segmentDurations` field). */
+async function readOutputFileText(dirHandle: FileSystemDirectoryHandle, filename: string): Promise<string | null> {
+  try {
+    const fh = await dirHandle.getFileHandle(filename);
+    return await (await fh.getFile()).text();
+  } catch {
+    return null;
+  }
+}
+
 async function removeOutputFileQuietly(dirHandle: FileSystemDirectoryHandle, filename: string): Promise<void> {
   try {
     await dirHandle.removeEntry(filename);
@@ -2242,7 +2256,12 @@ async function runWithHandle(
   const EMPTY = new Uint8Array(0);
 
   const startIndex = isResume ? Math.max(0, session.lastSegmentIndex + 1) : 0;
-  const durations = isResume ? [...session.segmentDurations] : [];
+  // Recovers pre-pause segment durations from the media playlist already on
+  // disk, not from React-side session state — the worker is the only thing
+  // that ever actually knows a segment's own duration (see the loop below),
+  // and it's the source of truth for a resumed job the same way it already
+  // is for a fresh one.
+  const durations = isResume ? durationsFromPlaylist((await readOutputFileText(outputFolderHandle, 'index.m3u8')) ?? '') : [];
   let retryCount = 0;
   let totalBytes = 0;
 

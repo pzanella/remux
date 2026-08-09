@@ -120,7 +120,6 @@ export function usePersistence() {
         sourceFileSize,
         lastSegmentIndex: -1,
         totalSegments,
-        segmentDurations: [],
         m3u8Content: '',
         outputFolderHandle,
         createdAt: Date.now(),

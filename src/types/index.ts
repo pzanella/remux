@@ -20,7 +20,6 @@ export interface TranscodingSession {
   /** Index of the last segment successfully written; -1 means none yet. */
   lastSegmentIndex: number;
   totalSegments: number;
-  segmentDurations: number[];
   m3u8Content: string;
   outputFolderHandle: FileSystemDirectoryHandle | null;
   createdAt: number;
