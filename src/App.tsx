@@ -201,6 +201,7 @@ export default function App() {
           outputFolder={t.outputFolder}
           outputMode={t.outputMode}
           outputContainer={t.outputContainer}
+          loudnessNormalization={t.loudnessNormalization}
           logs={t.logs}
           m3u8={t.masterM3u8Preview || t.m3u8Preview}
           introFile={t.introFile}
@@ -211,6 +212,7 @@ export default function App() {
           onSelectFolder={t.selectOutputFolder}
           onSetOutputMode={t.setOutputMode}
           onSetOutputContainer={t.setOutputContainer}
+          onSetLoudnessNormalization={t.setLoudnessNormalization}
           onResume={t.resume}
           onPause={t.pause}
           onCancel={t.cancel}

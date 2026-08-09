@@ -83,6 +83,12 @@ export async function selectFmp4Container(page: Page): Promise<void> {
   await page.getByLabel('Fragmented MP4 (experimental)').check();
 }
 
+/** Enables EBU R128 loudness normalization on the export review screen —
+ * see `runExport`'s `beforeStart`. */
+export async function enableLoudnessNormalization(page: Page): Promise<void> {
+  await page.getByLabel('Normalize loudness (EBU R128)').check();
+}
+
 export async function getLogText(page: Page): Promise<string> {
   const logTab = page.locator('.tab-btn', { hasText: 'Log' });
   await logTab.click();

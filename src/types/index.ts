@@ -17,6 +17,16 @@ export interface TranscodingSession {
    * `runTranscoding`.
    */
   outputContainer?: 'ts' | 'fmp4';
+  /**
+   * When true, the main content's audio is run through an EBU R128 loudness
+   * normalization pass (FFmpeg's two-pass `loudnorm` filter, I=-23:TP=-1:LRA=7
+   * — the broadcast target, not a streaming-platform one) before anything
+   * else touches it. Scoped to the main content only — intro/outro and
+   * dub-audio tracks are left as-is, matching how other main-content-only
+   * features on this roadmap started (see fMP4's own single-quality-first
+   * scope). Video is always stream-copied during this pass, never re-encoded.
+   */
+  loudnessNormalization?: boolean;
   /** Index of the last segment successfully written; -1 means none yet. */
   lastSegmentIndex: number;
   totalSegments: number;

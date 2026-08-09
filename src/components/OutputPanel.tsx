@@ -2,20 +2,24 @@ interface OutputPanelProps {
   outputFolder: FileSystemDirectoryHandle | null;
   outputMode: 'opfs' | 'folder';
   outputContainer: 'ts' | 'fmp4';
+  loudnessNormalization: boolean;
   disabled: boolean;
   onSelectFolder: () => void;
   onSetOutputMode: (mode: 'opfs' | 'folder') => void;
   onSetOutputContainer: (container: 'ts' | 'fmp4') => void;
+  onSetLoudnessNormalization: (enabled: boolean) => void;
 }
 
 export default function OutputPanel({
   outputFolder,
   outputMode,
   outputContainer,
+  loudnessNormalization,
   disabled,
   onSelectFolder,
   onSetOutputMode,
   onSetOutputContainer,
+  onSetLoudnessNormalization,
 }: OutputPanelProps) {
   return (
     <div className="panel">
@@ -81,6 +85,21 @@ export default function OutputPanel({
         <p className="panel-hint">
           Single-quality only — no adaptive HLS, edited segments, subtitles, dub-audio, or intro/outro yet.
         </p>
+      )}
+
+      <div className="checkbox-grid">
+        <label className={`checkbox-row${disabled ? ' is-disabled' : ''}`}>
+          <input
+            type="checkbox"
+            checked={loudnessNormalization}
+            disabled={disabled}
+            onChange={(e) => onSetLoudnessNormalization(e.target.checked)}
+          />
+          Normalize loudness (EBU R128)
+        </label>
+      </div>
+      {loudnessNormalization && (
+        <p className="panel-hint">Main content audio only — intro/outro and dub-audio tracks are left as-is.</p>
       )}
     </div>
   );

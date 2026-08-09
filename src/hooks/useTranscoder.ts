@@ -69,6 +69,9 @@ export function useTranscoder() {
    * rather than this hook trying to pre-emptively cross-disable every
    * combination across several unrelated components. */
   const [outputContainer, setOutputContainer] = useState<'ts' | 'fmp4'>('ts');
+  /** EBU R128 loudness normalization for the main content's audio — see
+   * `TranscodingSession.loudnessNormalization`. */
+  const [loudnessNormalization, setLoudnessNormalization] = useState(false);
   const [sourceResolution, setSourceResolution] = useState<{ width: number; height: number } | null>(null);
   const [sourceDuration, setSourceDuration] = useState<number | undefined>(undefined);
   /** Kept only for the timeline's raw (pre-conversion) clip preview — never
@@ -422,6 +425,7 @@ export function useTranscoder() {
       dubAudioTracks: dubAudioTracks.length > 0 ? dubAudioTracks : undefined,
       segments: editorSegments,
       outputContainer,
+      loudnessNormalization,
     };
     setSession(sessionWithExtras);
 
@@ -451,7 +455,7 @@ export function useTranscoder() {
       setStatus('error');
       addLog(`Could not talk to the worker: ${err}`, 'error');
     }
-  }, [session, outputFolder, outputMode, outputContainer, abrEnabled, abrHeights, subtitleTracks, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
+  }, [session, outputFolder, outputMode, outputContainer, loudnessNormalization, abrEnabled, abrHeights, subtitleTracks, introFile, outroFile, dubAudioTracks, addLog, spawnWorker]);
 
   const resume = useCallback(async () => {
     const src = resumableSession ?? session;
@@ -590,6 +594,7 @@ export function useTranscoder() {
     outputFolder,
     outputMode,
     outputContainer,
+    loudnessNormalization,
     uploadProgress,
     convertProgress,
     segmentProgress,
@@ -613,6 +618,7 @@ export function useTranscoder() {
     selectOutputFolder,
     setOutputMode,
     setOutputContainer,
+    setLoudnessNormalization,
     selectSubtitleFile,
     addBlankSubtitleTrack,
     saveSubtitleEdits,

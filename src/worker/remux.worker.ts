@@ -221,6 +221,122 @@ async function convertAudioToM4a(sourceOpfsName: string, originalFileName: strin
   return outputOpfsName;
 }
 
+// ── Loudness normalization (EBU R128) ──────────────────────────────
+//
+// I=-23 LUFS / TP=-1 dBTP / LRA=7 LU are the EBU R128 broadcast targets
+// (not the louder ~-14 LUFS streaming-platform convention) — this project's
+// roadmap calls out EBU R128 by name, not "loud enough for YouTube".
+
+const LOUDNORM_TARGETS = 'I=-23:TP=-1:LRA=7';
+
+interface LoudnormMeasurement {
+  input_i: string;
+  input_tp: string;
+  input_lra: string;
+  input_thresh: string;
+  target_offset: string;
+}
+
+/** Runs FFmpeg's `loudnorm` filter once, audio-only (`-vn`, so there's no
+ * video to decode at all), to measure the source's actual loudness stats —
+ * the first half of the filter's own documented two-pass recipe, needed for
+ * a sample-accurate correction rather than the filter's less accurate
+ * single-pass "dynamic" mode. The stats come back as a JSON object the
+ * filter prints to stderr (`print_format=json`), captured the same way this
+ * file already captures FFmpeg's log output for error reporting (see the
+ * SRT→VTT conversion in `resolveSubtitleTracks`). */
+async function measureLoudness(ffmpeg: InstanceType<FFmpegModule['FFmpeg']>, inputName: string): Promise<LoudnormMeasurement> {
+  const lines: string[] = [];
+  const onLog = ({ message }: { message: string }) => lines.push(message);
+  ffmpeg.on('log', onLog);
+  try {
+    const code = await ffmpeg.exec(['-i', inputName, '-vn', '-af', `loudnorm=${LOUDNORM_TARGETS}:print_format=json`, '-f', 'null', '-']);
+    if (code !== 0) {
+      throw new Error(`FFmpeg exited with code ${code}: ${lines.slice(-10).join(' / ')}`);
+    }
+  } finally {
+    ffmpeg.off('log', onLog);
+  }
+  // The filter's own JSON block has no nested braces, so the last
+  // "{...}" span in the combined log text is unambiguously it — nothing
+  // else FFmpeg prints at this verbosity is brace-delimited.
+  const matches = lines.join('\n').match(/\{[^{}]*\}/g);
+  if (!matches) {
+    throw new Error(`Could not find loudnorm's measurement output: ${lines.slice(-10).join(' / ')}`);
+  }
+  return JSON.parse(matches[matches.length - 1]) as LoudnormMeasurement;
+}
+
+/**
+ * EBU R128 loudness normalization for one source file's main audio —
+ * two-pass (measure, then apply with `linear=true` using those exact
+ * measured values), the accurate form of FFmpeg's `loudnorm` filter rather
+ * than its single-pass real-time approximation. Video is always
+ * stream-copied (`-c:v copy`) in both passes — this never re-encodes video,
+ * only ever touches audio, so it's cheap even for a long source. Reads from
+ * OPFS, writes the result back to OPFS, and returns the new OPFS filename,
+ * matching `convertToMp4`'s own contract so callers can treat this as just
+ * another pre-processing step ahead of it.
+ */
+async function normalizeLoudness(sourceOpfsName: string, originalFileName: string): Promise<string> {
+  post({ type: 'CONVERTING', log: 'Measuring loudness…', convertProgress: 0 });
+
+  const { FFmpeg } = await loadFFmpegModule();
+  const { fetchFile } = await import('@ffmpeg/util');
+
+  const ffmpeg = new FFmpeg();
+  await loadFFmpegCore(ffmpeg);
+
+  const opfsRoot = await navigator.storage.getDirectory();
+  const srcHandle = await opfsRoot.getFileHandle(sourceOpfsName);
+  const srcFile: File = await srcHandle.getFile();
+
+  const ext = originalFileName.includes('.') ? originalFileName.slice(originalFileName.lastIndexOf('.')) : '.video';
+  const inputName = `input${ext}`;
+  await ffmpeg.writeFile(inputName, await fetchFile(srcFile));
+
+  const measured = await measureLoudness(ffmpeg, inputName);
+
+  post({ type: 'CONVERTING', log: 'Applying loudness normalization…', convertProgress: 40 });
+  ffmpeg.on('progress', ({ progress }) => {
+    const pct = Math.round(Math.min(Math.max(progress, 0), 1) * 55) + 40; // map 0-1 to 40-95
+    post({ type: 'CONVERTING', log: `Applying loudness normalization… ${pct}%`, convertProgress: pct });
+  });
+
+  const outputName = 'output.mp4';
+  const applyFilter =
+    `loudnorm=${LOUDNORM_TARGETS}:` +
+    `measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:` +
+    `measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}:linear=true:print_format=summary`;
+  const applyLines: string[] = [];
+  const onApplyLog = ({ message }: { message: string }) => applyLines.push(message);
+  ffmpeg.on('log', onApplyLog);
+  let applyCode: number;
+  try {
+    applyCode = await ffmpeg.exec(['-i', inputName, '-c:v', 'copy', '-af', applyFilter, '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-y', outputName]);
+  } finally {
+    ffmpeg.off('log', onApplyLog);
+  }
+  if (applyCode !== 0) {
+    ffmpeg.terminate();
+    throw new Error(`FFmpeg exited with code ${applyCode}: ${applyLines.slice(-10).join(' / ')}`);
+  }
+
+  const outputData = (await ffmpeg.readFile(outputName)) as Uint8Array;
+  const outputOpfsName = `normalized_${Date.now()}_output.mp4`;
+  const outHandle = await opfsRoot.getFileHandle(outputOpfsName, { create: true });
+  const writable = await outHandle.createWritable();
+  await writable.write(outputData.buffer.slice(0) as ArrayBuffer);
+  await writable.close();
+
+  await ffmpeg.deleteFile(inputName);
+  await ffmpeg.deleteFile(outputName);
+  ffmpeg.terminate();
+
+  post({ type: 'CONVERTING', log: 'Loudness normalization done.', convertProgress: 100 });
+  return outputOpfsName;
+}
+
 interface RenditionResult {
   rendition: (typeof ABR_LADDER)[number];
   playlist: string;
@@ -2058,12 +2174,33 @@ async function resolveOutputFolderHandle(cmd: WorkerCommand): Promise<FileSystem
 }
 
 async function runTranscoding(cmd: WorkerCommand): Promise<void> {
-  const { session } = cmd;
+  let { session } = cmd;
   const outputFolderHandle = await resolveOutputFolderHandle(cmd);
 
   if (!outputFolderHandle) {
     post({ type: 'ERROR', error: 'No output folder selected.' });
     return;
+  }
+
+  // Runs before anything else touches the source — every downstream path
+  // (fast remux, ABR, segmented) reads session.sourceFilePath, so doing
+  // this once here up front reaches all of them with no path-specific
+  // wiring. Re-derives a fresh normalized copy on every call, including a
+  // RESUME, the same way the non-native-container conversion below already
+  // does — session state round-tripped through React/IndexedDB never
+  // tracks a worker-local path swap like this (see runWithHandle's own
+  // durationsFromPlaylist recovery for the same reason). sourceFileName is
+  // also updated to a plain ".mp4" name so the native-container check below
+  // doesn't force a redundant second FFmpeg pass for a source that was
+  // already re-packaged into native MP4 here.
+  if (session.loudnessNormalization) {
+    try {
+      const normalizedOpfsName = await normalizeLoudness(session.sourceFilePath, session.sourceFileName);
+      session = { ...session, sourceFilePath: normalizedOpfsName, sourceFileName: 'normalized.mp4' };
+    } catch (err) {
+      post({ type: 'ERROR', error: `Loudness normalization failed: ${err}` });
+      return;
+    }
   }
 
   const subtitleTags = await resolveSubtitleTracks(session, outputFolderHandle);

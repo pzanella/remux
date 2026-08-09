@@ -60,6 +60,13 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
   from that same strip; each shipped as its own `#EXT-X-MEDIA:TYPE=AUDIO`
   rendition alongside the original, switchable from the player's own audio
   menu.
+- **Loudness normalization (EBU R128)** — an optional toggle on the export
+  screen runs the main content's audio through FFmpeg's two-pass `loudnorm`
+  filter (I=-23 LUFS, TP=-1 dBTP, LRA=7 LU — the broadcast targets, not the
+  louder streaming-platform convention) before anything else touches it.
+  Video is always stream-copied, never re-encoded, so this costs nothing in
+  quality or, for an already-native H.264 source, much time. Scoped to the
+  main content only — intro/outro and dub-audio tracks are left as-is.
 - **Shaka Player result** — the final HLS output plays through
   [Shaka Player](https://github.com/shaka-project/shaka-player), with its
   stock quality/track selection UI, reading segments straight from disk (or

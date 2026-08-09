@@ -18,6 +18,7 @@ interface ExportModalProps {
   outputFolder: FileSystemDirectoryHandle | null;
   outputMode: 'opfs' | 'folder';
   outputContainer: 'ts' | 'fmp4';
+  loudnessNormalization: boolean;
   logs: LogEntry[];
   m3u8: string;
   introFile: ClipFile | null;
@@ -28,6 +29,7 @@ interface ExportModalProps {
   onSelectFolder: () => void;
   onSetOutputMode: (mode: 'opfs' | 'folder') => void;
   onSetOutputContainer: (container: 'ts' | 'fmp4') => void;
+  onSetLoudnessNormalization: (enabled: boolean) => void;
   onResume: () => void;
   onPause: () => void;
   onCancel: () => void;
@@ -63,6 +65,7 @@ export default function ExportModal({
   outputFolder,
   outputMode,
   outputContainer,
+  loudnessNormalization,
   logs,
   m3u8,
   introFile,
@@ -73,6 +76,7 @@ export default function ExportModal({
   onSelectFolder,
   onSetOutputMode,
   onSetOutputContainer,
+  onSetLoudnessNormalization,
   onResume,
   onPause,
   onCancel,
@@ -113,10 +117,12 @@ export default function ExportModal({
             outputFolder={outputFolder}
             outputMode={outputMode}
             outputContainer={outputContainer}
+            loudnessNormalization={loudnessNormalization}
             disabled={isRunning}
             onSelectFolder={onSelectFolder}
             onSetOutputMode={onSetOutputMode}
             onSetOutputContainer={onSetOutputContainer}
+            onSetLoudnessNormalization={onSetLoudnessNormalization}
           />
         )}
 
