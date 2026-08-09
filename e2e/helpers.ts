@@ -36,6 +36,16 @@ export async function attachOutro(page: Page, fixtureName: string): Promise<void
   await page.locator('.extras-row input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
 }
 
+/** Attaches a dub-audio track via the persistent intro/outro/dub-audio strip
+ * — selected by its own distinct `accept` attribute (see MediaExtrasPanel's
+ * `DUB_AUDIO_ACCEPT`) rather than position, since unlike intro/outro this
+ * file input never moves regardless of how many dub tracks are already
+ * attached. */
+export async function attachDubAudio(page: Page, fixtureName: string): Promise<void> {
+  await expandExtrasStrip(page);
+  await page.locator('.extras-row input[type="file"][accept*=".m4a"]').setInputFiles(path.join(FIXTURES, fixtureName));
+}
+
 /** Attaches a subtitle track via the persistent caption lane below the
  * preview — works whether or not a track is already attached (the "+ Add
  * captions" empty-state input and the "+ Add track" footer input share the
