@@ -10,7 +10,7 @@
 //! project's own test fixtures, inspected with `mp4dump`) rather than only
 //! against the spec text — the two independently confirm the same layout.
 
-use crate::{SampleInfo, TrackData};
+use crate::{EncodedChunkMeta, SampleInfo, TrackData};
 
 // ── Box-writing primitives ──────────────────────────────────────
 
@@ -455,10 +455,181 @@ pub fn fragment_audio(sequence_number: u32, samples: &[SampleInfo], sample_data:
     fragment(sequence_number, 2, samples, sample_data)
 }
 
+// ── Encoded (WebCodecs) samples → fMP4 ────────────────────────────
+//
+// The public API above assumes an already-parsed source track (`TrackData`,
+// with its avcC/AAC config already known). The ABR encode path instead
+// produces raw WebCodecs output — Annex-B video chunks with SPS/PPS repeated
+// inline, no separate config — so it needs its own translation into the same
+// AVCC/avcC shape before it can reach `init_segment_*`/`fragment_*` at all.
+
+/// Finds every Annex-B start code (`00 00 01` or `00 00 00 01`) in `data`,
+/// returned as `(code_start, content_start)` pairs. Greedily absorbs *every*
+/// leading zero before the `01`, not just enough to make a 3- or 4-byte code
+/// — H.264's own `trailing_zero_8bits` RBSP padding is byte-identical to an
+/// extra leading zero on the next start code, an ambiguity real decoders
+/// (e.g. FFmpeg's own Annex-B scanner) resolve the same way.
+fn annexb_start_codes(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let mut code_start = i;
+            while code_start > 0 && data[code_start - 1] == 0 {
+                code_start -= 1;
+            }
+            out.push((code_start, i + 3));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+struct AnnexbNalus {
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    sample_avcc: Vec<u8>,
+}
+
+/// Splits one Annex-B access unit into its SPS/PPS (if present — only a
+/// keyframe carries them) and the rest of its NALUs re-framed as AVCC
+/// (length-prefixed), with the access unit delimiter (type 9) dropped
+/// entirely since it carries no information this format needs.
+fn split_annexb(data: &[u8]) -> AnnexbNalus {
+    let starts = annexb_start_codes(data);
+    let mut sps = None;
+    let mut pps = None;
+    let mut sample_avcc = Vec::with_capacity(data.len());
+    for (i, &(_, content_start)) in starts.iter().enumerate() {
+        let nalu_end = starts.get(i + 1).map(|&(code_start, _)| code_start).unwrap_or(data.len());
+        if content_start >= nalu_end {
+            continue;
+        }
+        let nalu = &data[content_start..nalu_end];
+        match nalu[0] & 0x1F {
+            7 => sps = Some(nalu.to_vec()),
+            8 => pps = Some(nalu.to_vec()),
+            9 => {}
+            _ => {
+                sample_avcc.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+                sample_avcc.extend_from_slice(nalu);
+            }
+        }
+    }
+    AnnexbNalus { sps, pps, sample_avcc }
+}
+
+/// Builds an avcC config record from a keyframe's own SPS/PPS — the encoded
+/// path's only source of this, since WebCodecs never hands back a config
+/// record directly for `avc: { format: 'annexb' }` output.
+fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(11 + sps.len() + pps.len());
+    out.push(1);
+    out.push(sps.get(1).copied().unwrap_or(0x42));
+    out.push(sps.get(2).copied().unwrap_or(0));
+    out.push(sps.get(3).copied().unwrap_or(0x1e));
+    out.push(0xFF);
+    out.push(0xE1);
+    out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.push(1);
+    out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    out.extend_from_slice(pps);
+    out
+}
+
+fn synthetic_track_data(timescale: u32, avcc_raw: Vec<u8>, aac_config: [u8; 3]) -> TrackData {
+    TrackData {
+        timescale,
+        handler: *b"    ",
+        samples: vec![],
+        annexb_header: vec![],
+        nalu_len_size: 4,
+        aac_config,
+        avc1_profile: None,
+        avcc_raw,
+        edit_list_end: None,
+        video_codec_fourcc: None,
+    }
+}
+
+/// Converts WebCodecs' own per-chunk metadata (size + timestamp + keyframe
+/// flag) into this project's `SampleInfo` shape. `pts == dts` always here —
+/// unlike the FFmpeg ABR path, the encoded pipeline never reorders frames
+/// (see `mux_encoded_segment_inner`'s PES headers), so there's no B-frame
+/// case to account for. A sample's duration is the gap to the *next* sample's
+/// timestamp; the last sample has none to measure from, so it reuses the
+/// previous gap instead of reporting zero.
+fn encoded_chunks_to_samples(meta: &[EncodedChunkMeta], timescale: u32) -> Vec<SampleInfo> {
+    let ticks: Vec<u64> = meta.iter().map(|m| (m.timestamp_us * timescale as f64 / 1_000_000.0).round() as u64).collect();
+    ticks
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let duration = if i + 1 < ticks.len() {
+                ticks[i + 1].saturating_sub(t) as u32
+            } else if i > 0 {
+                t.saturating_sub(ticks[i - 1]) as u32
+            } else {
+                0
+            };
+            SampleInfo { file_offset: 0, size: 0, pts: t, dts: t, duration, is_keyframe: meta[i].is_keyframe }
+        })
+        .collect()
+}
+
+pub(crate) fn init_segment_video_encoded_inner(width: u16, height: u16, first_keyframe_annexb: &[u8]) -> Result<Vec<u8>, String> {
+    let parsed = split_annexb(first_keyframe_annexb);
+    let (sps, pps) = match (parsed.sps, parsed.pps) {
+        (Some(sps), Some(pps)) => (sps, pps),
+        _ => return Err("No SPS/PPS found in the first keyframe".to_string()),
+    };
+    let track = synthetic_track_data(1_000_000, build_avcc(&sps, &pps), [0, 0, 0]);
+    Ok(init_segment_video(&track, width, height))
+}
+
+pub(crate) fn init_segment_audio_encoded_inner(sample_rate: u32, channels: u8) -> Vec<u8> {
+    let track = synthetic_track_data(sample_rate, vec![], [2, crate::sample_rate_to_idx(sample_rate), channels]);
+    init_segment_audio(&track)
+}
+
+pub(crate) fn mux_video_fragment_encoded_inner(video_data: &[u8], video_meta_json: &str, sequence_number: u32) -> Result<Vec<u8>, String> {
+    let meta: Vec<EncodedChunkMeta> = serde_json::from_str(video_meta_json).map_err(|e| format!("bad video_meta_json: {e}"))?;
+    let mut sample_data = Vec::with_capacity(video_data.len());
+    let mut sizes = Vec::with_capacity(meta.len());
+    let mut offset = 0usize;
+    for m in &meta {
+        let end = offset + m.size as usize;
+        if end > video_data.len() {
+            return Err("video_meta_json sizes exceed video_data length".to_string());
+        }
+        let converted = split_annexb(&video_data[offset..end]).sample_avcc;
+        sizes.push(converted.len() as u32);
+        sample_data.extend_from_slice(&converted);
+        offset = end;
+    }
+    let mut samples = encoded_chunks_to_samples(&meta, 1_000_000);
+    for (s, size) in samples.iter_mut().zip(sizes) {
+        s.size = size;
+    }
+    Ok(fragment_video(sequence_number, &samples, &sample_data))
+}
+
+pub(crate) fn mux_audio_fragment_encoded_inner(audio_data: &[u8], audio_meta_json: &str, sequence_number: u32, sample_rate: u32) -> Result<Vec<u8>, String> {
+    let meta: Vec<EncodedChunkMeta> = serde_json::from_str(audio_meta_json).map_err(|e| format!("bad audio_meta_json: {e}"))?;
+    let mut samples = encoded_chunks_to_samples(&meta, sample_rate);
+    for (s, m) in samples.iter_mut().zip(&meta) {
+        s.size = m.size;
+    }
+    Ok(fragment_audio(sequence_number, &samples, audio_data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{find_all_boxes, find_box, find_box_in_stsd_entries, find_box_path, u16be, u32be, u64be};
+    use crate::{find_all_boxes, find_box, find_box_in_stsd_entries, find_box_path, u16be, u32be, u64be, parse_avcc_header, HlsProcessor};
 
     // avc1's SampleEntry+VisualSampleEntry fixed header (78 bytes) and
     // mp4a's SampleEntry+AudioSampleEntry fixed header (28 bytes) — the
@@ -775,5 +946,218 @@ mod tests {
         assert_eq!(u32be(trun, 4), 0);
         let mdat = find_box(&frag, b"mdat").expect("mdat");
         assert!(mdat.is_empty());
+    }
+
+    // Real SPS/PPS bytes (no start code) from an actual libx264-encoded
+    // Annex-B stream (`ffmpeg -c:v libx264 ... -bsf:v h264_mp4toannexb -f
+    // h264`) — not synthetic, so build_avcc/split_annexb are exercised
+    // against the same shape of data WebCodecs' own `avc: {format:
+    // 'annexb'}` output actually has.
+    const REAL_SPS: [u8; 25] = [
+        0x67, 0x64, 0x00, 0x1e, 0xac, 0xd9, 0x41, 0x41, 0xfb, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20,
+        0xf1, 0x62, 0xd9, 0x60,
+    ];
+    const REAL_PPS: [u8; 6] = [0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+
+    fn annexb_keyframe(slice_nalu: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nalu in [&REAL_SPS[..], &REAL_PPS[..], &[0x09, 0xf0], slice_nalu] {
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            out.extend_from_slice(nalu);
+        }
+        out
+    }
+
+    #[test]
+    fn annexb_start_codes_finds_both_3_and_4_byte_forms() {
+        // 3-byte code at [0,3), 4-byte code at [5,9).
+        let data = [0x00, 0x00, 0x01, 0xAA, 0xBB, 0x00, 0x00, 0x00, 0x01, 0xCC];
+        assert_eq!(annexb_start_codes(&data), vec![(0, 3), (5, 9)]);
+    }
+
+    #[test]
+    fn annexb_start_codes_greedily_absorbs_every_leading_zero_before_01() {
+        // A run of 3 leading zeros (one more than a plain 4-byte code
+        // has) still resolves to a single start code spanning all of
+        // them, not a stray extra zero byte left dangling as if it were
+        // the previous NALU's own content.
+        let data = [0xAA, 0x00, 0x00, 0x00, 0x01, 0xBB];
+        assert_eq!(annexb_start_codes(&data), vec![(1, 5)]);
+    }
+
+    #[test]
+    fn split_annexb_extracts_real_sps_and_pps_from_a_keyframe() {
+        let slice = [0x65u8, 0x88, 0x84, 0x00]; // NAL type 5 (IDR slice), arbitrary payload
+        let data = annexb_keyframe(&slice);
+        let parsed = split_annexb(&data);
+        assert_eq!(parsed.sps.as_deref(), Some(&REAL_SPS[..]));
+        assert_eq!(parsed.pps.as_deref(), Some(&REAL_PPS[..]));
+    }
+
+    #[test]
+    fn split_annexb_drops_the_access_unit_delimiter_but_keeps_the_slice() {
+        let slice = [0x65u8, 0x88, 0x84, 0x00];
+        let data = annexb_keyframe(&slice);
+        let parsed = split_annexb(&data);
+        // sample_avcc should be exactly one length-prefixed NALU (the
+        // slice) — the AUD (type 9) must not appear in it at all.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(slice.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&slice);
+        assert_eq!(parsed.sample_avcc, expected);
+    }
+
+    #[test]
+    fn split_annexb_non_keyframe_has_no_sps_pps_and_keeps_sei_and_slice() {
+        // A non-keyframe: no SPS/PPS/AUD, just an SEI (type 6) then a
+        // non-IDR slice (type 1) — both should end up in sample_avcc,
+        // length-prefixed, in order (SEI is allowed inline in a real AVCC
+        // sample; only SPS/PPS/AUD get pulled out).
+        let sei = [0x06u8, 0x05, 0xff];
+        let slice = [0x41u8, 0x9a, 0x24];
+        let mut data = Vec::new();
+        for nalu in [&sei[..], &slice[..]] {
+            data.extend_from_slice(&[0x00, 0x00, 0x01]);
+            data.extend_from_slice(nalu);
+        }
+        let parsed = split_annexb(&data);
+        assert!(parsed.sps.is_none());
+        assert!(parsed.pps.is_none());
+        let mut expected = Vec::new();
+        for nalu in [&sei[..], &slice[..]] {
+            expected.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+            expected.extend_from_slice(nalu);
+        }
+        assert_eq!(parsed.sample_avcc, expected);
+    }
+
+    #[test]
+    fn build_avcc_round_trips_through_the_project_own_avcc_parser() {
+        // The strongest available correctness check: build an avcC from
+        // real SPS/PPS, then feed it to the *reader* this project already
+        // trusts (parse_avcc_header, used on every real parsed source
+        // file) and confirm it reconstructs the exact same NALUs and
+        // profile — two independently-written functions agreeing, not
+        // just one asserting on its own output shape.
+        let avcc = build_avcc(&REAL_SPS, &REAL_PPS);
+        let (annexb_header, nalu_len_size, profile) = parse_avcc_header(&avcc);
+        assert_eq!(nalu_len_size, 4);
+        assert_eq!(profile, Some([REAL_SPS[1], REAL_SPS[2], REAL_SPS[3]]));
+        let mut expected_header = Vec::new();
+        expected_header.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected_header.extend_from_slice(&REAL_SPS);
+        expected_header.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected_header.extend_from_slice(&REAL_PPS);
+        assert_eq!(annexb_header, expected_header);
+    }
+
+    #[test]
+    fn encoded_chunks_to_samples_duration_is_gap_to_next_timestamp() {
+        let meta = vec![
+            EncodedChunkMeta { size: 100, timestamp_us: 0.0, is_keyframe: true },
+            EncodedChunkMeta { size: 50, timestamp_us: 40_000.0, is_keyframe: false },
+            EncodedChunkMeta { size: 40, timestamp_us: 80_000.0, is_keyframe: false },
+        ];
+        let samples = encoded_chunks_to_samples(&meta, 1_000_000);
+        assert_eq!(samples[0].duration, 40_000);
+        assert_eq!(samples[1].duration, 40_000);
+        // Last sample has no "next" timestamp to measure from -- reuses
+        // the previous gap rather than reporting 0.
+        assert_eq!(samples[2].duration, 40_000);
+        assert_eq!(samples[1].pts, samples[1].dts);
+    }
+
+    #[test]
+    fn encoded_chunks_to_samples_single_chunk_has_zero_duration() {
+        let meta = vec![EncodedChunkMeta { size: 100, timestamp_us: 0.0, is_keyframe: true }];
+        let samples = encoded_chunks_to_samples(&meta, 1_000_000);
+        assert_eq!(samples[0].duration, 0);
+    }
+
+    #[test]
+    fn encoded_chunks_to_samples_converts_timestamp_into_the_given_timescale() {
+        // 20ms at a 44100 Hz timescale should land on a real sample-tick
+        // boundary (882 samples), not a truncated/rounded-away value.
+        let meta = vec![
+            EncodedChunkMeta { size: 10, timestamp_us: 0.0, is_keyframe: true },
+            EncodedChunkMeta { size: 10, timestamp_us: 20_000.0, is_keyframe: true },
+        ];
+        let samples = encoded_chunks_to_samples(&meta, 44_100);
+        assert_eq!(samples[1].pts, 882);
+    }
+
+    #[test]
+    fn init_segment_video_encoded_builds_avcc_from_the_first_keyframe() {
+        let processor = HlsProcessor::new();
+        let keyframe = annexb_keyframe(&[0x65, 0x88, 0x84, 0x00]);
+        let seg = processor.init_segment_video_encoded(320, 240, &keyframe).expect("init segment");
+        let stbl = find_box_path(&seg, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]).expect("stbl");
+        // avc1's own SampleEntry+VisualSampleEntry fixed header (78 bytes) —
+        // find_box_path can't reach into it directly, since stsd's entry
+        // list has its own version+flags+entry_count prefix ahead of the
+        // sample entry box (see AVC1_HEADER_LEN above, defined in this same
+        // module for the un-encoded init-segment tests).
+        let avcc = find_box_in_stsd_entries(stbl, AVC1_HEADER_LEN, b"avcC").expect("avcC");
+        // avcC's own SPS/PPS should match what a real reader (parse_avcc_header)
+        // pulls back out — same technique as the direct unit test above,
+        // now through the full wasm-bindgen-facing method.
+        let (annexb_header, ..) = parse_avcc_header(avcc);
+        assert!(annexb_header.windows(REAL_SPS.len()).any(|w| w == REAL_SPS));
+    }
+
+    #[test]
+    fn init_segment_video_encoded_errors_without_sps_or_pps() {
+        // Through the plain-Rust-error _inner function directly, not the
+        // wasm-bindgen-wrapped method: constructing a real JsValue needs
+        // the JS-interop runtime, which panics under a native `cargo
+        // test` — see init_segment_video_encoded_inner's own doc comment.
+        let no_params = [0x00, 0x00, 0x00, 0x01, 0x65, 0x88]; // just a slice NALU, no SPS/PPS
+        assert!(init_segment_video_encoded_inner(320, 240, &no_params).is_err());
+    }
+
+    #[test]
+    fn init_segment_audio_encoded_mdhd_timescale_is_the_sample_rate() {
+        let processor = HlsProcessor::new();
+        let seg = processor.init_segment_audio_encoded(48_000, 2);
+        let mdhd = find_box_path(&seg, &[b"moov", b"trak", b"mdia", b"mdhd"]).expect("mdhd");
+        assert_eq!(u32be(mdhd, 4 + 8), 48_000);
+    }
+
+    #[test]
+    fn mux_video_fragment_encoded_strips_sps_pps_and_shrinks_sample_size() {
+        let processor = HlsProcessor::new();
+        let slice = [0x65u8, 0x88, 0x84, 0x00];
+        let keyframe = annexb_keyframe(&slice);
+        let meta_json = format!(r#"[{{"size":{},"timestampUs":0,"isKeyframe":true}}]"#, keyframe.len());
+        let frag = processor.mux_video_fragment_encoded(&keyframe, &meta_json, 1).expect("fragment");
+
+        let mdat = find_box(&frag, b"mdat").expect("mdat");
+        // mdat should be just the one length-prefixed slice NALU, not the
+        // whole (much larger) Annex-B keyframe with SPS/PPS/AUD still in it.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(slice.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&slice);
+        assert_eq!(mdat, expected.as_slice());
+
+        let trun = find_box_path(&frag, &[b"moof", b"traf", b"trun"]).expect("trun");
+        let sample_size = u32be(trun, 12 + 4); // version+flags(4)+sample_count(4)+data_offset(4), then duration(4), then size
+        assert_eq!(sample_size, expected.len() as u32);
+    }
+
+    #[test]
+    fn mux_audio_fragment_encoded_passes_sample_bytes_through_unchanged() {
+        let processor = HlsProcessor::new();
+        let audio_data = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+        let meta_json = r#"[{"size":5,"timestampUs":0,"isKeyframe":true}]"#;
+        let frag = processor.mux_audio_fragment_encoded(&audio_data, meta_json, 1, 44_100).expect("fragment");
+        let mdat = find_box(&frag, b"mdat").expect("mdat");
+        assert_eq!(mdat, &audio_data[..]);
+    }
+
+    #[test]
+    fn mux_video_fragment_encoded_rejects_meta_sizes_past_the_data_end() {
+        let data = [0u8; 4];
+        let meta_json = r#"[{"size":100,"timestampUs":0,"isKeyframe":true}]"#;
+        assert!(mux_video_fragment_encoded_inner(&data, meta_json, 1).is_err());
     }
 }
