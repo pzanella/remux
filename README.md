@@ -367,15 +367,24 @@ same segment data `mux_segment` already reads — video and audio always as
 separate init segments/fragments, not a combined one, so a fragment stream
 can be shared across renditions the same way this project's dub-audio
 tracks already share one audio-only rendition across every video quality.
-The app itself now uses this too: the export screen's "Fragmented MP4
+A WebCodecs-encoded (Annex-B) rendition gets the same treatment through
+`init_segment_video_encoded`/`init_segment_audio_encoded` and
+`mux_video_fragment_encoded`/`mux_audio_fragment_encoded` instead — same
+box shapes, built from re-encoded chunks rather than bytes read straight
+from a source file.
+
+The app itself now uses all of this: the export screen's "Fragmented MP4
 (experimental)" output option produces an `#EXT-X-MAP`-based HLS media
-playlist referencing these init segments and `.m4s` fragments, for the
-plain single-quality fast path only — adaptive HLS, edited (trimmed/
-split) segments, dub-audio, subtitles, and intro/outro still only ever
+playlist referencing these init segments and `.m4s` fragments, *and* a
+`manifest.mpd` DASH manifest describing the same files a second way (see
+`src/lib/dash.ts`) — both for the plain single-quality fast path and for
+adaptive (multi-rendition) HLS/DASH, each rendition with its own video
+fragment stream sharing one audio fragment stream. Edited (trimmed/split)
+segments, dub-audio, subtitles, intro/outro, and resume still only ever
 produce MPEG-TS (the export screen fails clearly if you combine fMP4
-output with any of those, rather than silently falling back). This is
-still a building block toward CMAF/DASH, not DASH itself — nothing
-generates a DASH manifest from these fragments yet.
+output with any of those, rather than silently falling back), and adaptive
+fMP4/DASH specifically needs WebCodecs hardware encoding — no FFmpeg
+fallback exists for it, unlike adaptive MPEG-TS.
 
 ## Supported Formats
 
@@ -394,11 +403,13 @@ generates a DASH manifest from these fragments yet.
   on hosts that can't set custom headers (like GitHub Pages),
   `public/coi-serviceworker.js` supplies them client-side instead.
 - HEVC and AV1 video are not supported by the fast native path.
-- The "Fragmented MP4 (experimental)" output option (an early step toward
-  CMAF/DASH) only supports the plain single-quality fast path — combine it
-  with adaptive HLS, an edited timeline, dub-audio, subtitles, or intro/
-  outro and the export fails clearly instead of silently falling back to
-  MPEG-TS.
+- The "Fragmented MP4 (experimental)" output option produces both an
+  HLS-on-fMP4 playlist and a DASH manifest, for the plain single-quality
+  fast path and adaptive (multi-rendition) HLS/DASH alike — but not
+  combined with an edited timeline, dub-audio, subtitles, intro/outro, or
+  resume; the export fails clearly instead of silently falling back to
+  MPEG-TS. Adaptive fMP4/DASH also needs a browser with WebCodecs hardware
+  encoding — there's no FFmpeg fallback for it the way plain adaptive HLS has.
 - The FFmpeg fallback downloads its engine (~32 MB) from a public CDN the
   first time it runs, then caches it for later sessions.
 - Adaptive HLS's audio floor is 96 kbps, even for the 240p rung — Chrome's
