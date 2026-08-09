@@ -1714,6 +1714,30 @@ impl HlsProcessor {
         Ok(fmp4::init_segment_audio(aud).into_boxed_slice())
     }
 
+    /// Fragmented-MP4 `moof`+`mdat` for one segment's video, following that
+    /// segment's `init_segment_video`. `video_data` is that segment's video
+    /// samples' bytes concatenated, the same slice `mux_segment` already
+    /// expects for the same segment — this and `mux_segment` can be called
+    /// on the same `segment_index` to get both an MPEG-TS and an fMP4
+    /// rendition of one segment from the same parsed source.
+    pub fn mux_video_fragment(&self, video_data: &[u8], segment_index: u32) -> Result<Box<[u8]>, JsValue> {
+        let seg = self
+            .segments
+            .get(segment_index as usize)
+            .ok_or_else(|| JsValue::from_str("Segment index out of range"))?;
+        Ok(fmp4::fragment_video(segment_index + 1, &seg.video, video_data).into_boxed_slice())
+    }
+
+    /// Fragmented-MP4 `moof`+`mdat` for one segment's audio — see
+    /// `mux_video_fragment`.
+    pub fn mux_audio_fragment(&self, audio_data: &[u8], segment_index: u32) -> Result<Box<[u8]>, JsValue> {
+        let seg = self
+            .segments
+            .get(segment_index as usize)
+            .ok_or_else(|| JsValue::from_str("Segment index out of range"))?;
+        Ok(fmp4::fragment_audio(segment_index + 1, &seg.audio, audio_data).into_boxed_slice())
+    }
+
     /// Mux one segment into MPEG-TS bytes.
     /// `video_data`/`audio_data` are the concatenated raw sample bytes read
     /// from the file at the offsets `parse_headers` (or `parse_audio_only`)

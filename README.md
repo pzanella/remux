@@ -358,9 +358,19 @@ for (let i = 0; i < segmentCount; i++) {
 const playlist = processor.generate_m3u8(JSON.stringify(durations));
 ```
 
-`HlsProcessor` only ever holds one video + one audio track and always
-produces MPEG-TS/HLS — that's the whole feature set today. There's no
-generic multi-track API and no DASH/CMAF output.
+`HlsProcessor` only ever holds one video + one audio track. Its main output
+is still MPEG-TS/HLS via `mux_segment`, but it can also write fragmented-MP4
+(CMAF-style) boxes: `init_segment_video`/`init_segment_audio` build the
+`ftyp`+`moov` init segment for a rendition, and `mux_video_fragment`/
+`mux_audio_fragment` build one `moof`+`mdat` fragment at a time from the
+same segment data `mux_segment` already reads — video and audio always as
+separate init segments/fragments, not a combined one, so a fragment stream
+can be shared across renditions the same way this project's dub-audio
+tracks already share one audio-only rendition across every video quality.
+This is a building block for CMAF/DASH output, not that output itself yet
+— nothing generates an HLS-on-fMP4 media playlist or a DASH manifest from
+these fragments yet, and the app itself doesn't call any of this; it still
+only ever produces MPEG-TS.
 
 ## Supported Formats
 

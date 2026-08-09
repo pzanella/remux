@@ -10,7 +10,7 @@
 //! project's own test fixtures, inspected with `mp4dump`) rather than only
 //! against the spec text — the two independently confirm the same layout.
 
-use crate::TrackData;
+use crate::{SampleInfo, TrackData};
 
 // ── Box-writing primitives ──────────────────────────────────────
 
@@ -293,6 +293,125 @@ fn wrap_moov(trak: Vec<u8>, track_id: u32) -> Vec<u8> {
     out
 }
 
+// ── Fragment (moof + mdat) ───────────────────────────────────────
+//
+// Unlike the MPEG-TS path (`mux_segment_inner`), a sample's bytes need no
+// reframing here: AVCC length-prefixed NALUs and raw (non-ADTS) AAC frames
+// are exactly what fMP4 already wants, since the length-prefix size and
+// AudioSpecificConfig both live in the init segment's `avcC`/`esds` instead
+// of needing to be repeated per frame. A fragment's `mdat` is therefore
+// just its samples' bytes copied through verbatim, in order — all the real
+// work is in `trun` correctly describing them.
+
+fn mfhd(sequence_number: u32) -> Vec<u8> {
+    full_box(b"mfhd", 0, 0, &sequence_number.to_be_bytes())
+}
+
+/// `default-base-is-moof` (0x020000) only — every other `tfhd` flag is left
+/// unset on purpose so nothing here relies on a `tfhd`/`trex` default; every
+/// sample's duration/size/flags is spelled out explicitly in `trun` instead,
+/// which needs no per-track special-casing for the fact that video sample
+/// durations vary (open GOPs, frame-rate drift) while audio's don't.
+fn tfhd(track_id: u32) -> Vec<u8> {
+    full_box(b"tfhd", 0, 0x0002_0000, &track_id.to_be_bytes())
+}
+
+/// Version 1 for a 64-bit `base_media_decode_time` — this project already
+/// keeps sample timestamps as `u64` (see `SampleInfo`), so there's no real
+/// upper bound on how long a source video can run before a 32-bit decode
+/// time would wrap.
+fn tfdt(base_media_decode_time: u64) -> Vec<u8> {
+    full_box(b"tfdt", 1, 0, &base_media_decode_time.to_be_bytes())
+}
+
+/// ISO 14496-12 8.8.3.1's `sample_flags`: `sample_depends_on` = 2 ("does
+/// not depend on others") with `sample_is_non_sync_sample` = 0 marks a
+/// keyframe/sync sample; everything else uses `sample_depends_on` = 1 with
+/// `is_non_sync_sample` = 1. Confirmed against a real reference fragmented
+/// MP4 (Bento4's `mp4fragment`, inspected with `mp4dump`) rather than only
+/// the spec text — its `tfhd` default and `trun` first-sample-flags used
+/// these exact two values for the same two cases.
+fn sample_flags(is_keyframe: bool) -> u32 {
+    if is_keyframe { 0x0200_0000 } else { 0x0101_0000 }
+}
+
+/// data-offset-present | sample-duration-present | sample-size-present |
+/// sample-flags-present | sample-composition-time-offset-present. No
+/// first-sample-flags-present: every sample gets an explicit `sample_flags`
+/// instead of relying on a tfhd default for everything after the first,
+/// since that default doesn't exist here (see `tfhd`).
+const TRUN_FLAGS: u32 = 0x0001 | 0x0100 | 0x0200 | 0x0400 | 0x0800;
+
+/// Builds `trun` and returns it alongside the absolute byte offset (within
+/// the returned box's own bytes) of its `data_offset` field — that field
+/// can't be filled in correctly until the caller knows this fragment's
+/// total `moof` size, which isn't known until every box inside it,
+/// including this one, already exists. `moof` backpatches through the
+/// returned offset once its own size is final, the standard two-pass
+/// approach for a self-referential field like this.
+fn trun(samples: &[SampleInfo]) -> (Vec<u8>, usize) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(samples.len() as u32).to_be_bytes()); // sample_count
+    let data_offset_pos_in_body = body.len();
+    body.extend_from_slice(&0i32.to_be_bytes()); // data_offset — backpatched by `moof`
+    for s in samples {
+        body.extend_from_slice(&s.duration.to_be_bytes());
+        body.extend_from_slice(&s.size.to_be_bytes());
+        body.extend_from_slice(&sample_flags(s.is_keyframe).to_be_bytes());
+        // Composition offset (pts - dts) is 0 for every audio sample and
+        // for video with no B-frames — always writing it costs 4 bytes per
+        // sample but means a track that occasionally reorders frames
+        // doesn't need a structurally different trun from one that never
+        // does.
+        let composition_offset = s.pts as i64 - s.dts as i64;
+        body.extend_from_slice(&(composition_offset as i32).to_be_bytes());
+    }
+    let boxed = full_box(b"trun", 1, TRUN_FLAGS, &body);
+    // 8 (box header) + 4 (version+flags) puts us at the start of `body`.
+    (boxed, 8 + 4 + data_offset_pos_in_body)
+}
+
+fn traf(track_id: u32, base_media_decode_time: u64, samples: &[SampleInfo]) -> (Vec<u8>, usize) {
+    let tfhd_box = tfhd(track_id);
+    let tfdt_box = tfdt(base_media_decode_time);
+    let (trun_box, data_offset_pos_in_trun) = trun(samples);
+
+    let mut body = Vec::with_capacity(tfhd_box.len() + tfdt_box.len() + trun_box.len());
+    body.extend_from_slice(&tfhd_box);
+    body.extend_from_slice(&tfdt_box);
+    let trun_start_in_body = body.len();
+    body.extend_from_slice(&trun_box);
+
+    let traf_box = make_box(b"traf", &body);
+    // 8 (traf's own header) puts us at the start of `body`.
+    (traf_box, 8 + trun_start_in_body + data_offset_pos_in_trun)
+}
+
+/// Builds one fragment: `moof` (with `trun`'s `data_offset` correctly
+/// backpatched to point at the byte right after this `moof`, per
+/// `default-base-is-moof`) followed immediately by `mdat` holding
+/// `sample_data` unchanged.
+fn fragment(sequence_number: u32, track_id: u32, samples: &[SampleInfo], sample_data: &[u8]) -> Vec<u8> {
+    let base_media_decode_time = samples.first().map(|s| s.dts).unwrap_or(0);
+    let mfhd_box = mfhd(sequence_number);
+    let (traf_box, data_offset_pos_in_traf) = traf(track_id, base_media_decode_time, samples);
+
+    let mut body = Vec::with_capacity(mfhd_box.len() + traf_box.len());
+    body.extend_from_slice(&mfhd_box);
+    let traf_start_in_body = body.len();
+    body.extend_from_slice(&traf_box);
+
+    let mut moof_box = make_box(b"moof", &body);
+    // `mdat` starts right after moof — its own 8-byte header included.
+    let data_offset = moof_box.len() as i32 + 8;
+    let patch_at = 8 + traf_start_in_body + data_offset_pos_in_traf;
+    moof_box[patch_at..patch_at + 4].copy_from_slice(&data_offset.to_be_bytes());
+
+    let mut out = moof_box;
+    out.extend_from_slice(&make_box(b"mdat", sample_data));
+    out
+}
+
 // ── Public API ───────────────────────────────────────────────────
 
 /// Builds the `ftyp` + `moov` init segment for a video-only rendition.
@@ -317,10 +436,29 @@ pub fn init_segment_audio(audio: &TrackData) -> Vec<u8> {
     wrap_moov(audio_trak(audio), 2)
 }
 
+/// Builds one video fragment (`moof` + `mdat`) — `sequence_number` is the
+/// fragment's 1-based position in this rendition's own fragment stream
+/// (`mfhd`'s field of the same name), `samples` describes each of
+/// `sample_data`'s frames in order, and `sample_data` is those frames'
+/// bytes concatenated, already in AVCC (length-prefixed) form as read
+/// straight from the source — no reframing needed, see the section comment
+/// above. Track ID fixed at 1, matching `init_segment_video`.
+pub fn fragment_video(sequence_number: u32, samples: &[SampleInfo], sample_data: &[u8]) -> Vec<u8> {
+    fragment(sequence_number, 1, samples, sample_data)
+}
+
+/// Builds one audio fragment — see `fragment_video`. `sample_data` is raw
+/// AAC frames with no ADTS framing (the AudioSpecificConfig lives in the
+/// init segment's `esds` instead). Track ID fixed at 2, matching
+/// `init_segment_audio`.
+pub fn fragment_audio(sequence_number: u32, samples: &[SampleInfo], sample_data: &[u8]) -> Vec<u8> {
+    fragment(sequence_number, 2, samples, sample_data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{find_all_boxes, find_box, find_box_in_stsd_entries, find_box_path, u16be, u32be};
+    use crate::{find_all_boxes, find_box, find_box_in_stsd_entries, find_box_path, u16be, u32be, u64be};
 
     // avc1's SampleEntry+VisualSampleEntry fixed header (78 bytes) and
     // mp4a's SampleEntry+AudioSampleEntry fixed header (28 bytes) — the
@@ -502,5 +640,140 @@ mod tests {
         let amoov = find_box(&aseg, b"moov").unwrap();
         assert_eq!(find_all_boxes(vmoov, b"trak").len(), 1);
         assert_eq!(find_all_boxes(amoov, b"trak").len(), 1);
+    }
+
+    fn sample(pts: u64, dts: u64, duration: u32, size: u32, is_keyframe: bool) -> SampleInfo {
+        SampleInfo { file_offset: 0, size, pts, dts, duration, is_keyframe }
+    }
+
+    /// One keyframe followed by two B-frames whose presentation order
+    /// doesn't match decode order (pts != dts) — the case that actually
+    /// exercises `trun`'s composition-time-offset field, as opposed to a
+    /// GOP with no B-frames where it would always be 0 and a bug there
+    /// could hide.
+    fn gop_with_b_frames() -> Vec<SampleInfo> {
+        vec![
+            sample(0, 0, 512, 1000, true),
+            sample(1536, 512, 512, 200, false),
+            sample(1024, 1024, 512, 180, false),
+        ]
+    }
+
+    #[test]
+    fn fragment_video_starts_with_moof_then_mdat_containing_exact_bytes() {
+        let samples = gop_with_b_frames();
+        let sample_data: Vec<u8> = (0..(1000 + 200 + 180)).map(|i| (i % 256) as u8).collect();
+        let frag = fragment_video(7, &samples, &sample_data);
+        assert_eq!(&frag[4..8], b"moof");
+        let mdat = find_box(&frag, b"mdat").expect("mdat");
+        assert_eq!(mdat, sample_data.as_slice());
+    }
+
+    #[test]
+    fn fragment_video_mfhd_sequence_number_matches_argument() {
+        let samples = gop_with_b_frames();
+        let data = vec![0u8; 1380];
+        let frag = fragment_video(7, &samples, &data);
+        let mfhd = find_box_path(&frag, &[b"moof", b"mfhd"]).expect("mfhd");
+        assert_eq!(u32be(mfhd, 4), 7); // skip version+flags
+    }
+
+    #[test]
+    fn fragment_video_tfhd_track_id_is_1_with_default_base_is_moof_flag() {
+        let samples = gop_with_b_frames();
+        let data = vec![0u8; 1380];
+        let frag = fragment_video(7, &samples, &data);
+        let traf = find_box_path(&frag, &[b"moof", b"traf"]).expect("traf");
+        let tfhd = find_box(traf, b"tfhd").expect("tfhd");
+        assert_eq!(&tfhd[1..4], &[0x02, 0x00, 0x00]); // flags = default-base-is-moof (0x020000), 24-bit big-endian
+        assert_eq!(u32be(tfhd, 4), 1); // track_id
+    }
+
+    #[test]
+    fn fragment_audio_tfhd_track_id_is_2() {
+        let samples = vec![sample(0, 0, 1024, 200, true)];
+        let data = vec![0u8; 200];
+        let frag = fragment_audio(1, &samples, &data);
+        let traf = find_box_path(&frag, &[b"moof", b"traf"]).expect("traf");
+        let tfhd = find_box(traf, b"tfhd").expect("tfhd");
+        assert_eq!(u32be(tfhd, 4), 2);
+    }
+
+    #[test]
+    fn fragment_video_tfdt_base_media_decode_time_is_first_sample_dts() {
+        let mut samples = gop_with_b_frames();
+        samples.iter_mut().for_each(|s| s.dts += 90_000); // simulate a later fragment, not starting at 0
+        let data = vec![0u8; 1380];
+        let frag = fragment_video(2, &samples, &data);
+        let tfdt = find_box_path(&frag, &[b"moof", b"traf", b"tfdt"]).expect("tfdt");
+        assert_eq!(tfdt[0], 1); // version 1 -> 64-bit base_media_decode_time
+        assert_eq!(u64be(tfdt, 4), samples[0].dts);
+    }
+
+    #[test]
+    fn fragment_video_trun_sample_count_and_data_offset_point_exactly_at_mdat_payload() {
+        let samples = gop_with_b_frames();
+        let data = vec![0u8; 1380];
+        let frag = fragment_video(1, &samples, &data);
+        let trun = find_box_path(&frag, &[b"moof", b"traf", b"trun"]).expect("trun");
+        assert_eq!(u32be(trun, 4), samples.len() as u32); // sample_count, right after version+flags
+        let data_offset = u32be(trun, 8) as usize; // data_offset, right after sample_count
+
+        // `default-base-is-moof` makes data_offset relative to moof's own
+        // start (byte 0 of `frag`) — it should land exactly on mdat's
+        // payload, not its header, and not drift if trun's own size
+        // changes (e.g. more samples).
+        let moof_len = u32be(&frag, 0) as usize;
+        assert_eq!(data_offset, moof_len + 8);
+        assert_eq!(&frag[data_offset..], data.as_slice());
+    }
+
+    #[test]
+    fn fragment_video_trun_per_sample_duration_and_size_match_input() {
+        let samples = gop_with_b_frames();
+        let data = vec![0u8; 1380];
+        let frag = fragment_video(1, &samples, &data);
+        let trun = find_box_path(&frag, &[b"moof", b"traf", b"trun"]).expect("trun");
+        // version+flags(4) + sample_count(4) + data_offset(4) = 12, then
+        // 16 bytes per sample (duration, size, flags, composition_offset).
+        for (i, s) in samples.iter().enumerate() {
+            let off = 12 + i * 16;
+            assert_eq!(u32be(trun, off), s.duration, "sample {i} duration");
+            assert_eq!(u32be(trun, off + 4), s.size, "sample {i} size");
+        }
+    }
+
+    #[test]
+    fn fragment_video_trun_keyframe_and_non_keyframe_sample_flags() {
+        let samples = gop_with_b_frames(); // [keyframe, non-key, non-key]
+        let data = vec![0u8; 1380];
+        let frag = fragment_video(1, &samples, &data);
+        let trun = find_box_path(&frag, &[b"moof", b"traf", b"trun"]).expect("trun");
+        let flags_at = |i: usize| u32be(trun, 12 + i * 16 + 8);
+        assert_eq!(flags_at(0), 0x0200_0000, "keyframe");
+        assert_eq!(flags_at(1), 0x0101_0000, "non-keyframe");
+        assert_eq!(flags_at(2), 0x0101_0000, "non-keyframe");
+    }
+
+    #[test]
+    fn fragment_video_trun_composition_offset_is_pts_minus_dts() {
+        let samples = gop_with_b_frames();
+        let data = vec![0u8; 1380];
+        let frag = fragment_video(1, &samples, &data);
+        let trun = find_box_path(&frag, &[b"moof", b"traf", b"trun"]).expect("trun");
+        for (i, s) in samples.iter().enumerate() {
+            let off = 12 + i * 16 + 12;
+            let cto = u32be(trun, off) as i32;
+            assert_eq!(cto as i64, s.pts as i64 - s.dts as i64, "sample {i} composition offset");
+        }
+    }
+
+    #[test]
+    fn fragment_with_no_samples_still_produces_a_parseable_empty_fragment() {
+        let frag = fragment_video(1, &[], &[]);
+        let trun = find_box_path(&frag, &[b"moof", b"traf", b"trun"]).expect("trun");
+        assert_eq!(u32be(trun, 4), 0);
+        let mdat = find_box(&frag, b"mdat").expect("mdat");
+        assert!(mdat.is_empty());
     }
 }
