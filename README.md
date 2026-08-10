@@ -104,6 +104,11 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
   right where you left off. **Start over** resets everything for a new file.
 - **Light on memory** — the file is never fully loaded into RAM, even for
   large videos.
+- **Installable** — a web app manifest (icons, standalone display mode)
+  makes the browser offer "Install" / "Add to Home Screen", so it opens
+  like a native app with no address bar. Everything else about the app
+  already runs fully client-side; this only adds the install affordance
+  itself, not offline caching of the app shell.
 
 ## Project Structure
 
