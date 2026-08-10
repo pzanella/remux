@@ -52,4 +52,24 @@ describe('useChapters', () => {
     rerender({ duration: 50 });
     expect(result.current.chapters).toEqual([]);
   });
+
+  it('loadChapters overwrites the current list with a loaded project\'s saved one, minting fresh ids', () => {
+    const { result } = renderHook(() => useChapters(30));
+    act(() => result.current.addChapterAt(5));
+    expect(result.current.chapters).toHaveLength(1);
+
+    act(() => result.current.loadChapters([{ time: 0, title: 'Intro' }, { time: 12, title: 'Main' }]));
+    expect(result.current.chapters.map(({ time, title }) => ({ time, title }))).toEqual([
+      { time: 0, title: 'Intro' },
+      { time: 12, title: 'Main' },
+    ]);
+    expect(result.current.chapters[0].id).not.toBe(result.current.chapters[1].id);
+  });
+
+  it('loadChapters with an empty list clears any existing chapters', () => {
+    const { result } = renderHook(() => useChapters(30));
+    act(() => result.current.addChapterAt(5));
+    act(() => result.current.loadChapters([]));
+    expect(result.current.chapters).toEqual([]);
+  });
 });

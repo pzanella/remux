@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import { SUPPORTED_VIDEO_MIME_TYPES } from '../types';
+import { PROJECT_FILE_EXTENSION } from '../lib/projectFile';
 
 const FORMAT_CHIPS = ['MP4', 'MOV', 'MKV', 'WebM', 'AVI', 'WMV', 'FLV'];
 
@@ -10,13 +11,19 @@ interface EmptyStateProps {
    * extras, just one shared settings pass over every file. `onSelectFile`
    * above still handles the single-file case unchanged. */
   onSelectFiles: (files: File[]) => void;
+  /** Loads a `.remuxproj` bundle saved earlier (see TopBar's "Save
+   * Project") — a completely different ingest path from the two above (a
+   * project archive, not a raw source video), so it gets its own picker
+   * rather than sharing the dropzone's file input. */
+  onLoadProject: (file: File) => void;
 }
 
 /** Full-height centered dropzone shown before anything is loaded — the
  * editor and its top bar don't render at all yet, so this is the entire
  * page. */
-export default function EmptyState({ onSelectFile, onSelectFiles }: EmptyStateProps) {
+export default function EmptyState({ onSelectFile, onSelectFiles, onLoadProject }: EmptyStateProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const projectInputRef = useRef<HTMLInputElement>(null);
   const [isOver, setIsOver] = useState(false);
 
   const dispatch = (files: File[]) => {
@@ -64,7 +71,23 @@ export default function EmptyState({ onSelectFile, onSelectFiles }: EmptyStatePr
         </div>
         <span className="dropzone-privacy">Processed entirely in your browser — nothing is uploaded.</span>
       </button>
+
+      <button type="button" className="btn-quiet load-project-link" onClick={() => projectInputRef.current?.click()}>
+        Have a saved project ({PROJECT_FILE_EXTENSION})? Load it
+      </button>
+
       <input ref={inputRef} type="file" accept={SUPPORTED_VIDEO_MIME_TYPES} multiple className="sr-only" onChange={onPick} />
+      <input
+        ref={projectInputRef}
+        type="file"
+        accept={PROJECT_FILE_EXTENSION}
+        className="sr-only"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) onLoadProject(file);
+          e.target.value = '';
+        }}
+      />
     </div>
   );
 }

@@ -9,6 +9,7 @@ import {
   splitAt,
   trimSegmentEnd,
   trimSegmentStart,
+  withIds,
 } from '../lib/segments';
 
 /**
@@ -37,7 +38,10 @@ export function useEditorSegments(sourceDuration: number | undefined) {
 
   // A new source (or a reset back to none) starts a fresh single full-span
   // segment and clears history — this is a new editing session, not an edit
-  // of the previous one.
+  // of the previous one. A loaded project's own saved cut list overwrites
+  // this via `loadSegments` below, called imperatively once ingest finishes
+  // rather than threaded through this effect — see that function's own
+  // comment for why.
   useEffect(() => {
     undoStack.current = [];
     redoStack.current = [];
@@ -152,6 +156,29 @@ export function useEditorSegments(sourceDuration: number | undefined) {
     setCanUndo(true);
   }, []);
 
+  // Overwrites the current segments wholesale with a loaded project's saved
+  // cut list — called imperatively from App.tsx right after
+  // `useTranscoder.loadProject` resolves, rather than reactively off
+  // `sourceDuration` (which the same load already changes, via this hook's
+  // own reset effect above): calling this *after* that effect has already
+  // run its trivial-reset is simpler and just as correct as trying to beat
+  // it to the punch, since this always applies last regardless of exact
+  // render timing, and the user only ever sees the final state — the
+  // "saving-to-opfs" loading screen covers the whole sequence anyway. Clears
+  // undo/redo history the same way a fresh single-segment source does; a
+  // loaded project's edits aren't something you'd expect to undo past.
+  const loadSegments = useCallback((ranges: { sourceStart: number; sourceEnd: number }[]) => {
+    if (ranges.length === 0) return;
+    const next = withIds(ranges);
+    undoStack.current = [];
+    redoStack.current = [];
+    setCanUndo(false);
+    setCanRedo(false);
+    setPlayheadTime(0);
+    setSegments(next);
+    setSelectedId(next[0]?.id ?? null);
+  }, []);
+
   const totalDuration = flattenedDuration(segments);
   const playheadLocation = locateGlobalTime(segments, playheadTime);
 
@@ -173,6 +200,7 @@ export function useEditorSegments(sourceDuration: number | undefined) {
     beginGesture,
     previewUpdate,
     commitGesture,
+    loadSegments,
     undo,
     redo,
   };

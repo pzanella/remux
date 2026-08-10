@@ -102,6 +102,13 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
   watch segments land there as they're produced.
 - **Crash recovery** — if the browser closes or crashes, you can pick up
   right where you left off. **Start over** resets everything for a new file.
+- **Saveable / shareable projects** — **Save Project** downloads the whole
+  editing session (source video, intro/outro/dub-audio/subtitles, cut list,
+  chapters, output settings) as one `.remuxproj` file — a real ZIP under the
+  hood. Load it back in from the empty-state screen, here or on a different
+  machine, and the editor comes back exactly as it was left. No account, no
+  cloud upload — hand the file to a collaborator the same way you'd hand off
+  the exported output.
 - **Light on memory** — the file is never fully loaded into RAM, even for
   large videos.
 - **Installable** — a web app manifest (icons, standalone display mode)

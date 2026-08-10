@@ -15,7 +15,10 @@ function nextChapterId(): string {
 export function useChapters(sourceDuration: number | undefined) {
   const [chapters, setChapters] = useState<ChapterMark[]>([]);
 
-  // A new source (or a reset back to none) starts a fresh editing session.
+  // A new source (or a reset back to none) starts a fresh editing session. A
+  // loaded project's own saved chapters overwrite this via `loadChapters`
+  // below, called imperatively once ingest finishes — see
+  // useEditorSegments' identically-shaped `loadSegments` for why.
   useEffect(() => {
     setChapters([]);
   }, [sourceDuration]);
@@ -39,7 +42,16 @@ export function useChapters(sourceDuration: number | undefined) {
     setChapters((prev) => prev.filter((c) => c.id !== id));
   }, []);
 
-  return { chapters, addChapterAt, renameChapter, removeChapter };
+  // Overwrites the current chapters wholesale with a loaded project's saved
+  // list — called imperatively from App.tsx right after
+  // `useTranscoder.loadProject` resolves, applied last regardless of the
+  // reset effect's own timing (see loadSegments in useEditorSegments for the
+  // full reasoning, identical here).
+  const loadChapters = useCallback((saved: { time: number; title: string }[]) => {
+    setChapters(saved.map((c) => ({ id: nextChapterId(), time: c.time, title: c.title })));
+  }, []);
+
+  return { chapters, addChapterAt, renameChapter, removeChapter, loadChapters };
 }
 
 export type UseChaptersReturn = ReturnType<typeof useChapters>;

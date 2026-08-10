@@ -15,14 +15,30 @@ interface TopBarProps {
   sourceResolution: { width: number; height: number } | null;
   sourceDuration: number | undefined;
   sourceFileSize: number | undefined;
+  isSavingProject: boolean;
   onReset: () => void;
   onExportClick: () => void;
+  onSaveProject: () => void;
 }
 
 /** Logo/wordmark + current project's identity, and the one primary action
  * (export) — everything else (output destination, renditions, progress)
- * lives inside the export flow it triggers, not cluttering this bar. */
-export default function TopBar({ hasSource, sourceFileName, sourceResolution, sourceDuration, sourceFileSize, onReset, onExportClick }: TopBarProps) {
+ * lives inside the export flow it triggers, not cluttering this bar. "Save
+ * Project" is the one exception, kept quiet (`.btn-quiet`, not
+ * `.btn-primary`) precisely so it doesn't compete with Export as a second
+ * primary action — it's a save/share checkpoint for work in progress, not
+ * something that belongs inside the export review flow itself. */
+export default function TopBar({
+  hasSource,
+  sourceFileName,
+  sourceResolution,
+  sourceDuration,
+  sourceFileSize,
+  isSavingProject,
+  onReset,
+  onExportClick,
+  onSaveProject,
+}: TopBarProps) {
   return (
     <header className="topbar">
       <button type="button" className="topbar-brand" onClick={onReset} title="Start over">
@@ -44,6 +60,12 @@ export default function TopBar({ hasSource, sourceFileName, sourceResolution, so
       )}
 
       <div className="topbar-spacer" />
+
+      {hasSource && (
+        <button type="button" className="btn-quiet" onClick={onSaveProject} disabled={isSavingProject} title="Download this project (source + edits) to resume later or share it">
+          {isSavingProject ? 'Saving…' : 'Save Project'}
+        </button>
+      )}
 
       <button type="button" className="btn-primary btn-export" onClick={onExportClick} disabled={!hasSource}>
         Export HLS

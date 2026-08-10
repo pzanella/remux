@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppStatus, LogEntry, TranscodingSession, WorkerCommand, WorkerEvent } from '../types';
-import { saveFileToOpfs, writeOpfsTextFile, usePersistence } from './usePersistence';
+import { saveFileToOpfs, writeOpfsTextFile, readOpfsFile, usePersistence } from './usePersistence';
 import { createZipBlob } from '../lib/zip';
 import { isTrivialEdit } from '../lib/segments';
+import { buildProjectZip, parseProjectZip, PROJECT_FILE_EXTENSION } from '../lib/projectFile';
 import RemuxWorker from '../worker/remux.worker.ts?worker';
 
 /** An intro/outro clip's OPFS pointer plus everything the timeline needs to
@@ -202,6 +203,88 @@ export function useTranscoder() {
       } catch (err) {
         setStatus('error');
         addLog(`Could not save the file: ${err}`, 'error');
+      }
+    },
+    [addLog, createSession, outputFolder],
+  );
+
+  /**
+   * Unpacks a `.remuxproj` bundle (see lib/projectFile.ts) and re-hydrates
+   * everything this hook owns: the source file (through the same OPFS
+   * ingest + session-creation path `selectFile` uses), intro/outro,
+   * dub-audio, subtitles, and output settings. Segments and chapters live in
+   * separate hooks (`useEditorSegments`/`useChapters`, owned by App.tsx),
+   * so those are handed back to the caller instead of set here — mirroring
+   * how `start` already takes them as parameters rather than owning them.
+   *
+   * Deliberately doesn't go through `selectSubtitleFile`/`selectDubAudioTrack`
+   * — those close over this hook's own state (`sourceDuration`, in
+   * particular, for dub-audio's length validation) via `useCallback`, and
+   * calling them back-to-back with `selectFile` in the same tick isn't
+   * guaranteed to see each other's just-set state before React actually
+   * re-renders. Operating at the same lower level `selectFile` itself does
+   * (straight to OPFS + this hook's own setters) sidesteps that instead of
+   * relying on render timing.
+   */
+  const loadProject = useCallback(
+    async (
+      file: File,
+    ): Promise<{ segments: { sourceStart: number; sourceEnd: number }[]; chapters: { time: number; title: string }[] } | null> => {
+      setStatus('saving-to-opfs');
+      setUploadProgress(0);
+      addLog(`Loading project ${file.name}…`);
+
+      try {
+        const bundle = await parseProjectZip(file);
+
+        const [opfsPath, dims] = await Promise.all([
+          saveFileToOpfs(bundle.sourceFile, (loaded, total) => setUploadProgress(Math.round((loaded / total) * 100))),
+          probeVideoMetadata(bundle.sourceFile),
+        ]);
+        const newSession = await createSession(bundle.sourceFile.name, opfsPath, bundle.sourceFile.size, 0, outputFolder);
+        setSession({ ...newSession, sourceWidth: dims?.width, sourceHeight: dims?.height, sourceDuration: dims?.duration });
+        setSourceResolution(dims);
+        setSourceDuration(dims?.duration);
+        setSourceFile(bundle.sourceFile);
+        setAbrHeightsState(dims ? bundle.manifest.abrHeights.filter((h) => h <= dims.height) : bundle.manifest.abrHeights);
+        setOutputContainer(bundle.manifest.outputContainer);
+        setLoudnessNormalization(bundle.manifest.loudnessNormalization);
+
+        if (bundle.introFile) {
+          const clip = bundle.introFile;
+          const [introPath, introDims] = await Promise.all([saveFileToOpfs(clip), probeVideoMetadata(clip)]);
+          setIntroFileState({ fileName: introPath, label: clip.name, width: introDims?.width, height: introDims?.height, duration: introDims?.duration, file: clip });
+        }
+        if (bundle.outroFile) {
+          const clip = bundle.outroFile;
+          const [outroPath, outroDims] = await Promise.all([saveFileToOpfs(clip), probeVideoMetadata(clip)]);
+          setOutroFileState({ fileName: outroPath, label: clip.name, width: outroDims?.width, height: outroDims?.height, duration: outroDims?.duration, file: clip });
+        }
+
+        const newSubtitleTracks: { fileName: string; label: string; language: string }[] = [];
+        const newSubtitleVttText: Record<string, string> = {};
+        for (const { file: subFile, label, language } of bundle.subtitleFiles) {
+          const [subPath, text] = await Promise.all([saveFileToOpfs(subFile), subFile.text()]);
+          newSubtitleTracks.push({ fileName: subPath, label, language });
+          newSubtitleVttText[subPath] = text;
+        }
+        setSubtitleTracksState(newSubtitleTracks);
+        setSubtitleVttTextByFile(newSubtitleVttText);
+
+        const newDubTracks: { fileName: string; label: string; language: string }[] = [];
+        for (const { file: dubFile, label, language } of bundle.dubAudioFiles) {
+          const dubPath = await saveFileToOpfs(dubFile);
+          newDubTracks.push({ fileName: dubPath, label, language });
+        }
+        setDubAudioTracksState(newDubTracks);
+
+        setStatus('idle');
+        addLog('Project loaded. Press Start when you are.', 'success');
+        return { segments: bundle.manifest.segments, chapters: bundle.manifest.chapters };
+      } catch (err) {
+        setStatus('error');
+        addLog(`Could not load the project: ${err}`, 'error');
+        return null;
       }
     },
     [addLog, createSession, outputFolder],
@@ -550,6 +633,51 @@ export function useTranscoder() {
     setIsZipping(false);
   }, [session, resumableSession, outputMode, deleteSession]);
 
+  /**
+   * Bundles the current editing session (source file, intro/outro,
+   * dub-audio, subtitles, output settings) plus whatever `editorSegments`/
+   * `chapters` the caller currently has — same "not owned by this hook"
+   * reason `start` takes them as parameters — into one downloadable
+   * `.remuxproj` file (see lib/projectFile.ts). This is the "save"/"share"
+   * half of #19: hand the file to a collaborator, or reload it later here
+   * or on another machine, and the editor comes back exactly as it was left.
+   */
+  const saveProject = useCallback(
+    async (editorSegments: { sourceStart: number; sourceEnd: number }[], projectChapters: { time: number; title: string }[]) => {
+      if (!sourceFile) return;
+      setIsZipping(true);
+      addLog('Building project file…');
+      try {
+        const blob = await buildProjectZip({
+          sourceFile,
+          segments: editorSegments,
+          chapters: projectChapters,
+          subtitleTracks,
+          subtitleVttTextByFile,
+          introFile: introFile ? { file: introFile.file } : null,
+          outroFile: outroFile ? { file: outroFile.file } : null,
+          dubAudioTracks,
+          readDubAudioFile: readOpfsFile,
+          outputContainer,
+          loudnessNormalization,
+          abrHeights,
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${sourceFile.name.replace(/\.[^.]+$/, '') || 'remux-project'}${PROJECT_FILE_EXTENSION}`;
+        a.click();
+        URL.revokeObjectURL(url);
+        addLog('Project saved.', 'success');
+      } catch (err) {
+        addLog(`Could not save the project: ${err}`, 'error');
+      } finally {
+        setIsZipping(false);
+      }
+    },
+    [sourceFile, subtitleTracks, subtitleVttTextByFile, introFile, outroFile, dubAudioTracks, outputContainer, loudnessNormalization, abrHeights, addLog],
+  );
+
   const downloadZip = useCallback(async () => {
     if (!outputFolder) return;
     setIsZipping(true);
@@ -616,6 +744,8 @@ export function useTranscoder() {
     canStart,
     canResume,
     selectFile,
+    loadProject,
+    saveProject,
     selectOutputFolder,
     setOutputMode,
     setOutputContainer,

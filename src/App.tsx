@@ -71,6 +71,31 @@ export default function App() {
     setExportModalOpen(false);
   }, [t]);
 
+  const handleSaveProject = useCallback(() => {
+    void t.saveProject(
+      editor.segments.map(({ sourceStart, sourceEnd }) => ({ sourceStart, sourceEnd })),
+      chapters.chapters.map(({ time, title }) => ({ time, title })),
+    );
+  }, [t, editor.segments, chapters.chapters]);
+
+  // Ingests a `.remuxproj` bundle (see EmptyState's own "Load Project"
+  // affordance): `useTranscoder.loadProject` re-hydrates everything it owns
+  // itself (source file, intro/outro, dub-audio, subtitles, output
+  // settings) and hands back the saved segments/chapters, since those live
+  // in the two separate hooks below rather than in `t` — same reason
+  // `start`/`saveProject` above take them as parameters instead of owning
+  // them.
+  const handleLoadProject = useCallback(
+    async (file: File) => {
+      const result = await t.loadProject(file);
+      if (result) {
+        editor.loadSegments(result.segments);
+        chapters.loadChapters(result.chapters);
+      }
+    },
+    [t, editor, chapters],
+  );
+
   // Spacebar toggles play/pause on the preview, and Ctrl/Cmd+Z (+ Shift)
   // drives undo/redo — both guarded so they don't hijack typing in a text
   // field, and both only live while there's something to edit.
@@ -141,7 +166,7 @@ export default function App() {
         {t.resumableSession && (
           <ResumeBanner session={t.resumableSession} canResume={t.canResume} onResume={t.resume} onDismiss={t.dismissResume} />
         )}
-        <EmptyState onSelectFile={t.selectFile} onSelectFiles={handleSelectFiles} />
+        <EmptyState onSelectFile={t.selectFile} onSelectFiles={handleSelectFiles} onLoadProject={handleLoadProject} />
       </div>
     );
   }
@@ -154,8 +179,10 @@ export default function App() {
         sourceResolution={t.sourceResolution}
         sourceDuration={t.sourceDuration}
         sourceFileSize={t.session?.sourceFileSize}
+        isSavingProject={t.isZipping}
         onReset={handleReset}
         onExportClick={handleExportClick}
+        onSaveProject={handleSaveProject}
       />
 
       {t.resumableSession && (

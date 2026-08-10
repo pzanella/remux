@@ -54,6 +54,15 @@ export function createInitialSegments(sourceDuration: number): EditorSegment[] {
   return [{ id: makeId(), sourceStart: 0, sourceEnd: Math.max(0, sourceDuration) }];
 }
 
+/** Mints fresh ids for a plain (sourceStart, sourceEnd) list — used to seed
+ * the editor from a loaded project's saved cut list (see useEditorSegments'
+ * own `seedSegments` param), which has no ids of its own since none of that
+ * ever left this process, let alone survived a round trip through a project
+ * bundle's JSON manifest. */
+export function withIds(ranges: { sourceStart: number; sourceEnd: number }[]): EditorSegment[] {
+  return ranges.map((r) => ({ id: makeId(), sourceStart: r.sourceStart, sourceEnd: r.sourceEnd }));
+}
+
 /** Each segment's start offset within the flattened (post-edit) timeline —
  * same length/order as `segments`. Takes only the `sourceStart`/`sourceEnd`
  * shape (not the full `EditorSegment`, which also requires `id`) so it works

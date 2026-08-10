@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Page } from '@playwright/test';
+import { expect, type Page } from '@playwright/test';
 
 // `package.json`'s "type": "module" makes this file ESM at runtime even
 // though it's type-checked under CommonJS (see e2e/tsconfig.json) — no
@@ -27,6 +27,13 @@ export async function expandExtrasStrip(page: Page): Promise<void> {
 export async function attachIntro(page: Page, fixtureName: string): Promise<void> {
   await expandExtrasStrip(page);
   await page.locator('.extras-row input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
+  // selectIntroFile is async (OPFS write + video-metadata probe) — the
+  // input's own change event resolving is not proof the ingest itself (and
+  // the resulting re-render that repositions outro's input to `.first()`)
+  // has actually landed. Without this wait, a same-tick attachOutro call
+  // can race it and land in what's still the *intro* slot (confirmed
+  // empirically: manifest.intro.fileName came back as the outro fixture).
+  await page.waitForSelector('.extras-item-name:has-text("Intro:")', { timeout: 10_000 });
 }
 
 export async function attachOutro(page: Page, fixtureName: string): Promise<void> {
@@ -34,6 +41,7 @@ export async function attachOutro(page: Page, fixtureName: string): Promise<void
   // Intro's file input exists whether or not intro is already attached, so
   // once intro is attached this is the remaining (first) file input.
   await page.locator('.extras-row input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
+  await page.waitForSelector('.extras-item-name:has-text("Outro:")', { timeout: 10_000 });
 }
 
 /** Attaches a dub-audio track via the persistent intro/outro/dub-audio strip
@@ -43,7 +51,15 @@ export async function attachOutro(page: Page, fixtureName: string): Promise<void
  * attached. */
 export async function attachDubAudio(page: Page, fixtureName: string): Promise<void> {
   await expandExtrasStrip(page);
+  const rows = page.locator('.dub-audio-list .extras-row');
+  const countBefore = await rows.count();
   await page.locator('.extras-row input[type="file"][accept*=".m4a"]').setInputFiles(path.join(FIXTURES, fixtureName));
+  // selectDubAudioTrack is async (video-metadata probe + OPFS write) — the
+  // input's own change event resolving isn't proof the track has actually
+  // landed in state yet (same class of race `attachIntro`/`attachOutro` hit
+  // — see their own comments), which matters here whenever a caller acts on
+  // the track immediately after (e.g. saving a project right away).
+  await expect(rows).toHaveCount(countBefore + 1, { timeout: 10_000 });
 }
 
 /** Attaches a subtitle track via the persistent caption lane below the
@@ -63,6 +79,26 @@ export async function addChapter(page: Page, title: string): Promise<void> {
   const titleInput = page.locator('.chapter-editor-row .text-input');
   await titleInput.waitFor({ timeout: 5_000 });
   await titleInput.fill(title);
+}
+
+/** Splits the timeline at a fractional position (0-1) of the current
+ * clip's own duration — scrubs the playhead there via the chapter ruler's
+ * own scrub lane (any of the persistent lanes under the preview double as
+ * one; this one needs no pre-existing track to already be attached), then
+ * clicks the "Split here" button VerticalTimeline shows once the playhead
+ * lands inside the selected (by default, the only) segment. */
+export async function splitTimelineAt(page: Page, fraction: number): Promise<void> {
+  const lane = page.locator('.chapter-ruler-lane');
+  const box = await lane.boundingBox();
+  if (!box) throw new Error('.chapter-ruler-lane not found — is the editor showing?');
+  // A locator click with an explicit position — not a raw `page.mouse.click`
+  // at the same viewport coordinates — is what actually reaches the lane's
+  // own `onPointerDown` scrub handler reliably (confirmed empirically: the
+  // raw mouse API left the playhead at 0% here even though the click itself
+  // registered, silently turning every split below into a no-op refused for
+  // being too close to the segment's own start).
+  await lane.click({ position: { x: box.width * fraction, y: box.height / 2 } });
+  await page.click('.split-button');
 }
 
 /** Toggles an adaptive-bitrate rendition chip (e.g. "240p") on. Selecting
@@ -111,6 +147,28 @@ export async function downloadZip(page: Page, destPath: string): Promise<string>
   const [download] = await Promise.all([page.waitForEvent('download'), page.click('button:has-text("Download ZIP")')]);
   await download.saveAs(destPath);
   return destPath;
+}
+
+/** Downloads the current editing session as a `.remuxproj` bundle (see
+ * TopBar's "Save Project") to `destPath`. */
+export async function saveProjectFile(page: Page, destPath: string): Promise<string> {
+  const [download] = await Promise.all([page.waitForEvent('download'), page.click('button:has-text("Save Project")')]);
+  await download.saveAs(destPath);
+  return destPath;
+}
+
+/** Loads a `.remuxproj` bundle from `filePath` via the empty-state's own
+ * "Load Project" picker and waits for the editor to come back up. */
+export async function loadProjectFile(page: Page, filePath: string): Promise<void> {
+  await page.locator('input[type="file"][accept=".remuxproj"]').setInputFiles(filePath);
+  await page.waitForSelector('.topbar', { timeout: 30_000 });
+}
+
+/** Clicks the topbar wordmark/logo — "Start over": tears the current
+ * session down completely and returns to the empty-state dropzone. */
+export async function startOver(page: Page): Promise<void> {
+  await page.click('.topbar-brand');
+  await page.waitForSelector('.dropzone', { timeout: 10_000 });
 }
 
 /** Lists entry names inside a ZIP produced by src/lib/zip.ts (a plain

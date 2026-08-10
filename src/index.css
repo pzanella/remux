@@ -551,9 +551,14 @@ body {
 .empty-state {
   min-height: 75vh;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 1rem;
   padding: 1rem;
+}
+.load-project-link {
+  font-size: 0.8rem;
 }
 .dropzone {
   cursor: pointer;

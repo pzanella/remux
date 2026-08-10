@@ -91,6 +91,16 @@ export async function deleteOpfsFile(opfsName: string): Promise<void> {
   await root.removeEntry(opfsName);
 }
 
+/** Reads a previously-saved OPFS file back as a real `File` — used when
+ * building a project bundle for a track that only kept an OPFS filename in
+ * memory (dub-audio; see useTranscoder's own `dubAudioTracks` state and
+ * lib/projectFile.ts's `readDubAudioFile`). */
+export async function readOpfsFile(opfsName: string): Promise<File> {
+  const root = await getOpfsRoot();
+  const fh = await root.getFileHandle(opfsName);
+  return fh.getFile();
+}
+
 /** Overwrites (or creates) a specific OPFS file with text content — unlike
  * `saveFileToOpfs`, which always mints a fresh unique name, this keeps a
  * stable filename across repeated writes. Used for subtitle edits, so the

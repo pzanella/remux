@@ -36,6 +36,35 @@ describe('useEditorSegments', () => {
     expect(result.current.canRedo).toBe(false);
   });
 
+  it('loadSegments overwrites the current cut list with a loaded project\'s saved one, minting fresh ids and clearing history', () => {
+    const { result } = renderHook(() => useEditorSegments(30));
+    act(() => result.current.setPlayheadTime(10));
+    act(() => result.current.splitAtPlayhead());
+    expect(result.current.segments).toHaveLength(2);
+    expect(result.current.canUndo).toBe(true);
+
+    act(() =>
+      result.current.loadSegments([
+        { sourceStart: 0, sourceEnd: 5 },
+        { sourceStart: 10, sourceEnd: 20 },
+      ]),
+    );
+    expect(result.current.segments.map(({ sourceStart, sourceEnd }) => ({ sourceStart, sourceEnd }))).toEqual([
+      { sourceStart: 0, sourceEnd: 5 },
+      { sourceStart: 10, sourceEnd: 20 },
+    ]);
+    expect(result.current.segments[0].id).not.toBe(result.current.segments[1].id);
+    expect(result.current.selectedId).toBe(result.current.segments[0].id);
+    expect(result.current.canUndo).toBe(false);
+    expect(result.current.canRedo).toBe(false);
+  });
+
+  it('loadSegments is a no-op for an empty list', () => {
+    const { result } = renderHook(() => useEditorSegments(30));
+    act(() => result.current.loadSegments([]));
+    expect(result.current.segments).toHaveLength(1); // still the trivial full-span default
+  });
+
   it('splits at the playhead and can undo/redo the split', () => {
     const { result } = renderHook(() => useEditorSegments(30));
     act(() => result.current.setPlayheadTime(10));

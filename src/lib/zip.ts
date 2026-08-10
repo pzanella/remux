@@ -74,22 +74,17 @@ type IterableDirectoryHandle = FileSystemDirectoryHandle & {
   entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
 };
 
-/** Zips every file directly inside `dirHandle` (flat — no subdirectories,
- * matching this app's output layout) into one downloadable Blob. */
-export async function createZipBlob(
-  dirHandle: FileSystemDirectoryHandle,
-  onProgress?: (done: number, total: number) => void,
-): Promise<Blob> {
-  const entries: { name: string; file: File }[] = [];
-  for await (const [name, handle] of (dirHandle as IterableDirectoryHandle).entries()) {
-    if (handle.kind === 'file') {
-      entries.push({ name, file: await (handle as FileSystemFileHandle).getFile() });
-    }
-  }
-  entries.sort((a, b) => a.name.localeCompare(b.name));
+export interface ZipEntry {
+  name: string;
+  data: Uint8Array;
+}
 
+/** The shared STORE-only writer both `createZipBlob` (output folder → one
+ * download) and `buildProjectZip` (lib/projectFile.ts) build on — arbitrary
+ * named byte entries in, one real PK zip Blob out. */
+export function buildZip(entries: ZipEntry[], onProgress?: (done: number, total: number) => void): Blob {
   if (entries.length === 0) {
-    throw new Error('Nothing to download yet.');
+    throw new Error('Nothing to zip.');
   }
 
   const { time, date } = dosDateTime(new Date());
@@ -99,8 +94,7 @@ export async function createZipBlob(
   let centralSize = 0;
 
   for (let i = 0; i < entries.length; i++) {
-    const { name, file } = entries[i];
-    const data = new Uint8Array(await file.arrayBuffer());
+    const { name, data } = entries[i];
     const crc = crc32(data);
     const nameBytes = new TextEncoder().encode(name);
 
@@ -162,4 +156,98 @@ export async function createZipBlob(
   ]);
 
   return new Blob([...parts, ...centralParts.map(toBlobPart), toBlobPart(eocd)], { type: 'application/zip' });
+}
+
+/** Zips every file directly inside `dirHandle` (flat — no subdirectories,
+ * matching this app's output layout) into one downloadable Blob. */
+export async function createZipBlob(
+  dirHandle: FileSystemDirectoryHandle,
+  onProgress?: (done: number, total: number) => void,
+): Promise<Blob> {
+  const files: { name: string; file: File }[] = [];
+  for await (const [name, handle] of (dirHandle as IterableDirectoryHandle).entries()) {
+    if (handle.kind === 'file') {
+      files.push({ name, file: await (handle as FileSystemFileHandle).getFile() });
+    }
+  }
+  files.sort((a, b) => a.name.localeCompare(b.name));
+
+  if (files.length === 0) {
+    throw new Error('Nothing to download yet.');
+  }
+
+  const entries: ZipEntry[] = [];
+  for (const { name, file } of files) {
+    entries.push({ name, data: new Uint8Array(await file.arrayBuffer()) });
+  }
+
+  return buildZip(entries, onProgress);
+}
+
+/**
+ * Reads a ZIP this app itself produced (`buildZip`/`createZipBlob`, always
+ * STORE — never DEFLATE) back into named entries — the read half needed to
+ * load a `.remuxproj` bundle (see lib/projectFile.ts). Not a general-purpose
+ * unzip: any entry using real compression throws rather than silently
+ * misreading it, since nothing this app writes ever does.
+ */
+export function parseZip(data: Uint8Array): ZipEntry[] {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const decoder = new TextDecoder();
+
+  // No entry this app writes ever carries a comment, so the End Of Central
+  // Directory record is always the last 22 bytes in practice — scanned
+  // backward rather than assumed, so a stray trailing comment (from some
+  // other tool re-saving the file) doesn't silently misparse it.
+  const EOCD_SIG = 0x06054b50;
+  const EOCD_MIN_SIZE = 22;
+  let eocdOffset = -1;
+  for (let i = data.length - EOCD_MIN_SIZE; i >= 0; i--) {
+    if (view.getUint32(i, true) === EOCD_SIG) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset === -1) {
+    throw new Error('Not a valid ZIP file (no end-of-central-directory record found).');
+  }
+
+  const entryCount = view.getUint16(eocdOffset + 10, true);
+  const centralDirOffset = view.getUint32(eocdOffset + 16, true);
+
+  const entries: ZipEntry[] = [];
+  let pos = centralDirOffset;
+  for (let i = 0; i < entryCount; i++) {
+    if (view.getUint32(pos, true) !== 0x02014b50) {
+      throw new Error('Corrupt ZIP central directory.');
+    }
+    const method = view.getUint16(pos + 10, true);
+    const compressedSize = view.getUint32(pos + 20, true);
+    const uncompressedSize = view.getUint32(pos + 24, true);
+    const nameLen = view.getUint16(pos + 28, true);
+    const extraLen = view.getUint16(pos + 30, true);
+    const commentLen = view.getUint16(pos + 32, true);
+    const localHeaderOffset = view.getUint32(pos + 42, true);
+    const name = decoder.decode(data.subarray(pos + 46, pos + 46 + nameLen));
+
+    if (method !== 0) {
+      throw new Error(`Entry "${name}" uses an unsupported compression method (${method}) — only stored (uncompressed) entries are supported.`);
+    }
+
+    // The local header's own filename/extra lengths can legally differ from
+    // the central directory's, so they're re-read here rather than assumed,
+    // to find the real start of this entry's data.
+    const localNameLen = view.getUint16(localHeaderOffset + 26, true);
+    const localExtraLen = view.getUint16(localHeaderOffset + 28, true);
+    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+    const entryData = data.subarray(dataStart, dataStart + compressedSize);
+    if (entryData.length !== uncompressedSize) {
+      throw new Error(`Entry "${name}" is truncated or corrupt.`);
+    }
+
+    entries.push({ name, data: entryData });
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return entries;
 }
