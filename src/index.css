@@ -1291,3 +1291,38 @@ body {
   color: var(--danger);
   font-weight: 600;
 }
+
+/* ── Batch mode ── */
+.batch-layout {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .batch-layout {
+    grid-template-columns: 1fr;
+  }
+}
+.batch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.batch-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+.batch-item--error {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+}
+.batch-item--complete {
+  border-color: color-mix(in srgb, var(--success) 40%, var(--line));
+}

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import TopBar from './components/TopBar';
 import EmptyState from './components/EmptyState';
+import BatchQueue from './components/BatchQueue';
 import PreviewPane, { type PreviewPaneHandle } from './components/PreviewPane';
 import VerticalTimeline from './components/VerticalTimeline';
 import CaptionLane from './components/CaptionLane';
@@ -10,12 +11,30 @@ import ResumeBanner from './components/ResumeBanner';
 import Player from './components/Player';
 import { useTranscoder } from './hooks/useTranscoder';
 import { useEditorSegments } from './hooks/useEditorSegments';
+import { useBatchTranscoder } from './hooks/useBatchTranscoder';
 
 export default function App() {
   const t = useTranscoder();
   const editor = useEditorSegments(t.sourceDuration);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const previewRef = useRef<PreviewPaneHandle>(null);
+
+  // Batch mode is a fully separate flow (see useBatchTranscoder's own doc
+  // comment) — its own hook instance, never touching `t` at all, swapped in
+  // for the whole screen the moment more than one file is dropped/picked.
+  const batch = useBatchTranscoder();
+  const [isBatchMode, setIsBatchMode] = useState(false);
+  const handleSelectFiles = useCallback(
+    (files: File[]) => {
+      batch.addFiles(files);
+      setIsBatchMode(true);
+    },
+    [batch],
+  );
+  const handleExitBatch = useCallback(() => {
+    batch.clearBatch();
+    setIsBatchMode(false);
+  }, [batch]);
 
   const editingPhase = t.status === 'idle';
   const { abrHeights, setAbrEnabled } = t;
@@ -71,6 +90,34 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [editingPhase, editor]);
 
+  if (isBatchMode) {
+    return (
+      <BatchQueue
+        items={batch.items}
+        isRunning={batch.isRunning}
+        isComplete={batch.isComplete}
+        canStart={batch.canStart}
+        outputMode={batch.outputMode}
+        rootFolder={batch.rootFolder}
+        outputContainer={batch.outputContainer}
+        loudnessNormalization={batch.loudnessNormalization}
+        abrHeights={batch.abrHeights}
+        onAddFiles={batch.addFiles}
+        onRemoveItem={batch.removeItem}
+        onSelectRootFolder={batch.selectRootFolder}
+        onSetOutputMode={batch.setOutputMode}
+        onSetOutputContainer={batch.setOutputContainer}
+        onSetLoudnessNormalization={batch.setLoudnessNormalization}
+        onToggleAbrHeight={batch.toggleAbrHeight}
+        onStart={() => void batch.start()}
+        onCancel={batch.cancelBatch}
+        onDownloadItemZip={batch.downloadItemZip}
+        onClearBatch={batch.clearBatch}
+        onExit={handleExitBatch}
+      />
+    );
+  }
+
   if (t.status === 'saving-to-opfs') {
     return (
       <div className="app-shell">
@@ -88,7 +135,7 @@ export default function App() {
         {t.resumableSession && (
           <ResumeBanner session={t.resumableSession} canResume={t.canResume} onResume={t.resume} onDismiss={t.dismissResume} />
         )}
-        <EmptyState onSelectFile={t.selectFile} />
+        <EmptyState onSelectFile={t.selectFile} onSelectFiles={handleSelectFiles} />
       </div>
     );
   }

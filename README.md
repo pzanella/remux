@@ -50,6 +50,13 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
   Shown automatically in the in-app player's own seek bar; ships in the
   export too, ready for any player that reads the same WebVTT `#xywh=`
   convention.
+- **Batch processing** — drop more than one file at once to convert them
+  all with one shared settings pass (output container, loudness
+  normalization, adaptive HLS renditions) instead of the single-file
+  timeline editor. Processed strictly one file at a time, each through the
+  exact same pipeline a single file already uses; no per-file trim/split,
+  subtitles, intro/outro, or dub-audio in this mode. Each file gets its own
+  ZIP (browser-storage output) or its own subfolder (local-folder output).
 - **In-browser timeline editor** — trim, split, and reorder clips on a
   vertical rail, with a live draft preview (Space to play/pause, Ctrl/Cmd+Z
   to undo) so you can check the cut before converting anything.
@@ -422,6 +429,12 @@ fallback exists for it, unlike adaptive MPEG-TS.
   (byte-copied, same as AVC — see `wasm/src/hevc.rs`); fMP4 output and
   adaptive HLS still require AVC and fall back to FFmpeg first for an HEVC
   source. AV1 isn't supported by the fast native path at all yet.
+- Batch mode picks adaptive HLS renditions per selected height same as the
+  single-file flow, but filters them per file at conversion time — a
+  rendition that would upscale one file in the batch is silently skipped
+  for that file specifically, not for the whole batch. Not resumable: a
+  cancelled or failed file starts over from scratch, not from where it
+  left off (unlike a single-file session, which checkpoints per segment).
 - The "Fragmented MP4 (experimental)" output option produces both an
   HLS-on-fMP4 playlist and a DASH manifest, for the plain single-quality
   fast path and adaptive (multi-rendition) HLS/DASH alike — but not
