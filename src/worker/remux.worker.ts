@@ -297,6 +297,22 @@ async function normalizeLoudness(sourceOpfsName: string, originalFileName: strin
 
   const measured = await measureLoudness(ffmpeg, inputName);
 
+  // loudnorm's own internal processing resamples to whatever rate its
+  // algorithm wants (confirmed empirically: a real 44100 Hz source came out
+  // at 96000 Hz with no explicit -ar) — harmless on its own, but WebCodecs'
+  // own AAC encoder (used by adaptive HLS, see ABR_ENCODE_VIDEO_CODEC)
+  // only accepts 44100 or 48000 Hz and throws "Unsupported sample rate"
+  // otherwise. An explicit -ar matching the *source's* own rate asks
+  // ffmpeg to resample back down after the filter, undoing that leak
+  // rather than shipping whatever rate loudnorm happened to pick.
+  const sampleRateLines: string[] = [];
+  const onSampleRateLog = ({ message }: { message: string }) => sampleRateLines.push(message);
+  ffmpeg.on('log', onSampleRateLog);
+  await ffmpeg.exec(['-i', inputName, '-vn', '-f', 'null', '-']).catch(() => {});
+  ffmpeg.off('log', onSampleRateLog);
+  const sampleRateMatch = sampleRateLines.join('\n').match(/Audio:.*?(\d+) Hz/);
+  const sourceSampleRate = sampleRateMatch ? sampleRateMatch[1] : '48000';
+
   post({ type: 'CONVERTING', log: 'Applying loudness normalization…', convertProgress: 40 });
   ffmpeg.on('progress', ({ progress }) => {
     const pct = Math.round(Math.min(Math.max(progress, 0), 1) * 55) + 40; // map 0-1 to 40-95
@@ -313,7 +329,16 @@ async function normalizeLoudness(sourceOpfsName: string, originalFileName: strin
   ffmpeg.on('log', onApplyLog);
   let applyCode: number;
   try {
-    applyCode = await ffmpeg.exec(['-i', inputName, '-c:v', 'copy', '-af', applyFilter, '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-y', outputName]);
+    applyCode = await ffmpeg.exec([
+      '-i', inputName,
+      '-c:v', 'copy',
+      '-af', applyFilter,
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-ar', sourceSampleRate,
+      '-movflags', '+faststart',
+      '-y', outputName,
+    ]);
   } finally {
     ffmpeg.off('log', onApplyLog);
   }
