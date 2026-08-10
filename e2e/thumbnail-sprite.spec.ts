@@ -72,7 +72,7 @@ test('shows a real thumbnail preview on seek-bar hover, via Shaka Player\'s own 
     await page.mouse.move(box!.x, box!.y + box!.height / 2);
     await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2, { steps: 5 });
     await page.waitForTimeout(2_000);
-    naturalWidth = await thumbnailImage.evaluate((img: HTMLImageElement) => img.naturalWidth).catch(() => 0);
+    naturalWidth = await thumbnailImage.evaluate((img: { naturalWidth: number }) => img.naturalWidth).catch(() => 0);
   }
   expect(naturalWidth).toBeGreaterThan(0);
   await expect(thumbnailImage).toHaveAttribute('src', /^blob:/);
