@@ -25,6 +25,7 @@ interface ExportModalProps {
   outroFile: ClipFile | null;
   subtitleTracks: { fileName: string; label: string; language: string }[];
   dubAudioTracks: { fileName: string; label: string; language: string }[];
+  chapters: { time: number; title: string }[];
   onClose: () => void;
   onSelectFolder: () => void;
   onSetOutputMode: (mode: 'opfs' | 'folder') => void;
@@ -72,6 +73,7 @@ export default function ExportModal({
   outroFile,
   subtitleTracks,
   dubAudioTracks,
+  chapters,
   onClose,
   onSelectFolder,
   onSetOutputMode,
@@ -93,6 +95,7 @@ export default function ExportModal({
     outroFile && 'outro',
     subtitleTracks.length > 0 && `${subtitleTracks.length} subtitle track${subtitleTracks.length > 1 ? 's' : ''}`,
     dubAudioTracks.length > 0 && `${dubAudioTracks.length} dub-audio track${dubAudioTracks.length > 1 ? 's' : ''}`,
+    chapters.length > 0 && `${chapters.length} chapter${chapters.length > 1 ? 's' : ''}`,
   ]
     .filter((s): s is string => !!s)
     .join(', ');

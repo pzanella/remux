@@ -109,6 +109,40 @@ async function loadThumbnailsTrackWithRetry(player: shaka.Player, dirHandle: Fil
   }
 }
 
+/**
+ * Loads chapter markers (see `writeChaptersVtt` in remux.worker.ts) into
+ * Shaka's own chapters track — this is all the wiring needed for the native
+ * `ChapterSelection` overflow-menu UI to show up; it appears automatically
+ * once `player.getChaptersAsync` returns anything. Unlike thumbnails.vtt,
+ * chapters.vtt has no secondary image reference for the *browser* to
+ * resolve on its own (see `loadThumbnailsTrack`'s own doc comment for that
+ * problem), so the `localdir://` URI is handed straight to Shaka — it's
+ * Shaka's own `NetworkingEngine` that fetches it, the same path the
+ * manifest/segments/subtitle tracks already go through.
+ *
+ * A session with no chapters never gets a chapters.vtt written at all (see
+ * the worker), so this fails every attempt and gives up silently for those
+ * — same "optional, non-fatal" tolerance as thumbnails.
+ */
+async function loadChaptersTrack(player: shaka.Player): Promise<boolean> {
+  try {
+    await player.addChaptersTrack(`${URI_PREFIX}chapters.vtt`, 'en');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadChaptersTrackWithRetry(player: shaka.Player, isCancelled: () => boolean): Promise<void> {
+  const RETRY_DELAYS_MS = [500, 1500, 3000, 5000, 8000];
+  if (await loadChaptersTrack(player)) return;
+  for (const delay of RETRY_DELAYS_MS) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    if (isCancelled()) return;
+    if (await loadChaptersTrack(player)) return;
+  }
+}
+
 interface PlayerProps {
   m3u8Content: string;
   outputFolderHandle: FileSystemDirectoryHandle | null;
@@ -208,6 +242,10 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
         // comment above) — the seek bar's own hover preview picks this up
         // automatically once added, no further wiring needed here.
         void loadThumbnailsTrackWithRetry(player, outputFolderHandle, () => cancelled);
+        // Chapter markers (see writeChaptersVtt in remux.worker.ts) — same
+        // "appears automatically once added" deal as thumbnails above, this
+        // time powering Shaka's Chapters overflow-menu entry.
+        void loadChaptersTrackWithRetry(player, () => cancelled);
         // `load()` resolving isn't proof playback actually works: WebKit's
         // MediaSource can silently accept a segment append that never
         // produces decodable data (confirmed against a real MPEG-TS HLS

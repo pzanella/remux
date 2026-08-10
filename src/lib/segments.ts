@@ -44,7 +44,7 @@ export function segmentDuration(seg: { sourceStart: number; sourceEnd: number })
   return Math.max(0, seg.sourceEnd - seg.sourceStart);
 }
 
-export function flattenedDuration(segments: EditorSegment[]): number {
+export function flattenedDuration(segments: { sourceStart: number; sourceEnd: number }[]): number {
   return segments.reduce((sum, s) => sum + segmentDuration(s), 0);
 }
 

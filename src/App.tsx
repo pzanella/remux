@@ -5,17 +5,20 @@ import BatchQueue from './components/BatchQueue';
 import PreviewPane, { type PreviewPaneHandle } from './components/PreviewPane';
 import VerticalTimeline from './components/VerticalTimeline';
 import CaptionLane from './components/CaptionLane';
+import ChapterRuler from './components/ChapterRuler';
 import MediaExtrasPanel from './components/MediaExtrasPanel';
 import ExportModal from './components/ExportModal';
 import ResumeBanner from './components/ResumeBanner';
 import Player from './components/Player';
 import { useTranscoder } from './hooks/useTranscoder';
 import { useEditorSegments } from './hooks/useEditorSegments';
+import { useChapters } from './hooks/useChapters';
 import { useBatchTranscoder } from './hooks/useBatchTranscoder';
 
 export default function App() {
   const t = useTranscoder();
   const editor = useEditorSegments(t.sourceDuration);
+  const chapters = useChapters(t.sourceDuration);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const previewRef = useRef<PreviewPaneHandle>(null);
 
@@ -56,9 +59,12 @@ export default function App() {
 
   const handleStartExport = useCallback(() => {
     if (t.status === 'idle' && t.canStart) {
-      t.start(editor.segments.map(({ sourceStart, sourceEnd }) => ({ sourceStart, sourceEnd })));
+      t.start(
+        editor.segments.map(({ sourceStart, sourceEnd }) => ({ sourceStart, sourceEnd })),
+        chapters.chapters.map(({ time, title }) => ({ time, title })),
+      );
     }
-  }, [t, editor.segments]);
+  }, [t, editor.segments, chapters.chapters]);
 
   const handleReset = useCallback(() => {
     void t.reset();
@@ -198,6 +204,15 @@ export default function App() {
                 onSetSubtitleTrackLanguage={t.setSubtitleTrackLanguage}
                 onSaveSubtitleEdits={t.saveSubtitleEdits}
               />
+              <ChapterRuler
+                segments={editor.segments}
+                playheadTime={editor.playheadTime}
+                onPlayheadChange={editor.setPlayheadTime}
+                chapters={chapters.chapters}
+                onAddChapterAt={chapters.addChapterAt}
+                onRenameChapter={chapters.renameChapter}
+                onRemoveChapter={chapters.removeChapter}
+              />
             </>
           ) : (
             <div className="preview-pane">
@@ -255,6 +270,7 @@ export default function App() {
           outroFile={t.outroFile}
           subtitleTracks={t.subtitleTracks}
           dubAudioTracks={t.dubAudioTracks}
+          chapters={chapters.chapters}
           onClose={() => setExportModalOpen(false)}
           onSelectFolder={t.selectOutputFolder}
           onSetOutputMode={t.setOutputMode}

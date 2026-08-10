@@ -818,6 +818,67 @@ body {
   display: flex;
 }
 
+/* ── Chapter markers ── */
+.chapter-ruler {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  padding: 0.7rem 0.9rem;
+}
+.chapter-ruler-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.chapter-ruler-lane {
+  position: relative;
+  height: 1.6rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  cursor: pointer;
+}
+.chapter-marker {
+  position: absolute;
+  top: 50%;
+  width: 0.6rem;
+  height: 0.6rem;
+  padding: 0;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  transform: translate(-50%, -50%) rotate(45deg);
+  cursor: pointer;
+}
+.chapter-marker:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.chapter-marker--selected {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.chapter-marker--dropped {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+.chapter-ruler-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 6px 1px color-mix(in srgb, var(--accent) 80%, transparent);
+  pointer-events: none;
+}
+.chapter-editor-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 /* ── Subtitle cue editor ── */
 .cue-editor-backdrop {
   position: fixed;

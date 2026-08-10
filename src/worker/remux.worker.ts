@@ -10,7 +10,8 @@
 import type { WorkerCommand, WorkerEvent, ParseHeadersResult, AudioOnlyParseResult, SegmentInfoJs } from '../types';
 import { isNativeContainer, ABR_LADDER } from '../types';
 import { parseCues, serializeVtt, shiftCues } from '../lib/vtt';
-import { remapSourceRangeToGlobal } from '../lib/segments';
+import { flattenedDuration, remapSourceRangeToGlobal } from '../lib/segments';
+import { buildChaptersVtt } from '../lib/chapters';
 import {
   type SubtitleTag,
   type AudioTrackTag,
@@ -483,6 +484,23 @@ async function generateThumbnailSprite(srcBytes: Uint8Array, originalFileName: s
     vtt += `thumbnails.jpg#xywh=${col * THUMBNAIL_TILE_WIDTH},${row * THUMBNAIL_TILE_HEIGHT},${THUMBNAIL_TILE_WIDTH},${THUMBNAIL_TILE_HEIGHT}\n\n`;
   }
   await writeOutputFile(outputFolderHandle, 'thumbnails.vtt', vtt);
+}
+
+// ── Chapter markers ──────────────────────────────────────────────────
+//
+// Unlike the thumbnail sprite above, this is pure text generation — no
+// FFmpeg, no reading the source's own bytes — so it's cheap enough to just
+// await directly rather than needing the same fire-and-forget treatment.
+// `session.chapters`' own `time` values are already in the flattened/output
+// timeline's coordinates (see lib/chapters.ts), so the total duration this
+// needs is the *output* duration (`session.segments`, flattened), not the
+// raw source duration.
+async function writeChaptersVtt(session: import('../types').TranscodingSession, outputFolderHandle: FileSystemDirectoryHandle): Promise<void> {
+  if (!session.chapters?.length) return;
+  const totalDurationSec = session.segments?.length ? flattenedDuration(session.segments) : (session.sourceDuration ?? 0);
+  if (!(totalDurationSec > 0)) return;
+  const vtt = buildChaptersVtt(session.chapters.map((c, i) => ({ id: `chapter-${i}`, time: c.time, title: c.title })), totalDurationSec);
+  await writeOutputFile(outputFolderHandle, 'chapters.vtt', vtt);
 }
 
 interface RenditionResult {
@@ -2388,6 +2406,12 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     } catch (err) {
       log(`Could not generate the scrubbing-preview thumbnail sprite: ${err}`, 'ERROR');
     }
+  }
+
+  try {
+    await writeChaptersVtt(session, outputFolderHandle);
+  } catch (err) {
+    log(`Could not write chapters.vtt: ${err}`, 'ERROR');
   }
 
   const subtitleTags = await resolveSubtitleTracks(session, outputFolderHandle);

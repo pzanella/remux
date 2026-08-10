@@ -390,7 +390,7 @@ export function useTranscoder() {
     };
   }, [outputMode, session?.id, resumableSession?.id, outputFolder, addLog]);
 
-  const start = useCallback((editorSegments?: { sourceStart: number; sourceEnd: number }[]) => {
+  const start = useCallback((editorSegments?: { sourceStart: number; sourceEnd: number }[], chapters?: { time: number; title: string }[]) => {
     if (!session || !outputFolder) return;
 
     setStatus('processing');
@@ -424,6 +424,7 @@ export function useTranscoder() {
       introOutro,
       dubAudioTracks: dubAudioTracks.length > 0 ? dubAudioTracks : undefined,
       segments: editorSegments,
+      chapters: chapters && chapters.length > 0 ? chapters : undefined,
       outputContainer,
       loudnessNormalization,
     };

@@ -54,6 +54,17 @@ export async function attachSubtitle(page: Page, fixtureName: string): Promise<v
   await page.locator('.caption-lane input[type="file"]').setInputFiles(path.join(FIXTURES, fixtureName));
 }
 
+/** Drops a chapter marker at the current playhead (0 by default, since the
+ * preview hasn't been scrubbed) via the persistent chapter ruler below the
+ * caption lane, then renames it through the inline title input that opens
+ * automatically once the marker is selected (see ChapterRuler). */
+export async function addChapter(page: Page, title: string): Promise<void> {
+  await page.click('.chapter-ruler button:has-text("+ Chapter here")');
+  const titleInput = page.locator('.chapter-editor-row .text-input');
+  await titleInput.waitFor({ timeout: 5_000 });
+  await titleInput.fill(title);
+}
+
 /** Toggles an adaptive-bitrate rendition chip (e.g. "240p") on. Selecting
  * any chip is what turns adaptive HLS on at all — see RenditionChips. */
 export async function selectRendition(page: Page, label: string): Promise<void> {

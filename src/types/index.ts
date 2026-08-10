@@ -110,6 +110,14 @@ export interface TranscodingSession {
    * from a genuine trim.
    */
   sourceDuration?: number;
+  /**
+   * Chapter markers for the player's native chapters menu. `time` is
+   * already in the flattened/output timeline's own coordinates (see
+   * `lib/chapters.ts`), not source-relative like `subtitleTracks`' cues, so
+   * the worker needs no `segments`-based remapping step for these — just
+   * `buildChaptersVtt` to turn them into `chapters.vtt`.
+   */
+  chapters?: { time: number; title: string }[];
 }
 
 // ── Adaptive bitrate (multi-resolution) ────────────────────────────

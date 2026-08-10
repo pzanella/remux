@@ -68,6 +68,16 @@ subtitle tracks and all — instead of just a folder of files you have to trust.
   as a playback surprise later. Each track ships as its own
   `#EXT-X-MEDIA:TYPE=SUBTITLES` rendition, switchable from the player's own
   subtitle menu.
+- **Chapters** — drop named markers on the flattened/output timeline from
+  the persistent chapter ruler under the caption lane, renamed inline right
+  where they're placed. Ships as `chapters.vtt`, loaded into Shaka Player's
+  own native "Chapters" menu (with automatic per-chapter thumbnails, reusing
+  the scrubbing-preview sprite above, wherever the browser's own `<img>`
+  loading allows it). A marker is placed against the *edited* preview, not
+  the source, so it doesn't track content if you trim/split/reorder the
+  timeline again afterward — a marker beyond the edit's new end is dropped
+  at export, flagged in the ruler the same way an out-of-range subtitle cue
+  already is.
 - **Intro / outro clips** — attach clips to splice onto the start/end of the
   output, from the collapsed "Intro/outro · Dub audio" strip above the
   timeline. Letterboxed/pillarboxed to match the main content's own
