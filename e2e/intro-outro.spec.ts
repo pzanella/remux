@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { uploadSource, attachIntro, attachOutro, expandExtrasStrip, splitTimelineAt, runExport, downloadZip, listZipEntries, readZipEntryText } from './helpers';
+import { uploadSource, attachIntro, attachOutro, expandExtrasStrip, splitTimelineAt, runExport, downloadZip, listZipEntries, readZipEntryText, getLogText } from './helpers';
 
 test('splices an intro and outro clip onto the main content', async ({ page }, testInfo) => {
   await page.goto('/');
@@ -57,4 +57,49 @@ test('blocks attaching an intro/outro once the timeline has been split, instead 
   await expect(page.locator('.extras-warning')).toBeVisible();
   await expect(page.getByRole('button', { name: '+ Intro' })).toBeDisabled();
   await expect(page.getByRole('button', { name: '+ Outro' })).toBeDisabled();
+});
+
+test('a hardware-encoding fallback along the way does not falsely report the export as failed', async ({ page }, testInfo) => {
+  // long-sample.mp4 is 160x120 with 22050 Hz audio, against sample.mp4's
+  // 320x240/44100 Hz — a real combination that, at least on Chromium (this
+  // is real WebCodecs behavior, not guaranteed identical across engines —
+  // WebKit encodes this one straight through with no fallback needed),
+  // trips a recoverable fallback while letterboxing the intro to match the
+  // main content: WebCodecs' AAC encoder rejects the non-standard sample
+  // rate, logged at 'ERROR' level for its red console styling. Before the
+  // fix, that log level was *also* what the whole job's status came from,
+  // so the export UI declared "Something went wrong" and gave up watching
+  // a job that was still running — and, via its own FFmpeg fallback, went
+  // on to finish correctly seconds later.
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+  await attachIntro(page, 'long-sample.mp4');
+  await attachOutro(page, 'outro.mp4');
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+
+  const logText = await getLogText(page);
+  expect(logText).toContain('Done!');
+
+  const zipPath = testInfo.outputPath('output.zip');
+  await downloadZip(page, zipPath);
+  const entries = listZipEntries(zipPath);
+  expect(entries.some((e) => e.endsWith('.ts'))).toBe(true);
+  expect(readZipEntryText(zipPath, 'index.m3u8')).toContain('#EXT-X-ENDLIST');
+
+  await page.click('.export-modal-close');
+  await expect(page.locator('.player-error')).toHaveCount(0);
+  // At least HAVE_CURRENT_DATA (2), not the stricter HAVE_ENOUGH_DATA (4)
+  // other specs check: this particular shape (an FFmpeg-fallback-encoded
+  // intro spliced with a fast-path main+outro) reliably buffers past
+  // initial data on both engines, but doesn't reach fully-buffered within
+  // any reasonable wait on WebKit specifically — a separate, narrower
+  // playback nuance from the false-failure bug this test is actually about
+  // (no player-error fired above, which is what that bug would have
+  // caused). Real, but for another investigation.
+  const video = page.locator('.player-frame video');
+  await expect
+    .poll(async () => video.evaluate((v: { readyState: number }) => v.readyState), { timeout: 25_000 })
+    .toBeGreaterThanOrEqual(2);
 });

@@ -2184,8 +2184,27 @@ function post(event: WorkerEvent) {
   self.postMessage(event);
 }
 
-function log(msg: string, level: WorkerEvent['type'] = 'PROGRESS') {
-  post({ type: level, log: msg });
+/**
+ * `level: 'ERROR'` here means "show this red in the log console" — a
+ * recoverable fallback worth flagging (hardware→FFmpeg, one rendition
+ * dropped, "continuing without X") — NOT "the job has failed". It always
+ * posts as a plain `PROGRESS` event, never `ERROR`, so it can't flip
+ * useTranscoder's status away from 'processing'/'converting' out from
+ * under a job that's still running, possibly to a real, correct
+ * completion. A genuinely fatal failure posts `{ type: 'ERROR', error }`
+ * directly instead (see every `return` after one in this file) — that's
+ * the only thing that should ever set the job itself to failed.
+ *
+ * Before this split, every one of those recoverable-fallback messages —
+ * despite each explicitly saying "continuing"/"falling back"/"retrying" —
+ * showed "Something went wrong" in the export UI immediately, even on a
+ * job that then finished successfully seconds later: confirmed with a real
+ * intro clip whose audio sample rate WebCodecs' AAC encoder rejected,
+ * where the FFmpeg fallback the log already announced went on to complete
+ * the whole export, well after the UI had already given up on it.
+ */
+function log(msg: string, level: 'PROGRESS' | 'ERROR' = 'PROGRESS') {
+  post({ type: 'PROGRESS', log: msg, logLevel: level === 'ERROR' ? 'error' : 'info' });
 }
 
 function readAt(handle: FileSystemSyncAccessHandle, offset: number, length: number): Uint8Array {

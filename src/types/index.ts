@@ -187,6 +187,17 @@ export interface WorkerEvent {
   renditionLabel?: string;
   /** The master playlist text — only set on the COMPLETE event of an ABR job. */
   masterM3u8?: string;
+  /**
+   * Display styling for `log`, independent of `type` — a `PROGRESS` event
+   * carrying a recoverable-fallback message (e.g. "hardware encoding
+   * failed, falling back to FFmpeg…") still needs to show red in the log
+   * console, but must NOT flip the whole job to `type: 'ERROR'`, which is
+   * reserved for genuine, job-ending failures (see remux.worker.ts's own
+   * `log` helper). Falls back to the old type-based inference in
+   * useTranscoder when unset, for COMPLETE/ERROR/PAUSED events that don't
+   * bother setting this explicitly.
+   */
+  logLevel?: 'info' | 'success' | 'warn' | 'error';
 }
 
 // ── UI state ───────────────────────────────────────────────────────

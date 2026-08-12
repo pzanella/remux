@@ -122,8 +122,13 @@ export function useTranscoder() {
     worker.onmessage = (e: MessageEvent<WorkerEvent>) => {
       const ev = e.data;
       if (ev.log) {
+        // `logLevel` (styling only — see remux.worker.ts's own `log` helper)
+        // takes priority when the worker sets it explicitly; events that
+        // don't (COMPLETE/ERROR/PAUSED posted directly, not through that
+        // helper) fall back to the old type-based inference.
         const level =
-          ev.type === 'ERROR' ? 'error' : ev.type === 'COMPLETE' ? 'success' : ev.type === 'PAUSED' ? 'warn' : 'info';
+          ev.logLevel ??
+          (ev.type === 'ERROR' ? 'error' : ev.type === 'COMPLETE' ? 'success' : ev.type === 'PAUSED' ? 'warn' : 'info');
         addLog(ev.log, level);
       }
 
