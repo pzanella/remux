@@ -6,7 +6,7 @@ import type { ClipFile } from '../hooks/useTranscoder';
 // section) — no FFmpeg pre-conversion step exists for them the way there is
 // for the main file, so only formats the Rust remuxer can read directly are
 // accepted here.
-const NATIVE_ACCEPT = '.mp4,.mov,.m4v,.3gp,.f4v';
+export const NATIVE_ACCEPT = '.mp4,.mov,.m4v,.3gp,.f4v';
 // A dub track's own video (if any) is never used — only its audio track is
 // read (see remuxDubAudioTrack) — so this also accepts audio-only formats,
 // normalized to AAC/M4A by FFmpeg if they aren't already MP4-family.

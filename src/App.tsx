@@ -283,9 +283,14 @@ export default function App() {
             beginGesture={editor.beginGesture}
             previewUpdate={editor.previewUpdate}
             commitGesture={editor.commitGesture}
-            introLabel={t.introFile?.label}
-            outroLabel={t.outroFile?.label}
+            introClip={t.introFile ? { label: t.introFile.label, duration: t.introFile.duration } : null}
+            outroClip={t.outroFile ? { label: t.outroFile.label, duration: t.outroFile.duration } : null}
+            onSelectIntroFile={t.selectIntroFile}
+            onClearIntroFile={t.clearIntroFile}
+            onSelectOutroFile={t.selectOutroFile}
+            onClearOutroFile={t.clearOutroFile}
             hasIntroOrOutro={hasIntroOrOutro}
+            hasEditedSegments={hasEditedSegments}
           />
         )}
       </div>

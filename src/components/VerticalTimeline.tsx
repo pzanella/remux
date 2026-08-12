@@ -10,6 +10,7 @@ import {
   trimSegmentEnd,
   trimSegmentStart,
 } from '../lib/segments';
+import { NATIVE_ACCEPT } from './MediaExtrasPanel';
 
 /** A curated warm-orange/teal spread (the two brand colors plus a few
  * in-between tones) rather than a full hue wheel — segment colors need to
@@ -51,6 +52,89 @@ function syntheticPeaks(id: string, count: number): number[] {
   return Array.from({ length: count }, () => 0.22 + next() * 0.7);
 }
 
+interface IntroOutroClip {
+  label: string;
+  duration?: number;
+}
+
+interface IntroOutroSlotProps {
+  kind: 'intro' | 'outro';
+  clip: IntroOutroClip | null | undefined;
+  disabled: boolean;
+  onSelect: (file: File) => void;
+  onClear: () => void;
+}
+
+/**
+ * A flanking slot above/below the main clip stack, styled like a real clip
+ * card (thumb block, name, duration) once something's attached — accepting
+ * either a click (opens a picker) or a native OS file drop, the same two
+ * ways `EmptyState`'s own dropzone already accepts the very first source
+ * file. This is a second entry point alongside MediaExtrasPanel's own
+ * "+ Intro"/"+ Outro" buttons, not a replacement for it — dub-audio still
+ * only lives there, and this one's whole point is putting intro/outro
+ * where they visually belong: in the timeline itself.
+ */
+function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear }: IntroOutroSlotProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [isOver, setIsOver] = useState(false);
+  const label = kind === 'intro' ? 'Intro' : 'Outro';
+
+  if (clip) {
+    return (
+      <div className={`rail-extra-card rail-extra-card--${kind}`}>
+        <div className="rail-extra-card-thumb" aria-hidden="true" />
+        <div className="rail-extra-card-info">
+          <span className="rail-extra-card-tag">{label}</span>
+          <span className="rail-extra-card-label">{clip.label}</span>
+          {clip.duration !== undefined && <span className="rail-extra-card-duration">{formatDuration(clip.duration)}</span>}
+        </div>
+        <button type="button" className="rail-extra-card-remove" onClick={onClear} title={`Remove ${label.toLowerCase()}`}>
+          ✕
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className={`rail-extra-slot${isOver ? ' is-drag-over' : ''}`}
+      disabled={disabled}
+      onClick={() => inputRef.current?.click()}
+      onDragOver={(e) => {
+        if (disabled) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+        setIsOver(true);
+      }}
+      onDragLeave={() => setIsOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setIsOver(false);
+        if (disabled) return;
+        const file = e.dataTransfer.files?.[0];
+        if (file) onSelect(file);
+      }}
+      title={disabled ? 'Not available together with a trimmed/split timeline yet' : `Drop a video here, or click to add ${kind === 'intro' ? 'an intro' : 'an outro'}`}
+    >
+      <span className="rail-extra-slot-plus">+</span> {label}
+      <input
+        ref={inputRef}
+        type="file"
+        accept={NATIVE_ACCEPT}
+        className="sr-only"
+        disabled={disabled}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) onSelect(file);
+          e.target.value = '';
+        }}
+      />
+    </button>
+  );
+}
+
 interface VerticalTimelineProps {
   segments: EditorSegment[];
   selectedId: string | null;
@@ -69,21 +153,29 @@ interface VerticalTimelineProps {
   beginGesture: () => void;
   previewUpdate: (mutate: (prev: EditorSegment[]) => EditorSegment[]) => void;
   commitGesture: () => void;
-  /** Display-only labels for attached intro/outro clips — shown as simple
-   * flanking cards above/below the main clip stack so they're part of what
-   * the timeline visibly shows, not just the separate collapsed extras
-   * strip (see MediaExtrasPanel). Not part of `segments`/the pixel-precise
-   * card layout at all: intro/outro splicing is mutually exclusive with a
-   * trimmed/split timeline (see `hasIntroOrOutro` below), so there's never
-   * a case where these coexist with more than the one trivial segment. */
-  introLabel?: string | null;
-  outroLabel?: string | null;
-  /** Disables Split — intro/outro splicing and a trimmed/split timeline
-   * aren't supported together yet (see remux.worker.ts's own guard), and
-   * this is the other half of that guard from MediaExtrasPanel's own
-   * `hasEditedSegments`: whichever of the two happens first blocks the
-   * other, instead of only failing at export time. */
+  /** Attached intro/outro clips — shown as flanking cards above/below the
+   * main clip stack, styled like a real clip, so they're part of what the
+   * timeline visibly shows rather than only living in the separate
+   * collapsed extras strip (see MediaExtrasPanel). Not part of
+   * `segments`/the pixel-precise card layout at all: intro/outro splicing
+   * is mutually exclusive with a trimmed/split timeline (see
+   * `hasIntroOrOutro` below), so there's never a case where these coexist
+   * with more than the one trivial segment. */
+  introClip?: IntroOutroClip | null;
+  outroClip?: IntroOutroClip | null;
+  onSelectIntroFile: (file: File) => void;
+  onClearIntroFile: () => void;
+  onSelectOutroFile: (file: File) => void;
+  onClearOutroFile: () => void;
+  /** Disables Split (and the empty intro/outro slots' own picker/drop) —
+   * intro/outro splicing and a trimmed/split timeline aren't supported
+   * together yet (see remux.worker.ts's own guard). `hasIntroOrOutro`
+   * blocks Split once intro/outro is attached; `hasEditedSegments` (the
+   * other half of the same guard, mirrored in MediaExtrasPanel) blocks
+   * attaching intro/outro once segments are edited — whichever happens
+   * first blocks the other, instead of only failing at export time. */
   hasIntroOrOutro: boolean;
+  hasEditedSegments: boolean;
 }
 
 /**
@@ -111,9 +203,14 @@ export default function VerticalTimeline({
   beginGesture,
   previewUpdate,
   commitGesture,
-  introLabel,
-  outroLabel,
+  introClip,
+  outroClip,
+  onSelectIntroFile,
+  onClearIntroFile,
+  onSelectOutroFile,
+  onClearOutroFile,
   hasIntroOrOutro,
+  hasEditedSegments,
 }: VerticalTimelineProps) {
   const railRef = useRef<HTMLDivElement>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
@@ -177,12 +274,7 @@ export default function VerticalTimeline({
           </button>
         </div>
       </div>
-      {introLabel && (
-        <div className="rail-extra-card rail-extra-card--intro">
-          <span className="rail-extra-card-tag">Intro</span>
-          <span className="rail-extra-card-label">{introLabel}</span>
-        </div>
-      )}
+      <IntroOutroSlot kind="intro" clip={introClip} disabled={hasEditedSegments} onSelect={onSelectIntroFile} onClear={onClearIntroFile} />
       <div className="timeline-rail" ref={railRef} onPointerDown={handleRailPointerDown} style={{ minHeight: totalHeight }}>
       <div className="rail-spine">
         {layout.map((card, i) => (
@@ -303,12 +395,7 @@ export default function VerticalTimeline({
         <span className="rail-playhead-badge">{formatDuration(playheadTime)}</span>
       </div>
       </div>
-      {outroLabel && (
-        <div className="rail-extra-card rail-extra-card--outro">
-          <span className="rail-extra-card-tag">Outro</span>
-          <span className="rail-extra-card-label">{outroLabel}</span>
-        </div>
-      )}
+      <IntroOutroSlot kind="outro" clip={outroClip} disabled={hasEditedSegments} onSelect={onSelectOutroFile} onClear={onClearOutroFile} />
     </div>
   );
 }

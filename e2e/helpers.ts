@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { expect, type Page } from '@playwright/test';
+import { expect, type Locator, type Page } from '@playwright/test';
 
 // `package.json`'s "type": "module" makes this file ESM at runtime even
 // though it's type-checked under CommonJS (see e2e/tsconfig.json) — no
@@ -14,6 +15,34 @@ export async function uploadSource(page: Page, fixtureName: string): Promise<voi
   const [chooser] = await Promise.all([page.waitForEvent('filechooser'), page.click('.dropzone')]);
   await chooser.setFiles(path.join(FIXTURES, fixtureName));
   await page.waitForSelector('.topbar', { timeout: 30_000 });
+}
+
+/**
+ * Simulates a native OS file drop (a real `dragenter`/`dragover`/`drop`
+ * sequence with a `DataTransfer` carrying real file bytes) onto `locator` —
+ * for drop targets with no backing `<input type="file">` a plain
+ * `setInputFiles` could target directly (e.g. VerticalTimeline's own
+ * intro/outro slots). The DataTransfer-building callback is passed as a
+ * plain string, not a typed function: it references browser-only globals
+ * (File, DataTransfer, atob) that e2e/tsconfig.json's DOM-less lib doesn't
+ * know about, even though they're real and correct once this actually runs
+ * in the browser — same class of gap documented on other DOM-typed e2e
+ * helpers in this file.
+ */
+export async function dropFileOnto(page: Page, locator: Locator, filePath: string): Promise<void> {
+  const base64 = readFileSync(filePath).toString('base64');
+  const fileName = path.basename(filePath);
+  const dataTransfer = await page.evaluateHandle(`(() => {
+    const bytes = Uint8Array.from(atob(${JSON.stringify(base64)}), (c) => c.charCodeAt(0));
+    const file = new File([bytes], ${JSON.stringify(fileName)}, { type: 'video/mp4' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    return dt;
+  })()`);
+
+  await locator.dispatchEvent('dragenter', { dataTransfer });
+  await locator.dispatchEvent('dragover', { dataTransfer });
+  await locator.dispatchEvent('drop', { dataTransfer });
 }
 
 /** Expands the persistent intro/outro/dub-audio strip if it's collapsed. */

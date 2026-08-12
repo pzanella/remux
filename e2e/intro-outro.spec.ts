@@ -1,5 +1,19 @@
+import path from 'node:path';
 import { test, expect } from './fixtures';
-import { uploadSource, attachIntro, attachOutro, expandExtrasStrip, splitTimelineAt, runExport, downloadZip, listZipEntries, readZipEntryText, getLogText } from './helpers';
+import {
+  FIXTURES,
+  uploadSource,
+  attachIntro,
+  attachOutro,
+  expandExtrasStrip,
+  splitTimelineAt,
+  dropFileOnto,
+  runExport,
+  downloadZip,
+  listZipEntries,
+  readZipEntryText,
+  getLogText,
+} from './helpers';
 
 test('splices an intro and outro clip onto the main content', async ({ page }, testInfo) => {
   await page.goto('/');
@@ -55,8 +69,28 @@ test('blocks attaching an intro/outro once the timeline has been split, instead 
   await expandExtrasStrip(page);
 
   await expect(page.locator('.extras-warning')).toBeVisible();
-  await expect(page.getByRole('button', { name: '+ Intro' })).toBeDisabled();
-  await expect(page.getByRole('button', { name: '+ Outro' })).toBeDisabled();
+  await expect(page.locator('.extras-row').getByRole('button', { name: '+ Intro' })).toBeDisabled();
+  await expect(page.locator('.extras-row').getByRole('button', { name: '+ Outro' })).toBeDisabled();
+  // The timeline's own intro/outro slots (see VerticalTimeline's
+  // IntroOutroSlot) are a second entry point for the exact same action —
+  // must be equally blocked, not just the collapsed strip's buttons.
+  await expect(page.locator('.rail-extra-slot').first()).toBeDisabled();
+  await expect(page.locator('.rail-extra-slot').last()).toBeDisabled();
+});
+
+test('drag-and-dropping a video file onto the timeline\'s intro/outro slots attaches it', async ({ page }) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+
+  const introSlot = page.locator('.rail-extra-slot').first();
+  await dropFileOnto(page, introSlot, path.join(FIXTURES, 'intro.mp4'));
+  await expect(page.locator('.rail-extra-card--intro')).toContainText('intro.mp4');
+
+  // Intro's own empty slot is gone now that it's attached (replaced by
+  // .rail-extra-card--intro), so the one remaining .rail-extra-slot is outro's.
+  const outroSlot = page.locator('.rail-extra-slot').first();
+  await dropFileOnto(page, outroSlot, path.join(FIXTURES, 'outro.mp4'));
+  await expect(page.locator('.rail-extra-card--outro')).toContainText('outro.mp4');
 });
 
 test('a hardware-encoding fallback along the way does not falsely report the export as failed', async ({ page }, testInfo) => {
