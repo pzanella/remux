@@ -670,12 +670,22 @@ async function cutSegmentClip(
     const { data, inputName } = await loadFFmpegInput(opfsRoot, sourceOpfsName);
     await ffmpeg.writeFile(inputName, data);
     const outputName = 'cut_output.mp4';
+    // +faststart moves moov to the front, same as convertToMp4's own reason
+    // for it: without it, FFmpeg's default MP4 muxer writes moov last (it
+    // can't finalize the sample table until every sample's been written),
+    // which every downstream reader of this clip (both the Rust wasm
+    // parser's own head-then-tail-retry and WebCodecs ABR's identical
+    // fallback) has to guess around instead of just finding it up front —
+    // confirmed causing a real "moov box not found in data" failure (only
+    // surfacing on some cuts, not others, depending on where the tail-read
+    // window happened to land) before this was added.
     await ffmpeg.exec([
       '-ss', sourceStart.toFixed(3),
       '-i', inputName,
       '-t', Math.max(0, sourceEnd - sourceStart).toFixed(3),
       '-c', 'copy',
       '-avoid_negative_ts', 'make_zero',
+      '-movflags', '+faststart',
       '-y',
       outputName,
     ]);

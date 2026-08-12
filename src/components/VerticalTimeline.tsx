@@ -69,6 +69,21 @@ interface VerticalTimelineProps {
   beginGesture: () => void;
   previewUpdate: (mutate: (prev: EditorSegment[]) => EditorSegment[]) => void;
   commitGesture: () => void;
+  /** Display-only labels for attached intro/outro clips — shown as simple
+   * flanking cards above/below the main clip stack so they're part of what
+   * the timeline visibly shows, not just the separate collapsed extras
+   * strip (see MediaExtrasPanel). Not part of `segments`/the pixel-precise
+   * card layout at all: intro/outro splicing is mutually exclusive with a
+   * trimmed/split timeline (see `hasIntroOrOutro` below), so there's never
+   * a case where these coexist with more than the one trivial segment. */
+  introLabel?: string | null;
+  outroLabel?: string | null;
+  /** Disables Split — intro/outro splicing and a trimmed/split timeline
+   * aren't supported together yet (see remux.worker.ts's own guard), and
+   * this is the other half of that guard from MediaExtrasPanel's own
+   * `hasEditedSegments`: whichever of the two happens first blocks the
+   * other, instead of only failing at export time. */
+  hasIntroOrOutro: boolean;
 }
 
 /**
@@ -96,6 +111,9 @@ export default function VerticalTimeline({
   beginGesture,
   previewUpdate,
   commitGesture,
+  introLabel,
+  outroLabel,
+  hasIntroOrOutro,
 }: VerticalTimelineProps) {
   const railRef = useRef<HTMLDivElement>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
@@ -159,6 +177,12 @@ export default function VerticalTimeline({
           </button>
         </div>
       </div>
+      {introLabel && (
+        <div className="rail-extra-card rail-extra-card--intro">
+          <span className="rail-extra-card-tag">Intro</span>
+          <span className="rail-extra-card-label">{introLabel}</span>
+        </div>
+      )}
       <div className="timeline-rail" ref={railRef} onPointerDown={handleRailPointerDown} style={{ minHeight: totalHeight }}>
       <div className="rail-spine">
         {layout.map((card, i) => (
@@ -260,12 +284,12 @@ export default function VerticalTimeline({
                   className="split-button"
                   draggable={false}
                   style={{ top: splitLocalPx }}
-                  disabled={disabled}
+                  disabled={disabled || hasIntroOrOutro}
                   onClick={(e) => {
                     e.stopPropagation();
                     onSplit();
                   }}
-                  title="Split this clip at the playhead"
+                  title={hasIntroOrOutro ? 'Not available together with an attached intro/outro yet — remove it first' : 'Split this clip at the playhead'}
                 >
                   ✂ Split here
                 </button>
@@ -279,6 +303,12 @@ export default function VerticalTimeline({
         <span className="rail-playhead-badge">{formatDuration(playheadTime)}</span>
       </div>
       </div>
+      {outroLabel && (
+        <div className="rail-extra-card rail-extra-card--outro">
+          <span className="rail-extra-card-tag">Outro</span>
+          <span className="rail-extra-card-label">{outroLabel}</span>
+        </div>
+      )}
     </div>
   );
 }

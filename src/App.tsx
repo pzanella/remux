@@ -14,6 +14,7 @@ import { useTranscoder } from './hooks/useTranscoder';
 import { useEditorSegments } from './hooks/useEditorSegments';
 import { useChapters } from './hooks/useChapters';
 import { useBatchTranscoder } from './hooks/useBatchTranscoder';
+import { isTrivialEdit } from './lib/segments';
 
 export default function App() {
   const t = useTranscoder();
@@ -21,6 +22,15 @@ export default function App() {
   const chapters = useChapters(t.sourceDuration);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const previewRef = useRef<PreviewPaneHandle>(null);
+
+  // Intro/outro splicing and a trimmed/split timeline aren't supported
+  // together yet (see remux.worker.ts's own guard in runTranscoding) —
+  // computed once here and threaded to both MediaExtrasPanel (disables
+  // attaching intro/outro once segments are edited) and VerticalTimeline
+  // (disables Split once intro/outro is attached), so whichever comes first
+  // blocks the other instead of only failing at export time.
+  const hasEditedSegments = t.sourceDuration !== undefined && !isTrivialEdit(editor.segments, t.sourceDuration);
+  const hasIntroOrOutro = !!(t.introFile || t.outroFile);
 
   // Batch mode is a fully separate flow (see useBatchTranscoder's own doc
   // comment) — its own hook instance, never touching `t` at all, swapped in
@@ -201,10 +211,11 @@ export default function App() {
           onSelectDubAudioTrack={t.selectDubAudioTrack}
           onRemoveDubAudioTrack={t.removeDubAudioTrack}
           onSetDubAudioTrackLanguage={t.setDubAudioTrackLanguage}
+          hasEditedSegments={hasEditedSegments}
         />
       )}
 
-      <div className="editor-layout">
+      <div className={`editor-layout${editingPhase ? '' : ' editor-layout--single'}`}>
         <div className="editor-main">
           {editingPhase ? (
             <>
@@ -253,25 +264,30 @@ export default function App() {
           )}
         </div>
 
-        <VerticalTimeline
-          segments={editor.segments}
-          selectedId={editor.selectedId}
-          playheadTime={editor.playheadTime}
-          sourceDuration={t.sourceDuration ?? 0}
-          disabled={!editingPhase}
-          canUndo={editor.canUndo}
-          canRedo={editor.canRedo}
-          onUndo={editor.undo}
-          onRedo={editor.redo}
-          onSelect={editor.setSelectedId}
-          onPlayheadChange={editor.setPlayheadTime}
-          onSplit={editor.splitAtPlayhead}
-          onDelete={editor.remove}
-          onReorder={editor.reorder}
-          beginGesture={editor.beginGesture}
-          previewUpdate={editor.previewUpdate}
-          commitGesture={editor.commitGesture}
-        />
+        {editingPhase && (
+          <VerticalTimeline
+            segments={editor.segments}
+            selectedId={editor.selectedId}
+            playheadTime={editor.playheadTime}
+            sourceDuration={t.sourceDuration ?? 0}
+            disabled={!editingPhase}
+            canUndo={editor.canUndo}
+            canRedo={editor.canRedo}
+            onUndo={editor.undo}
+            onRedo={editor.redo}
+            onSelect={editor.setSelectedId}
+            onPlayheadChange={editor.setPlayheadTime}
+            onSplit={editor.splitAtPlayhead}
+            onDelete={editor.remove}
+            onReorder={editor.reorder}
+            beginGesture={editor.beginGesture}
+            previewUpdate={editor.previewUpdate}
+            commitGesture={editor.commitGesture}
+            introLabel={t.introFile?.label}
+            outroLabel={t.outroFile?.label}
+            hasIntroOrOutro={hasIntroOrOutro}
+          />
+        )}
       </div>
 
       {exportModalOpen && (

@@ -136,6 +136,15 @@ export async function enableLoudnessNormalization(page: Page): Promise<void> {
   await page.getByLabel('Normalize loudness (EBU R128)').check();
 }
 
+/** Sums every `#EXTINF` duration in a media playlist's text — the real
+ * total runtime of that rendition, independent of segment count. */
+export function totalPlaylistDurationSec(playlistText: string): number {
+  const matches = playlistText.matchAll(/#EXTINF:([\d.]+)/g);
+  let total = 0;
+  for (const m of matches) total += parseFloat(m[1]);
+  return total;
+}
+
 export async function getLogText(page: Page): Promise<string> {
   const logTab = page.locator('.tab-btn', { hasText: 'Log' });
   await logTab.click();

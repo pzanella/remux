@@ -29,21 +29,31 @@ interface MediaExtrasPanelProps {
   onSelectDubAudioTrack: (file: File) => void;
   onRemoveDubAudioTrack: (fileName: string) => void;
   onSetDubAudioTrackLanguage: (fileName: string, language: string) => void;
+  /** Intro/outro splicing and a trimmed/split timeline aren't supported
+   * together yet (see remux.worker.ts's own guard in runTranscoding) — the
+   * worker used to be the only place this was ever caught, as a runtime
+   * error after Start. Disabling the picker here instead means the
+   * incompatible combination is never reachable in the first place. */
+  hasEditedSegments: boolean;
 }
 
 function FilePickerButton({
   label,
   accept,
   onSelect,
+  disabled,
+  title,
 }: {
   label: string;
   accept: string;
   onSelect: (file: File) => void;
+  disabled?: boolean;
+  title?: string;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   return (
     <>
-      <button type="button" className="btn" onClick={() => inputRef.current?.click()}>
+      <button type="button" className="btn" onClick={() => inputRef.current?.click()} disabled={disabled} title={title}>
         {label}
       </button>
       <input
@@ -81,6 +91,7 @@ export default function MediaExtrasPanel({
   onSelectDubAudioTrack,
   onRemoveDubAudioTrack,
   onSetDubAudioTrackLanguage,
+  hasEditedSegments,
 }: MediaExtrasPanelProps) {
   const [expanded, setExpanded] = useState(false);
 
@@ -101,6 +112,11 @@ export default function MediaExtrasPanel({
         <div className="extras-strip-body">
           <div className="extras-section">
             <span className="panel-hint">Intro / outro</span>
+            {hasEditedSegments && (
+              <span className="extras-warning">
+                Not available together with a trimmed/split timeline yet — undo those edits first.
+              </span>
+            )}
             <div className="extras-row">
               {introFile ? (
                 <span className="extras-item">
@@ -110,7 +126,13 @@ export default function MediaExtrasPanel({
                   </button>
                 </span>
               ) : (
-                <FilePickerButton label="+ Intro" accept={NATIVE_ACCEPT} onSelect={onSelectIntroFile} />
+                <FilePickerButton
+                  label="+ Intro"
+                  accept={NATIVE_ACCEPT}
+                  onSelect={onSelectIntroFile}
+                  disabled={hasEditedSegments}
+                  title={hasEditedSegments ? 'Not available together with a trimmed/split timeline yet' : undefined}
+                />
               )}
               {outroFile ? (
                 <span className="extras-item">
@@ -120,7 +142,13 @@ export default function MediaExtrasPanel({
                   </button>
                 </span>
               ) : (
-                <FilePickerButton label="+ Outro" accept={NATIVE_ACCEPT} onSelect={onSelectOutroFile} />
+                <FilePickerButton
+                  label="+ Outro"
+                  accept={NATIVE_ACCEPT}
+                  onSelect={onSelectOutroFile}
+                  disabled={hasEditedSegments}
+                  title={hasEditedSegments ? 'Not available together with a trimmed/split timeline yet' : undefined}
+                />
               )}
             </div>
           </div>

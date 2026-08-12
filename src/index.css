@@ -973,6 +973,10 @@ body {
   border-top: 1px solid var(--line);
   padding-top: 0.7rem;
 }
+.extras-warning {
+  font-size: 0.72rem;
+  color: var(--danger);
+}
 .extras-row {
   display: flex;
   align-items: center;
@@ -1079,6 +1083,37 @@ body {
 .rail-toolbar-actions {
   display: flex;
   gap: 0.7rem;
+}
+
+.rail-extra-card {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+  padding: 0.5rem 0.7rem;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+}
+.rail-extra-card-tag {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  padding: 0.1rem 0.5rem;
+}
+.rail-extra-card-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8rem;
+  color: var(--text-muted);
 }
 
 .timeline-rail {

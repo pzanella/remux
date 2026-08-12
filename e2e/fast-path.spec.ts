@@ -18,4 +18,11 @@ test('converts a native H.264/AAC source via the fast remux path', async ({ page
   const playlist = readZipEntryText(zipPath, 'index.m3u8');
   expect(playlist).toContain('#EXTM3U');
   expect(playlist).toContain('#EXT-X-ENDLIST');
+
+  // The editing rail (timeline, captions, chapters) has nothing left to do
+  // once the job is running — it gets out of the way entirely instead of
+  // sticking around disabled, leaving the result player as the one focus.
+  await page.click('.export-modal-close');
+  await expect(page.locator('.timeline-rail-panel')).toHaveCount(0);
+  await expect(page.locator('.player-frame')).toBeVisible();
 });

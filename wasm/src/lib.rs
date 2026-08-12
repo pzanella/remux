@@ -895,6 +895,18 @@ fn compute_audio_only_segments_at_boundaries(
     if audio.is_empty() || boundary_secs.is_empty() {
         return vec![];
     }
+    // A dub track can run a little longer than the main content's own last
+    // boundary (encoder padding, rounding) — that trailing sliver is worth
+    // keeping rather than dropping. A dub track that's *much* longer (this
+    // tolerance is in whole seconds, not a rounding fraction) is a
+    // different situation: cramming everything past that point into one
+    // giant final segment produced a media playlist wildly longer than the
+    // main content's own, which is exactly what confused real players (a
+    // duration mismatch between renditions in the same audio group). Cut it
+    // at the boundary like every other segment instead, the same "cut
+    // without a problem" behavior a too-long segments list already gets.
+    const LAST_SEGMENT_TRAILING_TOLERANCE_SEC: f64 = 0.5;
+
     let mut segments: Vec<SegmentSamples> = Vec::new();
     let start_dts = audio[0].dts;
     let mut cursor = 0usize;
@@ -902,17 +914,14 @@ fn compute_audio_only_segments_at_boundaries(
     for (idx, &boundary_sec) in boundary_secs.iter().enumerate() {
         let is_last = idx == boundary_secs.len() - 1;
         let seg_start = cursor;
-
-        if is_last {
-            // Absorb every remaining sample — a dub track can run a little
-            // longer or shorter than the main content, and whatever's left
-            // belongs in the final segment rather than being dropped.
-            cursor = audio.len();
+        let boundary_ts = start_dts + (boundary_sec * audio_timescale as f64) as u64;
+        let cutoff_ts = if is_last {
+            boundary_ts + (LAST_SEGMENT_TRAILING_TOLERANCE_SEC * audio_timescale as f64) as u64
         } else {
-            let boundary_ts = start_dts + (boundary_sec * audio_timescale as f64) as u64;
-            while cursor < audio.len() && audio[cursor].dts < boundary_ts {
-                cursor += 1;
-            }
+            boundary_ts
+        };
+        while cursor < audio.len() && audio[cursor].dts < cutoff_ts {
+            cursor += 1;
         }
 
         if cursor <= seg_start {
@@ -2116,15 +2125,34 @@ mod tests {
     }
 
     #[test]
-    fn audio_only_segments_at_boundaries_longer_track_absorbs_remainder_into_last() {
-        // A dub track longer than the main content: the *last* boundary
-        // always absorbs every remaining sample regardless of its own
-        // stated time, so trailing extra audio is folded into the final
-        // segment instead of being dropped.
-        let samples: Vec<SampleInfo> = (0..150).map(|i| audio_sample(i, 1)).collect();
+    fn audio_only_segments_at_boundaries_slightly_longer_track_absorbs_the_trailing_sliver() {
+        // A dub track only a little longer than the main content (here:
+        // 0.2s of samples past the 1.0s last boundary, within the 0.5s
+        // trailing tolerance) keeps that sliver in the final segment
+        // instead of dropping it — encoder padding/rounding, not a real
+        // duration mismatch.
+        let samples: Vec<SampleInfo> = (0..120).map(|i| audio_sample(i, 1)).collect();
         let segments = compute_audio_only_segments_at_boundaries(&samples, 100, &[0.3, 0.6, 1.0]);
         assert_eq!(segments.len(), 3);
-        assert_eq!(segments[2].audio.len(), 90, "60 samples up to 0.6s already consumed, the remaining 90 all land here");
+        assert_eq!(segments[2].audio.len(), 60, "60 samples up to 0.6s already consumed, the remaining 60 (including the 0.2s sliver) land here");
+    }
+
+    #[test]
+    fn audio_only_segments_at_boundaries_much_longer_track_is_cut_at_the_last_boundary() {
+        // A dub track *much* longer than the main content (1000 samples =
+        // 10s of audio against a 1.0s last boundary) must not turn into one
+        // giant final segment covering the whole extra length; it's cut at
+        // the boundary (plus the small trailing tolerance) like every other
+        // segment, and the leftover samples are simply never emitted.
+        let samples: Vec<SampleInfo> = (0..1000).map(|i| audio_sample(i, 1)).collect();
+        let segments = compute_audio_only_segments_at_boundaries(&samples, 100, &[0.3, 0.6, 1.0]);
+        assert_eq!(segments.len(), 3);
+        let total: usize = segments.iter().map(|s| s.audio.len()).sum();
+        assert!(total < 1000, "the dub track's own far-future tail must not all land in the last segment");
+        assert_eq!(
+            segments[2].audio.len(), 90,
+            "last segment covers 0.6s-1.0s plus the 0.5s trailing tolerance (150 samples), minus the 60 already consumed by earlier segments"
+        );
     }
 
     fn pmt_section_length(pkt: &[u8]) -> u16 {
