@@ -116,8 +116,8 @@ export async function addChapter(page: Page, title: string): Promise<void> {
 
 /** Splits the timeline at a fractional position (0-1) of the current
  * clip's own duration — scrubs the playhead there via the Timeline's own
- * track, then clicks the "Split" button it shows once the playhead lands
- * inside the selected (by default, the only) segment. */
+ * track, then clicks the standalone scissors button in the toolbar (no
+ * clip selection needed; splitAtPlayhead works off the playhead alone). */
 export async function splitTimelineAt(page: Page, fraction: number): Promise<void> {
   const track = page.locator('.timeline-track');
   const box = await track.boundingBox();
@@ -130,7 +130,7 @@ export async function splitTimelineAt(page: Page, fraction: number): Promise<voi
   // turning every split below into a no-op refused for being too close to
   // the segment's own start).
   await track.click({ position: { x: box.width * fraction, y: box.height / 2 } });
-  await page.click('.split-button');
+  await page.click('.timeline-toolbar .icon-btn');
 }
 
 /** Toggles an adaptive-bitrate rendition chip (e.g. "240p") on. Selecting

@@ -17,7 +17,7 @@ test('a dropped chapter warns via a hover/click popup, not just an inert badge',
   await track.click({ position: { x: box.width * 0.95, y: box.height / 2 } });
   await addChapter(page, 'Near end');
   await track.click({ position: { x: box.width * 0.8, y: box.height / 2 } });
-  await page.click('.split-button');
+  await page.click('.timeline-toolbar .icon-btn');
   const clips = page.locator('.timeline-clip:not(.timeline-clip--extra)');
   await expect(clips).toHaveCount(2);
   await clips.nth(1).click();

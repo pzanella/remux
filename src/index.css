@@ -1203,6 +1203,36 @@ body {
   gap: 0.6rem;
 }
 
+/* Combined intro+main+outro overview (TimelineOverviewRuler) — read-only,
+   genuinely proportional across the full spliced duration, unlike the
+   fixed-width intro/outro cards above it. Reuses .scrub-bar-marker for the
+   boundary ticks, same high-contrast styling PreviewPane's own scrub bar
+   already uses. */
+.timeline-overview {
+  position: relative;
+  height: 4px;
+  margin-top: 0.6rem;
+  border-radius: 2px;
+  background: var(--line);
+}
+.timeline-overview-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  pointer-events: none;
+}
+.timeline-overview-handle {
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
 /* Intro/outro flanking slots — fixed width so the layout doesn't jump when
    toggling between the attached and empty states. */
 .timeline-clip--extra,
@@ -1264,7 +1294,6 @@ body {
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
   background: var(--bg-sunken);
-  overflow: hidden;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 .timeline-clip:hover {
@@ -1426,35 +1455,31 @@ body {
   right: -0.3rem;
 }
 
-.split-button {
-  position: absolute;
-  top: 0.4rem;
-  z-index: 4;
-  transform: translateX(-50%);
+/* A small icon-only action button — currently just the Split scissors next
+   to the "Timeline" label (see Timeline.tsx's own toolbar), but generic
+   enough to reuse for any future icon-only toolbar action. */
+.icon-btn {
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 0.2rem;
-  padding: 0.2rem 0.45rem;
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-pill);
-  background: var(--bg-panel);
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.icon-btn:hover:not(:disabled) {
+  border-color: var(--accent);
   color: var(--accent);
-  font-family: var(--font-mono);
-  font-size: 0.6rem;
-  font-weight: 600;
-  white-space: nowrap;
-  box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.6);
 }
-.split-button:hover:not(:disabled) {
-  background: var(--accent);
-  color: var(--accent-text);
-}
-.split-button:disabled {
+.icon-btn:disabled {
   cursor: not-allowed;
-  opacity: 0.45;
-  border-color: var(--line-strong);
-  color: var(--text-tertiary);
+  opacity: 0.4;
 }
 
 .timeline-playhead {

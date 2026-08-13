@@ -71,10 +71,13 @@ test('plays an attached intro, then main content, then an attached outro, in seq
   await attachOutro(page, 'outro.mp4');
 
   // Combined preview timeline: intro (1s) + main (2s) + outro (1s) = 4s.
+  // Scoped to the preview's own scrub bar — Timeline's own overview ruler
+  // (see TimelineOverviewRuler) reuses the same marker class for its own,
+  // separate pair.
   await expect(page.locator('.timecode')).toContainText('/ 00:04');
-  await expect(page.locator('.scrub-bar-marker')).toHaveCount(2);
+  await expect(page.locator('.scrub-bar .scrub-bar-marker')).toHaveCount(2);
   // High-contrast var(--warning), not the old near-invisible var(--bg).
-  await expect(page.locator('.scrub-bar-marker').first()).toHaveCSS('background-color', 'rgb(245, 197, 66)');
+  await expect(page.locator('.scrub-bar .scrub-bar-marker').first()).toHaveCSS('background-color', 'rgb(245, 197, 66)');
 
   const video = page.locator('.preview-frame video');
   const introSrc = await video.evaluate((v: { currentSrc: string }) => v.currentSrc);
@@ -119,34 +122,47 @@ test('plays an attached intro, then main content, then an attached outro, in seq
     .toBe(outroSrc);
 });
 
-test('the timeline playhead starts in the intro slot and hands off to the main track, mirroring the live preview phase', async ({ page }) => {
-  // The bug this covers: Timeline.tsx's own playhead only ever knew about
-  // `playheadTime` (main-content-relative), so with an intro attached it
-  // sat frozen at the main track's own 0% for the whole intro phase instead
-  // of reflecting where playback actually was.
+test('the timeline shows a proportionally accurate combined overview once an intro/outro is attached, with no jump crossing phases', async ({ page }) => {
+  // The bug this covers: an earlier version gave each of the intro/outro
+  // cards (fixed-width) and the main track (proportional) their own
+  // separate playhead, confined to their own container — a real,
+  // user-reported jarring jump right at the boundary between two
+  // differently-scaled coordinate spaces. TimelineOverviewRuler replaces
+  // that with one continuous, genuinely proportional strip spanning
+  // intro+main+outro combined, independent of how the cards above it are
+  // sized.
   await page.goto('/');
   await uploadSource(page, 'sample.mp4'); // 2s
   await attachIntro(page, 'intro.mp4'); // 1s
   await attachOutro(page, 'outro.mp4'); // 1s
 
-  const introPlayhead = page.locator('.timeline-clip--intro .timeline-playhead');
-  const mainPlayhead = page.locator('.timeline-track > .timeline-playhead');
+  // No more per-slot playhead badges inside the (fixed-width) cards.
+  await expect(page.locator('.timeline-clip--extra .timeline-playhead')).toHaveCount(0);
 
-  await expect(introPlayhead).toBeVisible();
-  await expect(introPlayhead).toHaveCSS('left', '0px');
-  await expect(mainPlayhead).toHaveCount(0);
+  const overview = page.locator('.timeline-overview');
+  const handle = page.locator('.timeline-overview-handle');
+  await expect(overview).toBeVisible();
+  // 1s intro + 2s main + 1s outro = 4s total; boundaries at 25%/75%.
+  await expect(page.locator('.timeline-overview .scrub-bar-marker')).toHaveCount(2);
+  const markerLefts = await page
+    .locator('.timeline-overview .scrub-bar-marker')
+    .evaluateAll((els) => els.map((e) => (e as { style: { left: string } }).style.left));
+  expect(markerLefts.sort()).toEqual(['25%', '75%']);
+  await expect(handle).toHaveCSS('left', '0px');
 
+  // Sample the handle's own left% at high frequency across the intro->main
+  // boundary — it must only ever increase, never jump backward or skip.
   await page.click('.transport-btn');
-
-  // Once the intro (1s) hands off, the main track's own playhead takes
-  // over and the intro's own disappears.
-  await expect(mainPlayhead).toBeVisible({ timeout: 5_000 });
-  await expect(introPlayhead).toHaveCount(0);
-
-  // ...and once main content (2s) hands off to the outro, the reverse.
-  const outroPlayhead = page.locator('.timeline-clip--outro .timeline-playhead');
-  await expect(outroPlayhead).toBeVisible({ timeout: 5_000 });
-  await expect(mainPlayhead).toHaveCount(0);
+  const samples: number[] = [];
+  for (let i = 0; i < 30; i++) {
+    const left = await handle.evaluate((el) => parseFloat((el as { style: { left: string } }).style.left || '0'));
+    samples.push(left);
+    await page.waitForTimeout(60);
+  }
+  for (let i = 1; i < samples.length; i++) {
+    expect(samples[i], `sample ${i} (${samples[i]}%) regressed from sample ${i - 1} (${samples[i - 1]}%)`).toBeGreaterThanOrEqual(samples[i - 1]);
+  }
+  expect(Math.max(...samples)).toBeGreaterThan(0);
 });
 
 test('the timeline playhead starts directly on the main track when no intro is attached', async ({ page }) => {
@@ -155,6 +171,41 @@ test('the timeline playhead starts directly on the main track when no intro is a
 
   await expect(page.locator('.timeline-track > .timeline-playhead')).toBeVisible();
   await expect(page.locator('.timeline-playhead')).toHaveCount(1);
+});
+
+test('the standalone split button in the toolbar is disabled over intro/outro and enabled only on the main clip', async ({ page }) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4'); // 2s
+
+  const splitBtn = page.locator('.timeline-toolbar .icon-btn');
+  await expect(splitBtn).toBeVisible();
+  await expect(splitBtn).toHaveText('✂');
+  // No intro attached at all — always on the main clip already.
+  await expect(splitBtn).toBeEnabled();
+
+  await attachIntro(page, 'intro.mp4'); // 1s
+  await attachOutro(page, 'outro.mp4'); // 1s
+
+  // A freshly-attached intro starts the live preview there — split is
+  // disabled until the preview is actually on the main clip.
+  await expect(splitBtn).toBeDisabled();
+
+  const scrubBar = page.locator('.scrub-bar');
+  const box = await scrubBar.boundingBox();
+  if (!box) throw new Error('.scrub-bar not found');
+
+  // 50% of the 4s combined preview (1s intro + 2s main + 1s outro) = 2s,
+  // inside the main clip.
+  await scrubBar.click({ position: { x: box.width * 0.5, y: box.height / 2 } });
+  await expect(splitBtn).toBeEnabled();
+
+  // Scrub back into the intro — disabled again.
+  await scrubBar.click({ position: { x: box.width * 0.1, y: box.height / 2 } });
+  await expect(splitBtn).toBeDisabled();
+
+  // Scrub into the outro — still disabled.
+  await scrubBar.click({ position: { x: box.width * 0.95, y: box.height / 2 } });
+  await expect(splitBtn).toBeDisabled();
 });
 
 test('splits the timeline, then attaches an intro and outro on top of it — no longer mutually exclusive', async ({ page }, testInfo) => {
@@ -167,11 +218,15 @@ test('splits the timeline, then attaches an intro and outro on top of it — no 
   await attachOutro(page, 'outro.mp4');
 
   // Split stays reachable with intro/outro attached now — same setup the
-  // old (now-removed) restriction test used to assert the opposite of.
-  const track = page.locator('.timeline-track');
-  const box = await track.boundingBox();
-  await track.click({ position: { x: box!.width * 0.25, y: box!.height / 2 } });
-  await expect(page.locator('.split-button')).toBeEnabled();
+  // old (now-removed) restriction test used to assert the opposite of. The
+  // toolbar split button is gated on the live preview's own active phase
+  // (main vs intro/outro), so scrub the preview itself into the main
+  // phase first — clicking around in the Timeline's own track alone never
+  // changes that.
+  const scrubBar = page.locator('.scrub-bar');
+  const scrubBox = await scrubBar.boundingBox();
+  await scrubBar.click({ position: { x: scrubBox!.width * 0.5, y: scrubBox!.height / 2 } }); // 1s intro + 2s main + 1s outro = 4s total; 50% = 2s, inside main
+  await expect(page.locator('.timeline-toolbar .icon-btn')).toBeEnabled();
 
   const result = await runExport(page);
   expect(result).toBe('done');

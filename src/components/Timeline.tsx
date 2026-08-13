@@ -53,12 +53,6 @@ interface IntroOutroSlotProps {
   onSelect: (file: File) => void;
   onClear: () => void;
   onSetHoldDuration: (seconds: number) => void;
-  /** Whether the live preview is currently playing *this* slot's own clip
-   * (`PreviewPane`'s own `phase`, surfaced through App.tsx) — when true,
-   * shows a playhead reusing the same `.timeline-playhead` markup the main
-   * track uses, positioned by `phaseElapsed / clip.duration`. */
-  isActivePhase: boolean;
-  phaseElapsed: number;
 }
 
 /**
@@ -73,8 +67,17 @@ interface IntroOutroSlotProps {
  * The empty state accepts either a click (opens a picker) or a native OS
  * file drop, the same two ways `EmptyState`'s own dropzone already accepts
  * the very first source file.
+ *
+ * Doesn't show its own live-preview playhead (an earlier version did) —
+ * this card's fixed width has no fixed relationship to its own clip's real
+ * duration, so a playhead confined to it moved at a different visual rate
+ * than the main track's own, and appeared to jump discontinuously right at
+ * the boundary between the two. `TimelineOverviewRuler` below shows the
+ * live position instead, genuinely proportional across intro+main+outro
+ * combined — the same accurate model `PreviewPane`'s own scrub bar already
+ * uses.
  */
-function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDuration, isActivePhase, phaseElapsed }: IntroOutroSlotProps) {
+function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDuration }: IntroOutroSlotProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isOver, setIsOver] = useState(false);
   const label = kind === 'intro' ? 'Intro' : 'Outro';
@@ -133,12 +136,6 @@ function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDura
             ✕
           </button>
         </div>
-
-        {isActivePhase && clip.duration && clip.duration > 0 && (
-          <div className="timeline-playhead" style={{ left: `${Math.min(100, (phaseElapsed / clip.duration) * 100)}%` }}>
-            <span className="timeline-playhead-badge">{formatDuration(phaseElapsed)}</span>
-          </div>
-        )}
       </div>
     );
   }
@@ -179,6 +176,53 @@ function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDura
         }}
       />
     </button>
+  );
+}
+
+interface TimelineOverviewRulerProps {
+  introDuration: number | undefined;
+  mainDuration: number;
+  outroDuration: number | undefined;
+  activePhase: Phase;
+  playheadTime: number;
+  phaseElapsed: number;
+}
+
+/**
+ * A thin, read-only, genuinely proportional ruler spanning the full
+ * timeline strip width — the accurate "where is playback right now, across
+ * intro+main+outro combined" indicator, reusing the exact same math
+ * `PreviewPane`'s own scrub bar already gets right (see its own
+ * `globalPreviewTime`/marker positions). Only shown once an intro or outro
+ * is actually attached: with neither, the main track's own playhead is
+ * already the complete, accurate picture on its own.
+ *
+ * Exists *because* `IntroOutroSlot`'s fixed-width cards and the main
+ * track's proportional width are two different, incompatible pixel scales
+ * — a playhead confined to whichever one is "active" necessarily jumps at
+ * the boundary between them (a real, confirmed issue with an earlier
+ * version of this file). This ruler sidesteps that entirely by never
+ * touching those cards' own layout at all — one continuous, proportional
+ * strip of its own, independent of how comfortably-sized the cards above
+ * it are.
+ */
+function TimelineOverviewRuler({ introDuration = 0, mainDuration, outroDuration = 0, activePhase, playheadTime, phaseElapsed }: TimelineOverviewRulerProps) {
+  if (introDuration <= 0 && outroDuration <= 0) return null;
+
+  const totalDuration = introDuration + mainDuration + outroDuration;
+  if (totalDuration <= 0) return null;
+
+  const globalPreviewTime =
+    activePhase === 'intro' ? phaseElapsed : activePhase === 'main' ? introDuration + playheadTime : introDuration + mainDuration + phaseElapsed;
+  const playheadPercent = Math.min(100, (globalPreviewTime / totalDuration) * 100);
+
+  return (
+    <div className="timeline-overview" title="Combined intro + content + outro position">
+      {introDuration > 0 && <div className="scrub-bar-marker" style={{ left: `${(introDuration / totalDuration) * 100}%` }} />}
+      {outroDuration > 0 && <div className="scrub-bar-marker" style={{ left: `${((introDuration + mainDuration) / totalDuration) * 100}%` }} />}
+      <div className="timeline-overview-fill" style={{ width: `${playheadPercent}%` }} />
+      <div className="timeline-overview-handle" style={{ left: `${playheadPercent}%` }} />
+    </div>
   );
 }
 
@@ -303,9 +347,11 @@ export default function Timeline({
     if (disabled) return;
     // Clicking a clip both selects it (its own onClick) and scrubs the
     // playhead to that X position — only the small interactive controls
-    // inside a clip (trim handles, split button, delete, drag handle) opt
-    // out of also being treated as a track click.
-    if ((e.target as HTMLElement).closest('.trim-handle, .split-button, .timeline-clip-delete, .drag-handle')) return;
+    // inside a clip (trim handles, delete, drag handle) opt out of also
+    // being treated as a track click. Split itself moved to the toolbar
+    // (see the scissors button next to the "Timeline" label) — it no
+    // longer lives inside the track at all.
+    if ((e.target as HTMLElement).closest('.trim-handle, .timeline-clip-delete, .drag-handle')) return;
     scrubAt(e.clientX);
   };
 
@@ -334,7 +380,18 @@ export default function Timeline({
   return (
     <div className="timeline-panel">
       <div className="timeline-toolbar">
-        <span className="section-label">Timeline</span>
+        <span className="section-label-row">
+          <span className="section-label">Timeline</span>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={onSplit}
+            disabled={disabled || activePhase !== 'main' || totalDuration <= 0}
+            title={activePhase !== 'main' ? 'Split only works on the main content clip, not intro/outro' : 'Split at the playhead'}
+          >
+            ✂
+          </button>
+        </span>
         <div className="timeline-toolbar-actions">
           <button type="button" className="btn-quiet" onClick={onUndo} disabled={disabled || !canUndo} title="Undo (Ctrl/Cmd+Z)">
             Undo
@@ -362,8 +419,6 @@ export default function Timeline({
           onSelect={onSelectIntroFile}
           onClear={onClearIntroFile}
           onSetHoldDuration={onSetIntroImageDuration}
-          isActivePhase={activePhase === 'intro'}
-          phaseElapsed={phaseElapsed}
         />
 
         <div className="timeline-track" ref={trackRef} onPointerDown={handleTrackPointerDown}>
@@ -374,13 +429,6 @@ export default function Timeline({
             const leftPercent = totalDuration > 0 ? (offsets[i] / totalDuration) * 100 : 0;
             const widthPercent = totalDuration > 0 ? (duration / totalDuration) * 100 : 100;
             const peaks = syntheticPeaks(seg.id, 24);
-            const splitVisible = selected && playheadTime >= offsets[i] && playheadTime <= offsets[i] + duration;
-            // Kept clear of the clip's own left/right edges (where the trim
-            // handles live) so the floating button never visually collides
-            // with either, even when the playhead sits right at a clip's edge.
-            const splitLocalPercent = splitVisible
-              ? Math.min(Math.max(((playheadTime - offsets[i]) / Math.max(0.001, duration)) * 100, 8), 92)
-              : 0;
 
             return (
               <div
@@ -453,22 +501,6 @@ export default function Timeline({
                   </>
                 )}
 
-                {splitVisible && (
-                  <button
-                    type="button"
-                    className="split-button"
-                    draggable={false}
-                    style={{ left: `${splitLocalPercent}%` }}
-                    disabled={disabled}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSplit();
-                    }}
-                    title="Split this clip at the playhead"
-                  >
-                    ✂ Split
-                  </button>
-                )}
               </div>
             );
           })}
@@ -487,10 +519,16 @@ export default function Timeline({
           onSelect={onSelectOutroFile}
           onClear={onClearOutroFile}
           onSetHoldDuration={onSetOutroImageDuration}
-          isActivePhase={activePhase === 'outro'}
-          phaseElapsed={phaseElapsed}
         />
       </div>
+      <TimelineOverviewRuler
+        introDuration={introClip?.duration}
+        mainDuration={totalDuration}
+        outroDuration={outroClip?.duration}
+        activePhase={activePhase}
+        playheadTime={playheadTime}
+        phaseElapsed={phaseElapsed}
+      />
     </div>
   );
 }
