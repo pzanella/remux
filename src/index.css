@@ -1079,6 +1079,36 @@ body {
   font-size: 0.72rem;
   color: var(--danger);
 }
+.extras-strip-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  padding: 0 0.9rem 0.6rem;
+  font-size: 0.72rem;
+  color: var(--danger);
+}
+.extras-strip-error span {
+  flex: 1;
+  min-width: 0;
+}
+.extras-strip-error-dismiss {
+  flex-shrink: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.62rem;
+}
+.extras-strip-error-dismiss:hover {
+  background: color-mix(in srgb, var(--danger) 30%, transparent);
+  color: var(--text);
+}
 .extras-strip-body {
   display: flex;
   flex-direction: column;
@@ -1505,6 +1535,59 @@ body {
   font-size: 0.85rem;
   color: var(--danger);
   font-weight: 600;
+}
+
+/* ── Toast notifications ── */
+/* Anchored bottom-right via `right`/`bottom`, not `inset: 0` — sizes to its
+   own content instead of the viewport, so (unlike .export-modal-backdrop's
+   own real bug, see its own comment) it was never at risk of inheriting
+   .app-shell > *'s `max-width: 1440px` in a way that visibly clips
+   anything; noted here so a future full-bleed variant doesn't reintroduce
+   that same class of bug blind. */
+.toast-stack {
+  position: fixed;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  z-index: 100;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0.5rem;
+  width: min(22rem, calc(100vw - 2.5rem));
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-panel));
+  box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.5);
+}
+.toast-message {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--text);
+}
+.toast-dismiss {
+  flex-shrink: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.3rem;
+  height: 1.3rem;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+.toast-dismiss:hover {
+  background: color-mix(in srgb, var(--danger) 30%, transparent);
+  color: var(--text);
 }
 
 /* ── Batch mode ── */

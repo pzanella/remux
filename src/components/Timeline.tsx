@@ -204,6 +204,11 @@ interface TimelineProps {
   onSelectOutroFile: (file: File) => void;
   onClearOutroFile: () => void;
   onSetOutroImageDuration: (seconds: number) => void;
+  /** Set when the last intro/outro pick failed — see `useTranscoder`'s own
+   * `introOutroError`. Right at the slots that produced it, in addition to
+   * the same message always reaching `ToastStack` too. Dismissable. */
+  introOutroError?: string | null;
+  onClearIntroOutroError?: () => void;
 }
 
 /**
@@ -241,6 +246,8 @@ export default function Timeline({
   onSelectOutroFile,
   onClearOutroFile,
   onSetOutroImageDuration,
+  introOutroError,
+  onClearIntroOutroError,
 }: TimelineProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
@@ -314,6 +321,16 @@ export default function Timeline({
           </button>
         </div>
       </div>
+      {introOutroError && (
+        <div className="extras-strip-error">
+          <span>{introOutroError}</span>
+          {onClearIntroOutroError && (
+            <button type="button" className="extras-strip-error-dismiss" onClick={onClearIntroOutroError} title="Dismiss">
+              ✕
+            </button>
+          )}
+        </div>
+      )}
       <div className="timeline-strip">
         <IntroOutroSlot
           kind="intro"

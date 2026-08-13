@@ -147,11 +147,26 @@ export function useTranscoder() {
 
   const workerRef = useRef<Worker | null>(null);
   const logIdRef = useRef(0);
+  const toastIdRef = useRef(0);
+  // Surfaced UI-wide (see ToastStack, mounted once in App.tsx) so a failure
+  // during editing is visible without the user having to open the export
+  // review screen and find its own Log tab — the log panel only lives
+  // there, but a failure can happen at any point before that. Persists
+  // until dismissed rather than auto-expiring: a toast that vanishes before
+  // it's read is its own flavor of the same silent-failure problem this
+  // exists to fix.
+  const [toasts, setToasts] = useState<{ id: number; message: string }[]>([]);
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   const { createSession, updateSession, findResumableSession, deleteSession } = usePersistence();
 
   const addLog = useCallback((message: string, level: LogEntry['level'] = 'info') => {
     setLogs((prev) => [...prev, { id: logIdRef.current++, timestamp: Date.now(), message, level }]);
+    if (level === 'error') {
+      setToasts((prev) => [...prev, { id: toastIdRef.current++, message }]);
+    }
   }, []);
 
   useEffect(() => {
@@ -410,14 +425,26 @@ export function useTranscoder() {
     [addLog],
   );
 
+  // Shared by both intro and outro pickers — the message itself always
+  // names which side failed, and the two are never attempted at once in
+  // practice, so one slot is enough rather than tracking each separately.
+  // Rendered inline right at Timeline.tsx's own intro/outro slots (see
+  // ToastStack for the parallel, always-visible-everywhere version of the
+  // same failure).
+  const [introOutroError, setIntroOutroError] = useState<string | null>(null);
+  const clearIntroOutroError = useCallback(() => setIntroOutroError(null), []);
+
   const selectIntroFile = useCallback(
     async (file: File) => {
+      setIntroOutroError(null);
       try {
         const [opfsPath, meta] = await Promise.all([saveFileToOpfs(file), probeClipMetadata(file)]);
         setIntroFileState({ fileName: opfsPath, label: file.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file });
         addLog(`Intro: ${file.name}`, 'success');
       } catch (err) {
-        addLog(`Could not save the intro file: ${err}`, 'error');
+        const msg = `Could not save the intro file: ${err}`;
+        addLog(msg, 'error');
+        setIntroOutroError(msg);
       }
     },
     [addLog],
@@ -432,12 +459,15 @@ export function useTranscoder() {
 
   const selectOutroFile = useCallback(
     async (file: File) => {
+      setIntroOutroError(null);
       try {
         const [opfsPath, meta] = await Promise.all([saveFileToOpfs(file), probeClipMetadata(file)]);
         setOutroFileState({ fileName: opfsPath, label: file.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file });
         addLog(`Outro: ${file.name}`, 'success');
       } catch (err) {
-        addLog(`Could not save the outro file: ${err}`, 'error');
+        const msg = `Could not save the outro file: ${err}`;
+        addLog(msg, 'error');
+        setIntroOutroError(msg);
       }
     },
     [addLog],
@@ -447,8 +477,16 @@ export function useTranscoder() {
     setOutroFileState((prev) => (prev?.isImage ? { ...prev, duration: Math.max(0.1, seconds) } : prev));
   }, []);
 
+  // Rendered inline right at MediaExtrasPanel's own dub-audio picker (see
+  // ToastStack for the parallel, always-visible-everywhere version of the
+  // same failure) — the case named explicitly in the report this exists to
+  // fix.
+  const [dubAudioError, setDubAudioError] = useState<string | null>(null);
+  const clearDubAudioError = useCallback(() => setDubAudioError(null), []);
+
   const selectDubAudioTrack = useCallback(
     async (file: File) => {
+      setDubAudioError(null);
       try {
         // `<video>` reads .duration for audio-only files fine (it's really
         // an <audio> capable element too) — reused here just for that,
@@ -466,12 +504,12 @@ export function useTranscoder() {
         // that looks like it succeeded but produces broken playback.
         const TOLERANCE_SEC = 0.5;
         if (sourceDuration !== undefined && dims && dims.duration < sourceDuration - TOLERANCE_SEC) {
-          addLog(
+          const msg =
             `Dub audio "${file.name}" (${dims.duration.toFixed(1)}s) is shorter than the main content ` +
-              `(${sourceDuration.toFixed(1)}s) — not supported yet, it would produce broken playback. Trim the main ` +
-              `content to match, or use a dub at least as long.`,
-            'error',
-          );
+            `(${sourceDuration.toFixed(1)}s) — not supported yet, it would produce broken playback. Trim the main ` +
+            `content to match, or use a dub at least as long.`;
+          addLog(msg, 'error');
+          setDubAudioError(msg);
           return;
         }
         const opfsPath = await saveFileToOpfs(file);
@@ -479,7 +517,9 @@ export function useTranscoder() {
         setDubAudioTracksState((prev) => [...prev, { fileName: opfsPath, label, language: 'en' }]);
         addLog(`Dub audio: ${file.name}`, 'success');
       } catch (err) {
-        addLog(`Could not save the dub audio file: ${err}`, 'error');
+        const msg = `Could not save the dub audio file: ${err}`;
+        addLog(msg, 'error');
+        setDubAudioError(msg);
       }
     },
     [addLog, sourceDuration],
@@ -785,6 +825,8 @@ export function useTranscoder() {
   return {
     status,
     logs,
+    toasts,
+    dismissToast,
     session,
     resumableSession,
     outputFolder,
@@ -826,9 +868,13 @@ export function useTranscoder() {
     selectOutroFile,
     clearOutroFile,
     setOutroImageDuration,
+    introOutroError,
+    clearIntroOutroError,
     selectDubAudioTrack,
     removeDubAudioTrack,
     setDubAudioTrackLanguage,
+    dubAudioError,
+    clearDubAudioError,
     removeSubtitleTrack,
     setSubtitleTrackLanguage,
     setAbrEnabled,

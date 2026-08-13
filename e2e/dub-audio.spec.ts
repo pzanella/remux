@@ -11,9 +11,41 @@ import {
   listZipEntries,
   readZipEntryText,
   totalPlaylistDurationSec,
+  expandExtrasStrip,
+  FIXTURES,
 } from './helpers';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
+
+test('a too-short dub-audio track is rejected with both an inline error and a toast, without opening the export modal', async ({ page }) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4'); // 2s
+  await expandExtrasStrip(page);
+
+  // intro.mp4 is 1s — shorter than the 2s main content, so this hits
+  // selectDubAudioTrack's own TOLERANCE_SEC rejection branch rather than
+  // being accepted (unlike attachDubAudio's fixtures elsewhere in this
+  // file, which are deliberately at least as long as the main content).
+  await page.locator('.extras-row input[type="file"][accept*=".m4a"]').setInputFiles(path.join(FIXTURES, 'intro.mp4'));
+
+  const expectedText = /shorter than the main content/;
+  await expect(page.locator('.extras-strip-error')).toBeVisible();
+  await expect(page.locator('.extras-strip-error')).toHaveText(expectedText);
+  // The same failure also reaches the always-visible toast stack — the
+  // exact gap this feature closes: previously a failure during editing was
+  // only discoverable by opening the export review screen's own Log tab.
+  await expect(page.locator('.toast')).toBeVisible();
+  await expect(page.locator('.toast-message')).toHaveText(expectedText);
+  await expect(page.locator('.export-modal-backdrop')).toHaveCount(0);
+
+  // The track itself must not have been added.
+  await expect(page.locator('.dub-audio-list .extras-row')).toHaveCount(1); // just the file-picker row
+
+  await page.click('.extras-strip-error-dismiss');
+  await expect(page.locator('.extras-strip-error')).toHaveCount(0);
+  await page.click('.toast-dismiss');
+  await expect(page.locator('.toast')).toHaveCount(0);
+});
 
 test('attaches a dub-audio track and emits a master playlist with both audio tracks', async ({ page }, testInfo) => {
   await page.goto('/');

@@ -34,6 +34,14 @@ interface MediaExtrasPanelProps {
    * Shown regardless of the panel's own collapsed state so it's not missed
    * the way the old (now-removed) Timeline.tsx warning wasn't. */
   warning?: string;
+  /** Set when the last dub-audio pick failed (duration mismatch, or a
+   * genuine read/save error) — see `useTranscoder`'s own `dubAudioError`.
+   * Right at the picker that produced it, in addition to the same message
+   * always reaching `ToastStack` — this is the one case the "never fail
+   * silently" report named explicitly. Dismissable (unlike `warning` above,
+   * a standing structural state rather than a one-off failure). */
+  error?: string | null;
+  onClearError?: () => void;
 }
 
 function FilePickerButton({
@@ -81,6 +89,8 @@ export default function MediaExtrasPanel({
   onRemoveDubAudioTrack,
   onSetDubAudioTrackLanguage,
   warning,
+  error,
+  onClearError,
 }: MediaExtrasPanelProps) {
   const [expanded, setExpanded] = useState(false);
 
@@ -93,6 +103,16 @@ export default function MediaExtrasPanel({
         <span className="extras-strip-chevron">{expanded ? '▴' : '▾'}</span>
       </button>
       {warning && <span className="extras-strip-warning">{warning}</span>}
+      {error && (
+        <div className="extras-strip-error">
+          <span>{error}</span>
+          {onClearError && (
+            <button type="button" className="extras-strip-error-dismiss" onClick={onClearError} title="Dismiss">
+              ✕
+            </button>
+          )}
+        </div>
+      )}
 
       {expanded && (
         <div className="extras-strip-body">

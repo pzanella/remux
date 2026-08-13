@@ -9,6 +9,7 @@ import ChapterRuler from './components/ChapterRuler';
 import MediaExtrasPanel from './components/MediaExtrasPanel';
 import ExportModal from './components/ExportModal';
 import ResumeBanner from './components/ResumeBanner';
+import ToastStack from './components/ToastStack';
 import Player from './components/Player';
 import { useTranscoder } from './hooks/useTranscoder';
 import { useEditorSegments } from './hooks/useEditorSegments';
@@ -183,6 +184,7 @@ export default function App() {
   if (t.status === 'saving-to-opfs') {
     return (
       <div className="app-shell">
+        <ToastStack toasts={t.toasts} onDismiss={t.dismissToast} />
         <div className="loading-transition">
           <span className="spinner" aria-hidden="true" />
           <span>Analyzing audio/video streams…</span>
@@ -194,6 +196,7 @@ export default function App() {
   if (!t.sourceFile) {
     return (
       <div className="app-shell">
+        <ToastStack toasts={t.toasts} onDismiss={t.dismissToast} />
         {t.resumableSession && (
           <ResumeBanner session={t.resumableSession} canResume={t.canResume} onResume={t.resume} onDismiss={t.dismissResume} />
         )}
@@ -204,6 +207,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <ToastStack toasts={t.toasts} onDismiss={t.dismissToast} />
       <TopBar
         hasSource
         status={t.status}
@@ -263,6 +267,8 @@ export default function App() {
               onSelectOutroFile={t.selectOutroFile}
               onClearOutroFile={t.clearOutroFile}
               onSetOutroImageDuration={t.setOutroImageDuration}
+              introOutroError={t.introOutroError}
+              onClearIntroOutroError={t.clearIntroOutroError}
             />
             <MediaExtrasPanel
               dubAudioTracks={t.dubAudioTracks}
@@ -270,6 +276,8 @@ export default function App() {
               onRemoveDubAudioTrack={t.removeDubAudioTrack}
               onSetDubAudioTrackLanguage={t.setDubAudioTrackLanguage}
               warning={dubAudioAbrWarning}
+              error={t.dubAudioError}
+              onClearError={t.clearDubAudioError}
             />
             <CaptionLane
               segments={editor.segments}
