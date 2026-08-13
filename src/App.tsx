@@ -251,6 +251,7 @@ export default function App() {
         onReset={handleReset}
         onExportClick={handleExportClick}
         onSaveProject={handleSaveProject}
+        onLoadProject={handleLoadProject}
       />
 
       {t.resumableSession && (

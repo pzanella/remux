@@ -320,15 +320,25 @@ export function useTranscoder() {
         setOutputContainer(bundle.manifest.outputContainer);
         setLoudnessNormalization(bundle.manifest.loudnessNormalization);
 
+        // Unconditionally set (to `null` when absent from this bundle), not
+        // just when present — `loadProject` can now be triggered mid-
+        // session (see TopBar's own "Load Project"), not only from a
+        // freshly-reset empty state, so a bundle with no intro/outro of its
+        // own must actually clear whatever the *previous* session had
+        // attached rather than silently leaving it in place.
         if (bundle.introFile) {
           const clip = bundle.introFile;
           const [introPath, meta] = await Promise.all([saveFileToOpfs(clip), probeClipMetadata(clip)]);
           setIntroFileState({ fileName: introPath, label: clip.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file: clip });
+        } else {
+          setIntroFileState(null);
         }
         if (bundle.outroFile) {
           const clip = bundle.outroFile;
           const [outroPath, meta] = await Promise.all([saveFileToOpfs(clip), probeClipMetadata(clip)]);
           setOutroFileState({ fileName: outroPath, label: clip.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file: clip });
+        } else {
+          setOutroFileState(null);
         }
 
         const newSubtitleTracks: { fileName: string; label: string; language: string }[] = [];

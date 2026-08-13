@@ -20,6 +20,35 @@ import {
 } from './helpers';
 import { execFileSync } from 'node:child_process';
 
+test('a project can be loaded mid-session from the topbar, without starting over first', async ({ page }, testInfo) => {
+  // The gap this closes: the only way to load a .remuxproj used to be the
+  // empty-state screen's own small text link, reachable only *before*
+  // anything is loaded — a user with an active session (or one who just
+  // downloaded a project file and wants to open it) had to click "Start
+  // Over" first and go hunting for it.
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+  await addChapter(page, 'Cold Open');
+
+  const projectPath = testInfo.outputPath('project.remuxproj');
+  await saveProjectFile(page, projectPath);
+
+  // Make an unsaved change to the *current* session — attaching an intro —
+  // without saving it, then load the project back in from the topbar
+  // directly (no "Start Over"). The unsaved intro must be gone; the saved
+  // chapter must be back.
+  await attachIntro(page, 'intro.mp4');
+  await expect(page.locator('.timeline-clip--intro')).toBeVisible();
+
+  await expect(page.locator('.topbar button:has-text("Load Project")')).toBeVisible();
+  await page.locator('input[type="file"][accept=".remuxproj"]').setInputFiles(projectPath);
+  await page.waitForSelector('.topbar', { timeout: 30_000 });
+
+  await expect(page.locator('.timeline-clip--intro')).toHaveCount(0);
+  await expect(page.locator('.chapter-marker')).toHaveCount(1);
+  await expect(page.locator('.chapter-marker')).toHaveAttribute('title', /Cold Open/);
+});
+
 test('round-trips segments, chapters, a subtitle track, an ABR rendition, and loudness normalization through a saved project', async ({
   page,
 }, testInfo) => {
