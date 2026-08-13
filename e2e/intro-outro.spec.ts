@@ -47,6 +47,64 @@ test('shows attached intro/outro as flanking cards in the horizontal timeline', 
   await expect(page.locator('.timeline-extra-card--outro')).toContainText('outro.mp4');
 });
 
+test('plays an attached intro, then main content, then an attached outro, in sequence in the live preview', async ({ page }) => {
+  // The bug this covers: PreviewPane used to know nothing about intro/outro
+  // at all (only `sourceFile` + `segments`), so an attached intro/outro
+  // never actually played back before export — this drives real playback
+  // through all three phases and checks the <video> element's own src and
+  // the displayed timecode, not just "no error was thrown".
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+  await attachIntro(page, 'intro.mp4');
+  await attachOutro(page, 'outro.mp4');
+
+  // Combined preview timeline: intro (1s) + main (2s) + outro (1s) = 4s.
+  await expect(page.locator('.timecode')).toContainText('/ 00:04');
+  await expect(page.locator('.scrub-bar-marker')).toHaveCount(2);
+
+  const video = page.locator('.preview-frame video');
+  const introSrc = await video.evaluate((v: { currentSrc: string }) => v.currentSrc);
+  expect(introSrc).toMatch(/^blob:/);
+
+  await page.click('.transport-btn');
+  await expect(page.locator('.transport-btn')).toHaveAttribute('title', 'Pause (Space)');
+
+  // Real playback: the intro (1s) should hand off to main content on its own.
+  await expect
+    .poll(async () => video.evaluate((v: { currentSrc: string }) => v.currentSrc), { timeout: 5_000 })
+    .not.toBe(introSrc);
+  const mainSrc = await video.evaluate((v: { currentSrc: string }) => v.currentSrc);
+  expect(mainSrc).not.toBe(introSrc);
+
+  // Main content (2s) should in turn hand off to the outro.
+  await expect
+    .poll(async () => video.evaluate((v: { currentSrc: string }) => v.currentSrc), { timeout: 5_000 })
+    .not.toBe(mainSrc);
+  const outroSrc = await video.evaluate((v: { currentSrc: string }) => v.currentSrc);
+  expect(outroSrc).not.toBe(introSrc);
+
+  // Once the outro (1s) finishes playing there's no fourth phase to advance
+  // to, so playback stops on its own.
+  await expect(page.locator('.transport-btn')).toHaveAttribute('title', 'Play (Space)', { timeout: 5_000 });
+
+  // Scrubbing directly (not just auto-advancing) also has to resolve to the
+  // right phase: back into the intro, then forward into the outro.
+  const scrubBar = page.locator('.scrub-bar');
+  const box = await scrubBar.boundingBox();
+  if (!box) throw new Error('.scrub-bar not found');
+
+  await scrubBar.click({ position: { x: box.width * 0.1, y: box.height / 2 } });
+  await expect
+    .poll(async () => video.evaluate((v: { currentSrc: string }) => v.currentSrc))
+    .toBe(introSrc);
+  await expect(page.locator('.timecode')).toContainText('00:00 ');
+
+  await scrubBar.click({ position: { x: box.width * 0.95, y: box.height / 2 } });
+  await expect
+    .poll(async () => video.evaluate((v: { currentSrc: string }) => v.currentSrc))
+    .toBe(outroSrc);
+});
+
 test('blocks splitting the timeline once an intro/outro is attached, instead of only failing at export time', async ({ page }) => {
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');

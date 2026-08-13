@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import TopBar from './components/TopBar';
 import EmptyState from './components/EmptyState';
 import BatchQueue from './components/BatchQueue';
@@ -31,6 +31,20 @@ export default function App() {
   // comes first blocks the other, instead of only failing at export time.
   const hasEditedSegments = t.sourceDuration !== undefined && !isTrivialEdit(editor.segments, t.sourceDuration);
   const hasIntroOrOutro = !!(t.introFile || t.outroFile);
+
+  // PreviewPane's own reset effect keys off these objects' identity (to
+  // catch a genuine attach/detach) — a fresh object literal on every render
+  // here would refire it on every playhead tick during playback, since
+  // `t.introFile`/`t.outroFile` themselves are otherwise reference-stable
+  // between renders. Memoized on those, not reconstructed every render.
+  const introPreviewClip = useMemo(
+    () => (t.introFile ? { file: t.introFile.file, duration: t.introFile.duration ?? 0 } : null),
+    [t.introFile],
+  );
+  const outroPreviewClip = useMemo(
+    () => (t.outroFile ? { file: t.outroFile.file, duration: t.outroFile.duration ?? 0 } : null),
+    [t.outroFile],
+  );
 
   // Batch mode is a fully separate flow (see useBatchTranscoder's own doc
   // comment) — its own hook instance, never touching `t` at all, swapped in
@@ -212,6 +226,8 @@ export default function App() {
               abrHeights={t.abrHeights}
               sourceResolution={t.sourceResolution}
               onToggleAbrHeight={t.toggleAbrHeight}
+              introClip={introPreviewClip}
+              outroClip={outroPreviewClip}
             />
             <Timeline
               segments={editor.segments}
