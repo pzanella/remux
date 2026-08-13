@@ -1073,6 +1073,12 @@ body {
   color: var(--text-tertiary);
   font-size: 0.7rem;
 }
+.extras-strip-warning {
+  display: block;
+  padding: 0 0.9rem 0.6rem;
+  font-size: 0.72rem;
+  color: var(--danger);
+}
 .extras-strip-body {
   display: flex;
   flex-direction: column;

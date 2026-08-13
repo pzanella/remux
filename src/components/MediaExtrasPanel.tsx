@@ -27,6 +27,13 @@ interface MediaExtrasPanelProps {
   onSelectDubAudioTrack: (file: File) => void;
   onRemoveDubAudioTrack: (fileName: string) => void;
   onSetDubAudioTrackLanguage: (fileName: string, language: string) => void;
+  /** Set when dub-audio + a trimmed/split timeline + adaptive bitrate are
+   * all selected together — the one remaining unsupported combination
+   * (worker-side: runTranscoding's own guard) now that the fast-path
+   * equivalent works (see runSegmentedFastPath's hasDubAudio handling).
+   * Shown regardless of the panel's own collapsed state so it's not missed
+   * the way the old (now-removed) Timeline.tsx warning wasn't. */
+  warning?: string;
 }
 
 function FilePickerButton({
@@ -73,6 +80,7 @@ export default function MediaExtrasPanel({
   onSelectDubAudioTrack,
   onRemoveDubAudioTrack,
   onSetDubAudioTrackLanguage,
+  warning,
 }: MediaExtrasPanelProps) {
   const [expanded, setExpanded] = useState(false);
 
@@ -84,6 +92,7 @@ export default function MediaExtrasPanel({
         <span className="panel-hint">{summary}</span>
         <span className="extras-strip-chevron">{expanded ? '▴' : '▾'}</span>
       </button>
+      {warning && <span className="extras-strip-warning">{warning}</span>}
 
       {expanded && (
         <div className="extras-strip-body">

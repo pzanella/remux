@@ -2650,16 +2650,18 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
-  // Dub-audio still shares the underlying limitation intro/outro used to:
-  // buildAudioOnlyRenditions only ever knew about the single main-content
-  // timeline it was built for, with no equivalent of runSegmentedFastPath's
-  // splice. Intro/outro itself no longer needs this guard — both
-  // runSegmentedFastPath and runAdaptiveHlsSegmented now splice an attached
-  // intro/outro around the edited timeline the same way spliceIntroOutro/
-  // finalizeAbrResults already do for the unedited case.
+  // Edited segments + dub-audio is supported on the fast path now
+  // (runSegmentedFastPath splits each cut segment's own audio into a
+  // parallel "original" rendition and cuts each dub track to the real
+  // boundaries that splice produces — see its own doc comment). The ABR
+  // path's per-segment encode loop has no equivalent of that per-clip
+  // dual-track split yet (only the whole-file paths do), so that specific
+  // three-way combination — edited segments + dub-audio + adaptive bitrate
+  // — is what's still blocked here, not edited segments + dub-audio alone.
   const editedSegments = hasEditedSegments(session);
-  if (editedSegments && session.dubAudioTracks?.length) {
-    post({ type: 'ERROR', error: 'Dub-audio tracks are not yet supported together with edited (trimmed/split) segments.' });
+  const isAbrJob = !!session.abrHeights?.length;
+  if (editedSegments && session.dubAudioTracks?.length && isAbrJob) {
+    post({ type: 'ERROR', error: 'Dub-audio tracks are not yet supported together with edited (trimmed/split) segments on an adaptive-bitrate export — switch to a single quality, or remove one of the two.' });
     return;
   }
 
@@ -3265,7 +3267,7 @@ async function prepareAuxiliaryClip(
   const matchesMain = clipWidth && clipHeight && mainWidth && mainHeight && clipWidth === mainWidth && clipHeight === mainHeight;
 
   if (matchesMain || !clipWidth || !clipHeight || !mainWidth || !mainHeight) {
-    return remuxAuxiliaryClip(opfsFileName, segmentPrefix, outputFolderHandle);
+    return (await remuxAuxiliaryClip(opfsFileName, segmentPrefix, outputFolderHandle)).playlistText;
   }
 
   log(`${label} is ${clipWidth}x${clipHeight}, main content is ${mainWidth}x${mainHeight} — letterboxing to match…`);
@@ -3278,16 +3280,27 @@ async function prepareAuxiliaryClip(
   return playlistText;
 }
 
-/** Remuxes one auxiliary clip (intro or outro) with its own HlsProcessor
- * instance — a byte-for-byte copy, same as the fast path's main content —
- * writing `${segmentPrefix}NNNN.ts` files, and returns its final playlist
- * text. Only used when the clip's own dimensions already match the main
- * content's (or aren't known); see `prepareAuxiliaryClip`. */
+/** Remuxes one auxiliary clip (intro/outro, or an edited-segment cut) with
+ * its own HlsProcessor instance — a byte-for-byte copy, same as the fast
+ * path's main content — writing `${segmentPrefix}NNNN.ts` files, and
+ * returns its final playlist text. Only used when the clip's own
+ * dimensions already match the main content's (or aren't known); see
+ * `prepareAuxiliaryClip`.
+ *
+ * `hasDubAudio` is only ever set for an edited-segment call (dub-audio and
+ * intro/outro stay mutually exclusive, so `prepareAuxiliaryClip`'s own
+ * calls never pass it) — when set, each internal chunk's audio is *also*
+ * split into a parallel "original audio only" file under
+ * `${segmentPrefix}orig_NNNN.ts`, mirroring the exact `hasDubAudio ? EMPTY
+ * : audioData` split `runWithHandle` already does for the whole-file case:
+ * same segment index, same processor, so its cuts land exactly where the
+ * video's do. */
 async function remuxAuxiliaryClip(
   opfsFileName: string,
   segmentPrefix: string,
   outputFolderHandle: FileSystemDirectoryHandle,
-): Promise<string> {
+  hasDubAudio = false,
+): Promise<{ playlistText: string; originalAudioPlaylistText?: string }> {
   const opfsRoot = await navigator.storage.getDirectory();
   const fileHandle = await opfsRoot.getFileHandle(opfsFileName);
   const syncHandle = await fileHandle.createSyncAccessHandle();
@@ -3311,16 +3324,29 @@ async function remuxAuxiliaryClip(
     }
 
     const segmentName = (i: number) => `${segmentPrefix}${String(i).padStart(4, '0')}.ts`;
+    const origAudioSegmentName = (i: number) => `${segmentPrefix}orig_${String(i).padStart(4, '0')}.ts`;
+    const EMPTY = new Uint8Array(0);
     const durations: number[] = [];
     for (let i = 0; i < parseResult.segmentCount; i++) {
       const seg = parseResult.segments[i];
       const videoData = readSamples(syncHandle, seg.videoSamples);
       const audioData = readSamples(syncHandle, seg.audioSamples);
-      const tsBytes = processor.mux_segment(videoData, audioData, i) as Uint8Array;
+      // Passing an empty Uint8Array (rather than omitting real bytes) is
+      // what tells the Rust muxer this track isn't present — same
+      // mux_segment_inner has_video/has_audio convention runWithHandle's
+      // own hasDubAudio branch relies on.
+      const tsBytes = processor.mux_segment(videoData, hasDubAudio ? EMPTY : audioData, i) as Uint8Array;
       await writeOutputFile(outputFolderHandle, segmentName(i), tsBytes);
+      if (hasDubAudio) {
+        const origAudioBytes = processor.mux_segment(EMPTY, audioData, i) as Uint8Array;
+        await writeOutputFile(outputFolderHandle, origAudioSegmentName(i), origAudioBytes);
+      }
       durations.push(seg.durationSec);
     }
-    return buildIntermediateM3U8(durations, true, segmentName);
+    return {
+      playlistText: buildIntermediateM3U8(durations, true, segmentName),
+      originalAudioPlaylistText: hasDubAudio ? buildIntermediateM3U8(durations, true, origAudioSegmentName) : undefined,
+    };
   } finally {
     syncHandle.close();
   }
@@ -3455,9 +3481,16 @@ async function spliceIntroOutro(
  * segment is stream-copied out via `cutSegmentClip`, remuxed independently
  * through its own `HlsProcessor` (`remuxAuxiliaryClip` — safe here with no
  * letterboxing, since every segment shares the main content's own
- * dimensions), and the results spliced together. Not resumable, like the
- * ABR paths — a restart begins the whole job over rather than checkpointing
- * mid-cut.
+ * dimensions), and the results spliced together. When dub-audio tracks are
+ * attached, each segment's own audio is *also* split into a parallel
+ * "original audio" rendition (`remuxAuxiliaryClip`'s own `hasDubAudio`
+ * flag), spliced the same way, and each dub file is cut to match via
+ * `remuxDubAudioTrack` at the real boundaries this splice produces — the
+ * same "split original + cut dub tracks to boundaries" shape
+ * `buildAudioOnlyRenditions` already established for the whole-file ABR
+ * case, just computed from the edited timeline's own spliced output instead
+ * of a single file's. Not resumable, like the ABR paths — a restart begins
+ * the whole job over rather than checkpointing mid-cut.
  */
 async function runSegmentedFastPath(
   session: import('../types').TranscodingSession,
@@ -3466,8 +3499,10 @@ async function runSegmentedFastPath(
 ): Promise<void> {
   const segments = session.segments ?? [];
   const opfsRoot = await navigator.storage.getDirectory();
+  const hasDubAudio = !!session.dubAudioTracks?.length;
   const tempFiles: string[] = [];
   const texts: string[] = [];
+  const origAudioTexts: string[] = [];
 
   post({ type: 'INITIALIZED', totalSegments: segments.length });
 
@@ -3484,7 +3519,9 @@ async function runSegmentedFastPath(
       tempFiles.push(tempName);
 
       log(`Clip ${i + 1}/${segments.length}: remuxing…`);
-      texts.push(await remuxAuxiliaryClip(tempName, `seg${i}_`, outputFolderHandle));
+      const result = await remuxAuxiliaryClip(tempName, `seg${i}_`, outputFolderHandle, hasDubAudio);
+      texts.push(result.playlistText);
+      if (result.originalAudioPlaylistText) origAudioTexts.push(result.originalAudioPlaylistText);
 
       post({
         type: 'SEGMENT_DONE',
@@ -3506,7 +3543,12 @@ async function runSegmentedFastPath(
     return;
   }
 
-  let outputM3u8 = spliceM3U8Texts(texts);
+  // Captured before any intro/outro splicing below, which dub-audio's own
+  // boundaries must never include: dub-audio and intro/outro stay mutually
+  // exclusive (see runTranscoding's own guard), so mainSpliced and the
+  // eventual outputM3u8 are identical whenever hasDubAudio is true.
+  const mainSpliced = spliceM3U8Texts(texts);
+  let outputM3u8 = mainSpliced;
   // Not mutually exclusive with edited segments anymore — spliceIntroOutro
   // is already generic over "whatever main playlist text you hand it", the
   // exact same call runWithHandle makes for the whole-file case, just fed
@@ -3516,16 +3558,46 @@ async function runSegmentedFastPath(
   }
   await writeOutputFile(outputFolderHandle, 'index.m3u8', outputM3u8);
 
+  let audioTags: AudioTrackTag[] | undefined;
+  if (hasDubAudio) {
+    await writeOutputFile(outputFolderHandle, ORIGINAL_AUDIO_PLAYLIST, spliceM3U8Texts(origAudioTexts));
+    audioTags = [{ name: 'Original', language: 'und', playlist: ORIGINAL_AUDIO_PLAYLIST, isDefault: true }];
+
+    const boundaries = cumulativeBoundaries(durationsFromPlaylist(mainSpliced));
+    for (const track of session.dubAudioTracks ?? []) {
+      log(`Adding dub audio: ${track.label}…`);
+      const segmentPrefix = `dub_${track.language}_`;
+      const playlist = `dub_${track.language}.m3u8`;
+      const { playlistText, segmentCount } = await remuxDubAudioTrack(track.fileName, segmentPrefix, boundaries, outputFolderHandle);
+      // The UI already rejects a dub shorter than the main content before a
+      // conversion can even start (see selectDubAudioTrack) — this is a
+      // second line of defense for a resumed/stale session that slipped
+      // past that check, same reasoning runWithHandle's own copy of this
+      // check documents.
+      if (segmentCount < boundaries.length) {
+        post({
+          type: 'ERROR',
+          error: `Dub audio "${track.label}" is shorter than the main content and would produce broken playback — use a dub at least as long.`,
+          sessionId: session.id,
+        });
+        return;
+      }
+      await writeOutputFile(outputFolderHandle, playlist, playlistText);
+      audioTags.push({ name: track.label, language: track.language, playlist, isDefault: false });
+    }
+  }
+
   // Same reasoning as the whole-file fast path's own tail (runWithHandle):
   // #EXT-X-MEDIA only has meaning inside a multivariant playlist, so a
-  // subtitle track forces a minimal master.m3u8 into existence here too.
+  // subtitle track or a dub-audio track forces a minimal master.m3u8 into
+  // existence here too.
   let masterM3u8: string | undefined;
-  if (subtitleTags.length > 0) {
+  if (subtitleTags.length > 0 || audioTags) {
     const totalDuration = totalDurationFromPlaylist(outputM3u8);
     for (const tag of subtitleTags) {
       await writeOutputFile(outputFolderHandle, tag.playlist, buildSubtitlePlaylist(totalDuration, subtitleVttFilename(tag.language)));
     }
-    masterM3u8 = buildFastPathMasterM3U8(1_000_000, session.sourceWidth, session.sourceHeight, subtitleTags, undefined);
+    masterM3u8 = buildFastPathMasterM3U8(1_000_000, session.sourceWidth, session.sourceHeight, subtitleTags, audioTags);
     await writeOutputFile(outputFolderHandle, 'master.m3u8', masterM3u8);
   }
 
