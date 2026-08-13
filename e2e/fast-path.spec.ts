@@ -82,3 +82,25 @@ test('the topbar\'s own export button reads "Download ZIP" once the job is done'
   await topbarBtn.click();
   await expect(page.locator('.export-done-panel')).toBeVisible();
 });
+
+test('the export modal backdrop covers the full viewport on a wide screen', async ({ page }) => {
+  // Regression test: ExportModal renders as a direct child of .app-shell
+  // (see App.tsx), and `.app-shell > * { max-width: 1440px; }` (a
+  // page-centering rule meant for the editor's own content) used to leak
+  // onto the backdrop too, capping its width and leaving a gap on the right
+  // edge of any viewport wider than 1440px. Playwright's own default
+  // viewport is narrower than that, so this needs an explicit wide one to
+  // actually exercise the bug.
+  await page.setViewportSize({ width: 1920, height: 900 });
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+
+  await page.click('.btn-export');
+  const backdrop = page.locator('.export-modal-backdrop');
+  await backdrop.waitFor({ timeout: 5_000 });
+  const box = await backdrop.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.x).toBe(0);
+  expect(box!.width).toBe(1920);
+  expect(box!.height).toBe(900);
+});

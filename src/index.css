@@ -1392,6 +1392,18 @@ body {
 .export-modal-backdrop {
   position: fixed;
   inset: 0;
+  /* ExportModal renders as a direct child of .app-shell (see App.tsx), so
+     the page-centering rule `.app-shell > * { width: 100%; max-width:
+     1440px; }` would otherwise cap this fixed-position overlay's own width
+     too — on a viewport wider than 1440px, `inset: 0` keeps `left: 0` but
+     `width` wins over the implicit right-edge stretch, leaving the
+     backdrop short of the right edge. Explicitly overridden back to a real
+     full-viewport size regardless of that ancestor rule. Same specificity
+     (one class each) as `.app-shell > *`, so source order — this rule
+     comes later in the file — is what makes the override actually win. */
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
   background: color-mix(in srgb, black 65%, transparent);
   display: flex;
   align-items: center;
