@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { ChapterMark } from '../lib/chapters';
 import { type EditorSegment, flattenedDuration } from '../lib/segments';
 import { formatTimestamp } from '../lib/vtt';
+import TrackWarning from './TrackWarning';
 
 interface ChapterRulerProps {
   segments: EditorSegment[];
@@ -47,12 +48,10 @@ export default function ChapterRuler({
       <div className="chapter-ruler-header">
         <span className="panel-hint">Chapters</span>
         {droppedCount > 0 && (
-          <span
-            className="caption-track-warning"
-            title={`${droppedCount} chapter(s) fall outside the current edit and will be dropped at export`}
-          >
-            ⚠ {droppedCount}
-          </span>
+          <TrackWarning
+            label={`⚠ ${droppedCount}`}
+            detail={`${droppedCount} chapter(s) fall outside the current edit and will be dropped at export`}
+          />
         )}
         <button type="button" className="btn-quiet" onClick={() => setSelectedId(onAddChapterAt(playheadTime))}>
           + Chapter here

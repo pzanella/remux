@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import SubtitleCueEditor from './SubtitleCueEditor';
+import TrackWarning from './TrackWarning';
 import { type EditorSegment, flattenedDuration, locateGlobalTime, remapSourceRangeToGlobal } from '../lib/segments';
 import { parseCues, serializeVtt } from '../lib/vtt';
 
@@ -150,12 +151,10 @@ export default function CaptionLane({
                     title="BCP-47 language code, e.g. en, it, fr"
                   />
                   {droppedCount > 0 && (
-                    <span
-                      className="caption-track-warning"
-                      title={`${droppedCount} cue(s) fall outside the current edit and will be dropped at export`}
-                    >
-                      ⚠ {droppedCount}
-                    </span>
+                    <TrackWarning
+                      label={`⚠ ${droppedCount}`}
+                      detail={`${droppedCount} cue(s) fall outside the current edit and will be dropped at export`}
+                    />
                   )}
                   <button type="button" className="btn-quiet" onClick={() => addCueAtPlayhead(track)}>
                     + Cue

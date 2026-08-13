@@ -828,11 +828,54 @@ body {
   gap: 0.5rem;
   min-width: 0;
 }
-.caption-track-warning {
+/* ── Track warning badge + popup (TrackWarning.tsx) ── */
+/* Agnostic to which track/lane uses it — CaptionLane's dropped-cue count
+   and ChapterRuler's dropped-chapter count both render this same markup.
+   Shown on hover (pure CSS, no JS needed for that half) *and* toggled open
+   on click via the `--open` modifier (see TrackWarning.tsx) — a native
+   `title` tooltip only ever covered the hover case, with no click/touch
+   equivalent. */
+.track-warning {
+  position: relative;
+  display: inline-flex;
   flex-shrink: 0;
+}
+.track-warning-trigger {
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
   font-size: 0.7rem;
   color: var(--danger);
-  cursor: default;
+}
+.track-warning-popup {
+  position: absolute;
+  bottom: calc(100% + 0.4rem);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 16rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg-panel));
+  color: var(--text);
+  font-size: 0.68rem;
+  line-height: 1.4;
+  text-align: left;
+  box-shadow: 0 8px 20px -6px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  z-index: 20;
+}
+.track-warning:hover .track-warning-popup,
+.track-warning--open .track-warning-popup {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
 }
 .caption-track-lane {
   position: relative;
