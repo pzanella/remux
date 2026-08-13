@@ -1,3 +1,5 @@
+import type { AppStatus } from '../types';
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KiB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
@@ -11,6 +13,7 @@ function formatDuration(seconds: number): string {
 
 interface TopBarProps {
   hasSource: boolean;
+  status: AppStatus;
   sourceFileName: string | null;
   sourceResolution: { width: number; height: number } | null;
   sourceDuration: number | undefined;
@@ -30,6 +33,7 @@ interface TopBarProps {
  * something that belongs inside the export review flow itself. */
 export default function TopBar({
   hasSource,
+  status,
   sourceFileName,
   sourceResolution,
   sourceDuration,
@@ -39,6 +43,7 @@ export default function TopBar({
   onExportClick,
   onSaveProject,
 }: TopBarProps) {
+  const isComplete = status === 'complete';
   return (
     <header className="topbar">
       <button type="button" className="topbar-brand" onClick={onReset} title="Start over">
@@ -67,8 +72,14 @@ export default function TopBar({
         </button>
       )}
 
-      <button type="button" className="btn-primary btn-export" onClick={onExportClick} disabled={!hasSource}>
-        Export HLS
+      <button
+        type="button"
+        className="btn-primary btn-export"
+        onClick={onExportClick}
+        disabled={!hasSource}
+        title={isComplete ? 'Your export is ready — open it to download the ZIP' : 'Review output settings and start an export'}
+      >
+        {isComplete ? 'Download ZIP' : 'Export HLS'}
       </button>
     </header>
   );

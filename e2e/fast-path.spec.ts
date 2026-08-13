@@ -38,7 +38,10 @@ test('shows a real completed-state panel and a distinct packaging moment around 
   await expect(page.locator('.export-done-heading')).toHaveText('Export complete');
   await expect(page.locator('.export-done-summary')).toContainText('Single quality (fast remux)');
 
-  const downloadBtn = page.locator('button:has-text("Download ZIP")');
+  // Scoped to the modal's own button — the topbar's export button also
+  // reads "Download ZIP" once complete (see the dedicated test for that
+  // below), which would otherwise make a bare text match ambiguous.
+  const downloadBtn = page.locator('.export-download-btn');
   await expect(downloadBtn).toBeEnabled();
 
   const zipPath = testInfo.outputPath('output.zip');
@@ -55,4 +58,27 @@ test('shows a real completed-state panel and a distinct packaging moment around 
 
   const entries = listZipEntries(zipPath);
   expect(entries).toContain('index.m3u8');
+});
+
+test('the topbar\'s own export button reads "Download ZIP" once the job is done', async ({ page }) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+
+  const topbarBtn = page.locator('.btn-export');
+  await expect(topbarBtn).toHaveText('Export HLS');
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+  await expect(topbarBtn).toHaveText('Download ZIP');
+
+  // Closing the modal (the actual bug report: the button used to always say
+  // "Export HLS" even once nothing was left to export) doesn't revert it —
+  // the label reflects the job's own status, not whether the modal is open.
+  await page.click('.export-modal-close');
+  await expect(topbarBtn).toHaveText('Download ZIP');
+
+  // Clicking it still reopens the same modal, now straight to its completed
+  // panel — same real download action, not a dead end.
+  await topbarBtn.click();
+  await expect(page.locator('.export-done-panel')).toBeVisible();
 });

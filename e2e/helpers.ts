@@ -183,9 +183,13 @@ export async function getLogText(page: Page): Promise<string> {
   return page.locator('.log-console').innerText();
 }
 
-/** Downloads the export ZIP to `destPath` and returns it. */
+/** Downloads the export ZIP to `destPath` and returns it. Scoped to the
+ * export modal's own button (`.export-download-btn`), not a plain
+ * "Download ZIP" text match — once a job completes, the topbar's own
+ * export button *also* reads "Download ZIP" (see TopBar.tsx), so a bare
+ * text selector would match two buttons whenever the modal is still open. */
 export async function downloadZip(page: Page, destPath: string): Promise<string> {
-  const [download] = await Promise.all([page.waitForEvent('download'), page.click('button:has-text("Download ZIP")')]);
+  const [download] = await Promise.all([page.waitForEvent('download'), page.click('.export-download-btn')]);
   await download.saveAs(destPath);
   return destPath;
 }

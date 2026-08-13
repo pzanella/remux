@@ -199,6 +199,7 @@ export default function App() {
     <div className="app-shell">
       <TopBar
         hasSource
+        status={t.status}
         sourceFileName={t.session?.sourceFileName ?? null}
         sourceResolution={t.sourceResolution}
         sourceDuration={t.sourceDuration}
