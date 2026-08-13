@@ -2650,17 +2650,16 @@ async function runTranscoding(cmd: WorkerCommand): Promise<void> {
     return;
   }
 
-  // Edited (multi-segment) sources share the same underlying limitation:
-  // buildAudioOnlyRenditions/spliceIntroOutro only ever know about the
-  // single main-content timeline they were built for, with no equivalent
-  // of runSegmentedFastPath's splice for either combination yet.
+  // Dub-audio still shares the underlying limitation intro/outro used to:
+  // buildAudioOnlyRenditions only ever knew about the single main-content
+  // timeline it was built for, with no equivalent of runSegmentedFastPath's
+  // splice. Intro/outro itself no longer needs this guard — both
+  // runSegmentedFastPath and runAdaptiveHlsSegmented now splice an attached
+  // intro/outro around the edited timeline the same way spliceIntroOutro/
+  // finalizeAbrResults already do for the unedited case.
   const editedSegments = hasEditedSegments(session);
   if (editedSegments && session.dubAudioTracks?.length) {
     post({ type: 'ERROR', error: 'Dub-audio tracks are not yet supported together with edited (trimmed/split) segments.' });
-    return;
-  }
-  if (editedSegments && (session.introOutro?.introFileName || session.introOutro?.outroFileName)) {
-    post({ type: 'ERROR', error: 'Intro/outro clips are not yet supported together with edited (trimmed/split) segments.' });
     return;
   }
 
@@ -3440,8 +3439,11 @@ async function spliceIntroOutro(
 // unlike intro/outro these aren't separate files to begin with), remux it
 // independently, and splice the results with `spliceM3U8Texts`, which
 // already handles an arbitrary-length list. Every segment shares the main
-// content's own dimensions by definition, so none of intro/outro's
-// letterboxing logic applies here.
+// content's own dimensions by definition, so none of intro/outro's own
+// letterboxing logic applies to *them* — an attached intro/outro can still
+// be spliced on around the whole edited timeline (see `runSegmentedFastPath`
+// and `runAdaptiveHlsSegmented`'s own calls to `spliceIntroOutro`/
+// `resolveIntroOutroClip`), with its usual letterboxing intact for that.
 
 /** True when `session.segments` represents a real edit — more than one
  * segment, or a single segment that doesn't already span the whole source.
@@ -3504,7 +3506,14 @@ async function runSegmentedFastPath(
     return;
   }
 
-  const outputM3u8 = spliceM3U8Texts(texts);
+  let outputM3u8 = spliceM3U8Texts(texts);
+  // Not mutually exclusive with edited segments anymore — spliceIntroOutro
+  // is already generic over "whatever main playlist text you hand it", the
+  // exact same call runWithHandle makes for the whole-file case, just fed
+  // the already-multi-clip-spliced text here instead of a single file's.
+  if (session.introOutro?.introFileName || session.introOutro?.outroFileName) {
+    outputM3u8 = await spliceIntroOutro(session, outputFolderHandle, outputM3u8);
+  }
   await writeOutputFile(outputFolderHandle, 'index.m3u8', outputM3u8);
 
   // Same reasoning as the whole-file fast path's own tail (runWithHandle):
@@ -3534,12 +3543,16 @@ async function runSegmentedFastPath(
  * intro/main/outro triple to an ordered list of per-segment,
  * per-rendition results — one entry in `segmentResultsList` per timeline
  * segment, each already encoded across every selected rendition. Splices
- * per rendition the same way, across however many segments there are. */
+ * per rendition the same way, across however many segments there are, with
+ * `introResults`/`outroResults` (when given) prepended/appended per
+ * rendition exactly like `finalizeAbrResults`'s own fixed triple. */
 async function finalizeAbrResultsSegmented(
   outputFolderHandle: FileSystemDirectoryHandle,
   segmentResultsList: AbrSourceResult[][],
   subtitleTags: SubtitleTag[],
   audioTags?: AudioTrackTag[],
+  introResults?: AbrSourceResult[] | null,
+  outroResults?: AbrSourceResult[] | null,
 ): Promise<{ masterM3u8: string; highestM3u8: string }> {
   const reference = segmentResultsList.find((r) => r.length > 0);
   if (!reference) {
@@ -3550,8 +3563,11 @@ async function finalizeAbrResultsSegmented(
   let highestM3u8 = '';
 
   for (const { rendition } of reference) {
+    const intro = introResults?.find((r) => r.rendition.height === rendition.height);
+    const outro = outroResults?.find((r) => r.rendition.height === rendition.height);
     const texts: string[] = [];
     let width = 0;
+    if (intro) texts.push(intro.playlistText);
     for (const segResults of segmentResultsList) {
       const match = segResults.find((r) => r.rendition.height === rendition.height);
       if (match) {
@@ -3559,6 +3575,7 @@ async function finalizeAbrResultsSegmented(
         width = match.width;
       }
     }
+    if (outro) texts.push(outro.playlistText);
     if (texts.length === 0) continue;
 
     const spliced = texts.length > 1 ? spliceM3U8Texts(texts) : texts[0];
@@ -3574,6 +3591,8 @@ async function finalizeAbrResultsSegmented(
     for (let i = 0; i < segmentResultsList.length; i++) {
       await removeOutputFileQuietly(outputFolderHandle, `seg${i}_${rendition.label}.m3u8`);
     }
+    if (intro) await removeOutputFileQuietly(outputFolderHandle, `intro_${rendition.label}.m3u8`);
+    if (outro) await removeOutputFileQuietly(outputFolderHandle, `outro_${rendition.label}.m3u8`);
   }
 
   if (subtitleTags.length > 0) {
@@ -3592,7 +3611,13 @@ async function finalizeAbrResultsSegmented(
 /** Encodes one pre-cut segment clip across every selected rendition via
  * FFmpeg (software fallback) and maps the result to the shape
  * `finalizeAbrResultsSegmented` expects — the segmented counterpart of the
- * inline FFmpeg calls in `runAbrTranscoding`. */
+ * inline FFmpeg calls in `runAbrTranscoding`. `mainDimensions` is left unset
+ * for a regular edited-segment clip (cut from the main source itself, so it
+ * always already matches by definition — same reasoning `runSegmentedFastPath`
+ * documents for its own `remuxAuxiliaryClip` calls) and set to the main
+ * content's own dimensions when this is instead encoding an intro/outro
+ * clip, mirroring `encodeAuxiliaryClipMatchingMain`'s own reason for passing
+ * it (see `encodeRenditionsForSource`'s doc comment on the same param). */
 async function encodeSegmentWithFfmpeg(
   FFmpeg: FFmpegModule['FFmpeg'],
   coreURL: string,
@@ -3604,12 +3629,63 @@ async function encodeSegmentWithFfmpeg(
   sourceWidth: number,
   sourceHeight: number,
   segmentPrefix: string,
+  mainDimensions?: { width: number; height: number },
 ): Promise<AbrSourceResult[]> {
   const { data, inputName } = await loadFFmpegInput(opfsRoot, clipOpfsName);
   const results = await encodeRenditionsForSource(
-    FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, segmentPrefix, '',
+    FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, segmentPrefix, '', mainDimensions,
   );
   return results.map((r) => ({ rendition: r.rendition, width: r.width, playlistText: r.playlistText }));
+}
+
+/** Encodes one intro/outro clip across every selected rendition for the
+ * segmented ABR path — the same hardware-then-FFmpeg-fallback decision each
+ * per-segment clip already makes in `runAdaptiveHlsSegmented`'s own loop,
+ * plus the two things a regular edited segment never needs: resolving a
+ * still image to a synthesized held clip first (`resolveIntroOutroClip`),
+ * and letterboxing to the main content's own dimensions on the FFmpeg
+ * fallback path (`encodeSegmentWithFfmpeg`'s `mainDimensions` — the
+ * hardware path already letterboxes to whatever `sourceWidth`/`sourceHeight`
+ * it's given, same as `runAbrTranscodingWebCodecs`'s own intro/outro calls
+ * rely on). Non-fatal on failure — logs and returns `null`, letting the
+ * whole job continue without that one clip, matching how a single broken
+ * rendition is already handled elsewhere in this file. */
+async function encodeIntroOutroForSegmented(
+  label: 'intro' | 'outro',
+  fileName: string,
+  isImage: boolean | undefined,
+  holdDurationSec: number | undefined,
+  FFmpeg: FFmpegModule['FFmpeg'],
+  coreURL: string,
+  wasmURL: string,
+  opfsRoot: FileSystemDirectoryHandle,
+  outputFolderHandle: FileSystemDirectoryHandle,
+  renditions: (typeof ABR_LADDER)[number][],
+  sourceWidth: number,
+  sourceHeight: number,
+  canUseHardware: boolean,
+): Promise<AbrSourceResult[] | null> {
+  const prefix = `${label}_`;
+  let resolvedName: string | undefined;
+  try {
+    resolvedName = await resolveIntroOutroClip(fileName, isImage, holdDurationSec, sourceWidth, sourceHeight);
+    if (canUseHardware) {
+      try {
+        return await runAbrEncodeForSource(resolvedName, outputFolderHandle, renditions, sourceWidth, sourceHeight, prefix, false);
+      } catch (err) {
+        log(`Could not hardware-encode the ${label} (${err}), falling back to FFmpeg…`, 'ERROR');
+      }
+    }
+    return await encodeSegmentWithFfmpeg(
+      FFmpeg, coreURL, wasmURL, opfsRoot, outputFolderHandle, resolvedName, renditions, sourceWidth, sourceHeight, prefix,
+      { width: sourceWidth, height: sourceHeight },
+    );
+  } catch (err) {
+    log(`Could not encode the ${label} (${err}) — continuing without it.`, 'ERROR');
+    return null;
+  } finally {
+    if (resolvedName && resolvedName !== fileName) await removeOutputFileQuietly(opfsRoot, resolvedName);
+  }
 }
 
 /**
@@ -3620,7 +3696,10 @@ async function encodeSegmentWithFfmpeg(
  * `runAdaptiveHls` makes once for the whole job, made once here too and
  * reused for every segment rather than re-probed per clip), producing an
  * `AbrSourceResult[]` per segment that `finalizeAbrResultsSegmented`
- * splices together per rendition. Not resumable.
+ * splices together per rendition, along with an attached intro/outro (see
+ * `encodeIntroOutroForSegmented`) prepended/appended the same way
+ * `finalizeAbrResults` already does for the non-segmented case. Not
+ * resumable.
  */
 async function runAdaptiveHlsSegmented(
   session: import('../types').TranscodingSession,
@@ -3645,6 +3724,22 @@ async function runAdaptiveHlsSegmented(
   const opfsRoot = await navigator.storage.getDirectory();
   const { FFmpeg } = await loadFFmpegModule();
   const { coreURL, wasmURL } = await fetchFFmpegCoreBlobs();
+
+  const introName = session.introOutro?.introFileName;
+  const outroName = session.introOutro?.outroFileName;
+
+  let introResults: AbrSourceResult[] | null = null;
+  if (introName) {
+    log('Adding intro…');
+    introResults = await encodeIntroOutroForSegmented(
+      'intro', introName, session.introOutro?.introIsImage, session.introOutro?.introDuration,
+      FFmpeg, coreURL, wasmURL, opfsRoot, outputFolderHandle, renditions, sourceWidth, sourceHeight, canUseHardware,
+    );
+  }
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
 
   const tempFiles: string[] = [];
   const segmentResultsList: AbrSourceResult[][] = [];
@@ -3705,7 +3800,20 @@ async function runAdaptiveHlsSegmented(
     return;
   }
 
-  const { masterM3u8, highestM3u8 } = await finalizeAbrResultsSegmented(outputFolderHandle, segmentResultsList, subtitleTags, undefined);
+  let outroResults: AbrSourceResult[] | null = null;
+  if (outroName) {
+    log('Adding outro…');
+    outroResults = await encodeIntroOutroForSegmented(
+      'outro', outroName, session.introOutro?.outroIsImage, session.introOutro?.outroDuration,
+      FFmpeg, coreURL, wasmURL, opfsRoot, outputFolderHandle, renditions, sourceWidth, sourceHeight, canUseHardware,
+    );
+  }
+  if (cancelled) {
+    log('Cancelled.');
+    return;
+  }
+
+  const { masterM3u8, highestM3u8 } = await finalizeAbrResultsSegmented(outputFolderHandle, segmentResultsList, subtitleTags, undefined, introResults, outroResults);
   post({ type: 'COMPLETE', log: 'Done! master.m3u8 is ready.', m3u8: highestM3u8, masterM3u8, sessionId: session.id });
 }
 

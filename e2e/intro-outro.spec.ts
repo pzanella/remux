@@ -117,28 +117,69 @@ test('plays an attached intro, then main content, then an attached outro, in seq
     .toBe(outroSrc);
 });
 
-test('blocks splitting the timeline once an intro/outro is attached, instead of only failing at export time', async ({ page }) => {
-  await page.goto('/');
-  await uploadSource(page, 'sample.mp4');
-  await attachIntro(page, 'intro.mp4');
-
-  // The split button is only reachable this way once a card is selected
-  // and the playhead lands inside it — same setup as splitTimelineAt, but
-  // asserting on the button's own disabled state instead of clicking it.
-  const track = page.locator('.timeline-track');
-  const box = await track.boundingBox();
-  await track.click({ position: { x: box!.width * 0.5, y: box!.height / 2 } });
-  await expect(page.locator('.split-button')).toBeDisabled();
-});
-
-test('blocks attaching an intro/outro once the timeline has been split, instead of only failing at export time', async ({ page }) => {
+test('splits the timeline, then attaches an intro and outro on top of it — no longer mutually exclusive', async ({ page }, testInfo) => {
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');
   await splitTimelineAt(page, 0.5);
+  await expect(page.locator('.timeline-clip:not(.timeline-clip--extra)')).toHaveCount(2);
 
-  await expect(page.locator('.timeline-warning')).toBeVisible();
-  await expect(page.locator('.timeline-extra-slot').first()).toBeDisabled();
-  await expect(page.locator('.timeline-extra-slot').last()).toBeDisabled();
+  await attachIntro(page, 'intro.mp4');
+  await attachOutro(page, 'outro.mp4');
+
+  // Split stays reachable with intro/outro attached now — same setup the
+  // old (now-removed) restriction test used to assert the opposite of.
+  const track = page.locator('.timeline-track');
+  const box = await track.boundingBox();
+  await track.click({ position: { x: box!.width * 0.25, y: box!.height / 2 } });
+  await expect(page.locator('.split-button')).toBeEnabled();
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+
+  const zipPath = testInfo.outputPath('output.zip');
+  await downloadZip(page, zipPath);
+  const entries = listZipEntries(zipPath);
+  // intro (1s) + 2 split clips + outro (1s), each at least one segment.
+  const segmentCount = entries.filter((e) => e.endsWith('.ts')).length;
+  expect(segmentCount).toBeGreaterThan(3);
+
+  const playlist = readZipEntryText(zipPath, 'index.m3u8');
+  expect(playlist).toContain('#EXT-X-ENDLIST');
+  // ~1s intro + 2s main (now split into two pieces) + 1s outro.
+  expect(totalPlaylistDurationSec(playlist)).toBeGreaterThan(3.5);
+
+  await page.click('.export-modal-close');
+  await expect(page.locator('.player-error')).toHaveCount(0);
+  const video = page.locator('.player-frame video');
+  await expect
+    .poll(async () => video.evaluate((v: { readyState: number }) => v.readyState), { timeout: 25_000 })
+    .toBeGreaterThanOrEqual(2);
+});
+
+test('supports intro/outro spliced around a split timeline for an adaptive-bitrate export too', async ({ page }, testInfo) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+  await splitTimelineAt(page, 0.5);
+  await attachIntro(page, 'intro.mp4');
+  await attachOutro(page, 'outro.mp4');
+  await selectRendition(page, '240p');
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+
+  const zipPath = testInfo.outputPath('output.zip');
+  await downloadZip(page, zipPath);
+  const entries = listZipEntries(zipPath);
+  expect(entries).toContain('master.m3u8');
+  const master = readZipEntryText(zipPath, 'master.m3u8');
+  expect(master).toContain('240');
+
+  await page.click('.export-modal-close');
+  await expect(page.locator('.player-error')).toHaveCount(0);
+  const video = page.locator('.player-frame video');
+  await expect
+    .poll(async () => video.evaluate((v: { readyState: number }) => v.readyState), { timeout: 25_000 })
+    .toBeGreaterThanOrEqual(2);
 });
 
 test('drag-and-dropping a video file onto the timeline\'s intro/outro slots attaches it', async ({ page }) => {

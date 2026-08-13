@@ -14,7 +14,6 @@ import { useTranscoder } from './hooks/useTranscoder';
 import { useEditorSegments } from './hooks/useEditorSegments';
 import { useChapters } from './hooks/useChapters';
 import { useBatchTranscoder } from './hooks/useBatchTranscoder';
-import { isTrivialEdit } from './lib/segments';
 
 export default function App() {
   const t = useTranscoder();
@@ -22,15 +21,6 @@ export default function App() {
   const chapters = useChapters(t.sourceDuration);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const previewRef = useRef<PreviewPaneHandle>(null);
-
-  // Intro/outro splicing and a trimmed/split timeline aren't supported
-  // together yet (see remux.worker.ts's own guard in runTranscoding) —
-  // computed once here and passed to Timeline, which uses it in both
-  // directions: disables its own intro/outro slots once segments are
-  // edited, and disables Split once intro/outro is attached — whichever
-  // comes first blocks the other, instead of only failing at export time.
-  const hasEditedSegments = t.sourceDuration !== undefined && !isTrivialEdit(editor.segments, t.sourceDuration);
-  const hasIntroOrOutro = !!(t.introFile || t.outroFile);
 
   // PreviewPane's own reset effect keys off these objects' identity (to
   // catch a genuine attach/detach) — a fresh object literal on every render
@@ -256,8 +246,6 @@ export default function App() {
               onSelectOutroFile={t.selectOutroFile}
               onClearOutroFile={t.clearOutroFile}
               onSetOutroImageDuration={t.setOutroImageDuration}
-              hasIntroOrOutro={hasIntroOrOutro}
-              hasEditedSegments={hasEditedSegments}
             />
             <MediaExtrasPanel
               dubAudioTracks={t.dubAudioTracks}

@@ -150,11 +150,7 @@ function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDura
         const file = e.dataTransfer.files?.[0];
         if (file) onSelect(file);
       }}
-      title={
-        disabled
-          ? 'Not available together with a trimmed/split timeline yet'
-          : `Drop a video or image here, or click to add ${kind === 'intro' ? 'an intro' : 'an outro'}`
-      }
+      title={disabled ? undefined : `Drop a video or image here, or click to add ${kind === 'intro' ? 'an intro' : 'an outro'}`}
     >
       <span className="timeline-extra-slot-plus">+</span> {label}
       <input
@@ -191,13 +187,15 @@ interface TimelineProps {
   beginGesture: () => void;
   previewUpdate: (mutate: (prev: EditorSegment[]) => EditorSegment[]) => void;
   commitGesture: () => void;
-  /** Attached intro/outro clips — shown as flanking cards to the left/right
-   * of the main clip track, styled like a real clip, so they're part of
-   * what the timeline visibly shows rather than only living in a separate
-   * panel. Not part of `segments`'s own proportional layout at all:
-   * intro/outro splicing is mutually exclusive with a trimmed/split
-   * timeline (see `hasIntroOrOutro` below), so there's never a case where
-   * these coexist with more than the one trivial segment. */
+  /** Attached intro/outro clips — shown as flanking clips to the left/right
+   * of the main clip track (styled identically, see `IntroOutroSlot`), so
+   * they're part of what the timeline visibly shows rather than only living
+   * in a separate panel. Fixed-width, not part of `segments`'s own
+   * proportional layout — intro/outro have no shared timeline axis with the
+   * content track, regardless of how many content clips there are (the
+   * worker splices them around the whole edited timeline either way; see
+   * `spliceIntroOutro`'s calls in `runSegmentedFastPath`/
+   * `runAdaptiveHlsSegmented`). */
   introClip?: IntroOutroClip | null;
   outroClip?: IntroOutroClip | null;
   onSelectIntroFile: (file: File) => void;
@@ -206,15 +204,6 @@ interface TimelineProps {
   onSelectOutroFile: (file: File) => void;
   onClearOutroFile: () => void;
   onSetOutroImageDuration: (seconds: number) => void;
-  /** Disables Split (and the empty intro/outro slots' own picker/drop) —
-   * intro/outro splicing and a trimmed/split timeline aren't supported
-   * together yet (see remux.worker.ts's own guard). `hasIntroOrOutro`
-   * blocks Split once intro/outro is attached; `hasEditedSegments` (the
-   * other half of the same guard, mirrored in MediaExtrasPanel) blocks
-   * attaching intro/outro once segments are edited — whichever happens
-   * first blocks the other, instead of only failing at export time. */
-  hasIntroOrOutro: boolean;
-  hasEditedSegments: boolean;
 }
 
 /**
@@ -252,8 +241,6 @@ export default function Timeline({
   onSelectOutroFile,
   onClearOutroFile,
   onSetOutroImageDuration,
-  hasIntroOrOutro,
-  hasEditedSegments,
 }: TimelineProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
@@ -327,15 +314,11 @@ export default function Timeline({
           </button>
         </div>
       </div>
-      {hasEditedSegments && (
-        <span className="timeline-warning">Intro/outro isn't available together with a trimmed/split timeline yet — undo those edits first.</span>
-      )}
-
       <div className="timeline-strip">
         <IntroOutroSlot
           kind="intro"
           clip={introClip}
-          disabled={hasEditedSegments}
+          disabled={disabled}
           onSelect={onSelectIntroFile}
           onClear={onClearIntroFile}
           onSetHoldDuration={onSetIntroImageDuration}
@@ -434,12 +417,12 @@ export default function Timeline({
                     className="split-button"
                     draggable={false}
                     style={{ left: `${splitLocalPercent}%` }}
-                    disabled={disabled || hasIntroOrOutro}
+                    disabled={disabled}
                     onClick={(e) => {
                       e.stopPropagation();
                       onSplit();
                     }}
-                    title={hasIntroOrOutro ? 'Not available together with an attached intro/outro yet — remove it first' : 'Split this clip at the playhead'}
+                    title="Split this clip at the playhead"
                   >
                     ✂ Split
                   </button>
@@ -458,7 +441,7 @@ export default function Timeline({
         <IntroOutroSlot
           kind="outro"
           clip={outroClip}
-          disabled={hasEditedSegments}
+          disabled={disabled}
           onSelect={onSelectOutroFile}
           onClear={onClearOutroFile}
           onSetHoldDuration={onSetOutroImageDuration}

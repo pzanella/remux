@@ -1098,11 +1098,6 @@ body {
   display: flex;
   gap: 0.7rem;
 }
-.timeline-warning {
-  font-size: 0.72rem;
-  color: var(--danger);
-}
-
 .timeline-strip {
   display: flex;
   align-items: stretch;
