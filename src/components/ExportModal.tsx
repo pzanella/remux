@@ -131,7 +131,19 @@ export default function ExportModal({
 
         <ProgressPanel status={status} convertProgress={convertProgress} segmentProgress={segmentProgress} renditionLabel={renditionLabel} />
 
-        {isComplete && <p className="export-modal-done">Done — your HLS output is ready.</p>}
+        {isComplete && (
+          <div className={`export-done-panel${isZipping ? ' is-packaging' : ''}`}>
+            <div className="export-done-icon" aria-hidden="true">
+              {isZipping ? <span className="spinner spinner--sm" /> : '✓'}
+            </div>
+            <div className="export-done-body">
+              <h3 className="export-done-heading">{isZipping ? 'Packaging your output…' : 'Export complete'}</h3>
+              <p className="export-done-summary">
+                {isZipping ? 'Zipping everything into one download…' : `${renditionsSummary}${extrasSummary ? ` · ${extrasSummary}` : ''}`}
+              </p>
+            </div>
+          </div>
+        )}
         {isError && <p className="export-modal-error">Something went wrong — see the log below.</p>}
 
         <div className="btn-row">
@@ -156,7 +168,7 @@ export default function ExportModal({
             </button>
           )}
           {isComplete && (
-            <button type="button" className="btn-primary" onClick={onDownloadZip} disabled={isZipping}>
+            <button type="button" className="btn-primary export-download-btn" onClick={onDownloadZip} disabled={isZipping}>
               {isZipping ? 'Zipping…' : 'Download ZIP'}
             </button>
           )}

@@ -150,7 +150,7 @@ export async function runExport(page: Page, beforeStart?: () => Promise<void>): 
   if (beforeStart) await beforeStart();
   await page.click('button:has-text("Start conversion")');
   await Promise.race([
-    page.waitForSelector('text=Done — your HLS output is ready.', { timeout: 45_000 }),
+    page.waitForSelector('.export-done-panel', { timeout: 45_000 }),
     page.waitForSelector('.export-modal-error', { timeout: 45_000 }),
   ]);
   return (await page.$('.export-modal-error')) ? 'error' : 'done';

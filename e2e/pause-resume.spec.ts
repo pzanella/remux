@@ -35,7 +35,7 @@ test('pauses mid-job and resumes to a complete, correctly-ordered output', async
   await page.waitForSelector('button:has-text("Resume")', { timeout: 10_000 });
   await page.click('button:has-text("Resume")');
 
-  await page.waitForSelector('text=Done — your HLS output is ready.', { timeout: 30_000 });
+  await page.waitForSelector('.export-done-panel', { timeout: 30_000 });
 
   const zipPath = testInfo.outputPath('output.zip');
   await downloadZip(page, zipPath);
