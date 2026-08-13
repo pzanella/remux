@@ -753,16 +753,20 @@ body {
   pointer-events: none;
 }
 /* Marks where an attached intro/outro's own boundary falls on the combined
-   intro+main+outro scrub bar. */
+   intro+main+outro scrub bar — deliberately high-contrast (var(--warning),
+   not var(--bg)) and taller than the 4px bar itself so it reads as a clear
+   boundary tick rather than blending into the already-dark track. */
 .scrub-bar-marker {
   position: absolute;
   top: 50%;
-  width: 2px;
-  height: 10px;
-  background: var(--bg);
+  width: 3px;
+  height: 16px;
+  border-radius: 1.5px;
+  background: var(--warning);
+  box-shadow: 0 0 5px 0.5px color-mix(in srgb, var(--warning) 70%, transparent);
   transform: translate(-50%, -50%);
   pointer-events: none;
-  z-index: 1;
+  z-index: 2;
 }
 
 .rendition-chips {

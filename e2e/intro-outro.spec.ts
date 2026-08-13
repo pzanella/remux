@@ -73,6 +73,8 @@ test('plays an attached intro, then main content, then an attached outro, in seq
   // Combined preview timeline: intro (1s) + main (2s) + outro (1s) = 4s.
   await expect(page.locator('.timecode')).toContainText('/ 00:04');
   await expect(page.locator('.scrub-bar-marker')).toHaveCount(2);
+  // High-contrast var(--warning), not the old near-invisible var(--bg).
+  await expect(page.locator('.scrub-bar-marker').first()).toHaveCSS('background-color', 'rgb(245, 197, 66)');
 
   const video = page.locator('.preview-frame video');
   const introSrc = await video.evaluate((v: { currentSrc: string }) => v.currentSrc);
