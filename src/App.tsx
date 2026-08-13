@@ -38,11 +38,11 @@ export default function App() {
   // `t.introFile`/`t.outroFile` themselves are otherwise reference-stable
   // between renders. Memoized on those, not reconstructed every render.
   const introPreviewClip = useMemo(
-    () => (t.introFile ? { file: t.introFile.file, duration: t.introFile.duration ?? 0 } : null),
+    () => (t.introFile ? { file: t.introFile.file, duration: t.introFile.duration ?? 0, isImage: t.introFile.isImage } : null),
     [t.introFile],
   );
   const outroPreviewClip = useMemo(
-    () => (t.outroFile ? { file: t.outroFile.file, duration: t.outroFile.duration ?? 0 } : null),
+    () => (t.outroFile ? { file: t.outroFile.file, duration: t.outroFile.duration ?? 0, isImage: t.outroFile.isImage } : null),
     [t.outroFile],
   );
 
@@ -247,12 +247,14 @@ export default function App() {
               beginGesture={editor.beginGesture}
               previewUpdate={editor.previewUpdate}
               commitGesture={editor.commitGesture}
-              introClip={t.introFile ? { label: t.introFile.label, duration: t.introFile.duration } : null}
-              outroClip={t.outroFile ? { label: t.outroFile.label, duration: t.outroFile.duration } : null}
+              introClip={t.introFile ? { label: t.introFile.label, duration: t.introFile.duration, isImage: t.introFile.isImage } : null}
+              outroClip={t.outroFile ? { label: t.outroFile.label, duration: t.outroFile.duration, isImage: t.outroFile.isImage } : null}
               onSelectIntroFile={t.selectIntroFile}
               onClearIntroFile={t.clearIntroFile}
+              onSetIntroImageDuration={t.setIntroImageDuration}
               onSelectOutroFile={t.selectOutroFile}
               onClearOutroFile={t.clearOutroFile}
+              onSetOutroImageDuration={t.setOutroImageDuration}
               hasIntroOrOutro={hasIntroOrOutro}
               hasEditedSegments={hasEditedSegments}
             />

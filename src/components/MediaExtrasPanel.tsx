@@ -4,10 +4,13 @@ import { useRef, useState } from 'react';
 // path the main content uses (see remux.worker.ts's "Intro/outro splicing"
 // section) — no FFmpeg pre-conversion step exists for native-video intro/
 // outro the way there is for the main file, so only formats the Rust
-// remuxer can read directly are accepted for those. Exported for
+// remuxer can read directly are accepted for those. A still image is the
+// one exception: the worker synthesizes a short held video clip from it
+// first (see `convertImageToClip`), so it never touches the Rust remuxer
+// directly and isn't bound by that same-container restriction. Exported for
 // `Timeline.tsx`'s own intro/outro slots, which now own the picker/drop UI
 // this component used to (see that file's own `IntroOutroSlot`).
-export const NATIVE_ACCEPT = '.mp4,.mov,.m4v,.3gp,.f4v';
+export const NATIVE_ACCEPT = '.mp4,.mov,.m4v,.3gp,.f4v,.jpg,.jpeg,.png,.webp';
 // A dub track's own video (if any) is never used — only its audio track is
 // read (see remuxDubAudioTrack) — so this also accepts audio-only formats,
 // normalized to AAC/M4A by FFmpeg if they aren't already MP4-family.

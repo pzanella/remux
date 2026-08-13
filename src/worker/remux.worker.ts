@@ -222,6 +222,89 @@ async function convertAudioToM4a(sourceOpfsName: string, originalFileName: strin
   return outputOpfsName;
 }
 
+/** Synthesizes a short held-title/closing-logo video clip from a still
+ * image — `-loop 1` repeats the single frame for `holdDurationSec`, paired
+ * with a silent audio track (an audio-less clip spliced next to
+ * audio-bearing segments risks a real playback glitch, so one is always
+ * included) and scaled/padded to `targetWidth`x`targetHeight` so the result
+ * matches the main content's own dimensions exactly — see
+ * `resolveIntroOutroClip`, the only caller, for why that matters. Follows
+ * the same OPFS-in/OPFS-out shape as `convertAudioToM4a` above. */
+async function convertImageToClip(sourceOpfsName: string, holdDurationSec: number, targetWidth: number, targetHeight: number): Promise<string> {
+  const { FFmpeg } = await loadFFmpegModule();
+  const { fetchFile } = await import('@ffmpeg/util');
+
+  const ffmpeg = new FFmpeg();
+  await loadFFmpegCore(ffmpeg);
+
+  const opfsRoot = await navigator.storage.getDirectory();
+  const srcHandle = await opfsRoot.getFileHandle(sourceOpfsName);
+  const srcFile: File = await srcHandle.getFile();
+
+  const ext = sourceOpfsName.includes('.') ? sourceOpfsName.slice(sourceOpfsName.lastIndexOf('.')) : '.img';
+  const inputName = `input${ext}`;
+  await ffmpeg.writeFile(inputName, await fetchFile(srcFile));
+
+  const outputName = 'output.mp4';
+  await ffmpeg.exec([
+    '-loop', '1',
+    '-i', inputName,
+    '-f', 'lavfi',
+    '-i', 'anullsrc=r=44100:cl=stereo',
+    '-shortest',
+    '-t', String(holdDurationSec),
+    '-r', '30',
+    '-c:v', 'libx264',
+    '-preset', 'fast',
+    '-crf', '23',
+    '-pix_fmt', 'yuv420p',
+    '-vf', `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2:black`,
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-movflags', '+faststart',
+    '-y',
+    outputName,
+  ]);
+
+  const outputData = (await ffmpeg.readFile(outputName)) as Uint8Array;
+  const outputOpfsName = `converted_${Date.now()}_held.mp4`;
+  const outHandle = await opfsRoot.getFileHandle(outputOpfsName, { create: true });
+  const writable = await outHandle.createWritable();
+  await writable.write(outputData.buffer.slice(0) as ArrayBuffer);
+  await writable.close();
+
+  await ffmpeg.deleteFile(inputName);
+  await ffmpeg.deleteFile(outputName);
+  ffmpeg.terminate();
+
+  return outputOpfsName;
+}
+
+/** If `isImage`, synthesizes a short held clip from the still image (see
+ * `convertImageToClip` above) and returns its OPFS filename in place of the
+ * original, at exactly `mainWidth`x`mainHeight` — every downstream splice/
+ * encode path then treats it exactly like any other same-size video intro/
+ * outro, with no image-aware branching of its own (in particular,
+ * `prepareAuxiliaryClip`'s `matchesMain` check takes the fast byte-copy
+ * path instead of a redundant second letterbox encode). Returns the
+ * original filename unchanged for a real video clip. The synthetic file is
+ * temporary — callers must clean it up themselves (e.g. via
+ * `removeOutputFileQuietly` against `navigator.storage.getDirectory()`)
+ * once they're done with it, the same convention `cutSegmentClip`'s own
+ * callers already follow for their temp files. */
+async function resolveIntroOutroClip(
+  fileName: string,
+  isImage: boolean | undefined,
+  holdDurationSec: number | undefined,
+  mainWidth: number | undefined,
+  mainHeight: number | undefined,
+): Promise<string> {
+  if (!isImage) return fileName;
+  const width = mainWidth && mainWidth > 0 ? mainWidth : 1280;
+  const height = mainHeight && mainHeight > 0 ? mainHeight : 720;
+  return convertImageToClip(fileName, holdDurationSec ?? 3, width, height);
+}
+
 // ── Loudness normalization (EBU R128) ──────────────────────────────
 //
 // I=-23 LUFS / TP=-1 dBTP / LRA=7 LU are the EBU R128 broadcast targets
@@ -806,8 +889,12 @@ async function runAbrTranscoding(
 
   let introResults: RenditionResult[] | null = null;
   if (introName) {
+    let resolvedIntroName: string | undefined;
     try {
-      const { data, inputName } = await loadFFmpegInput(opfsRoot, introName);
+      resolvedIntroName = await resolveIntroOutroClip(
+        introName, session.introOutro?.introIsImage, session.introOutro?.introDuration, sourceWidth, sourceHeight,
+      );
+      const { data, inputName } = await loadFFmpegInput(opfsRoot, resolvedIntroName);
       introResults = await encodeRenditionsForSource(
         FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, 'intro_', '[intro] ', mainDimensions,
       );
@@ -817,6 +904,8 @@ async function runAbrTranscoding(
         return;
       }
       log(`Could not encode the intro (${err}) — continuing without it.`, 'ERROR');
+    } finally {
+      if (resolvedIntroName && resolvedIntroName !== introName) await removeOutputFileQuietly(opfsRoot, resolvedIntroName);
     }
   }
   if (cancelled) {
@@ -845,8 +934,12 @@ async function runAbrTranscoding(
 
   let outroResults: RenditionResult[] | null = null;
   if (outroName) {
+    let resolvedOutroName: string | undefined;
     try {
-      const { data, inputName } = await loadFFmpegInput(opfsRoot, outroName);
+      resolvedOutroName = await resolveIntroOutroClip(
+        outroName, session.introOutro?.outroIsImage, session.introOutro?.outroDuration, sourceWidth, sourceHeight,
+      );
+      const { data, inputName } = await loadFFmpegInput(opfsRoot, resolvedOutroName);
       outroResults = await encodeRenditionsForSource(
         FFmpeg, coreURL, wasmURL, renditions, data, inputName, outputFolderHandle, sourceWidth, sourceHeight, 'outro_', '[outro] ', mainDimensions,
       );
@@ -856,6 +949,8 @@ async function runAbrTranscoding(
         return;
       }
       log(`Could not encode the outro (${err}) — continuing without it.`, 'ERROR');
+    } finally {
+      if (resolvedOutroName && resolvedOutroName !== outroName) await removeOutputFileQuietly(opfsRoot, resolvedOutroName);
     }
   }
   if (cancelled) {
@@ -1621,13 +1716,21 @@ async function runAbrTranscodingWebCodecs(
   // this — no special-casing needed for that combination here.
   const hasDubAudio = !!session.dubAudioTracks?.length;
 
+  const opfsRoot = await navigator.storage.getDirectory();
+
   let introResults: AbrSourceResult[] | null = null;
   if (introName) {
+    let resolvedIntroName: string | undefined;
     try {
-      introResults = await runAbrEncodeForSource(introName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'intro_', false);
+      resolvedIntroName = await resolveIntroOutroClip(
+        introName, session.introOutro?.introIsImage, session.introOutro?.introDuration, sourceWidth, sourceHeight,
+      );
+      introResults = await runAbrEncodeForSource(resolvedIntroName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'intro_', false);
     } catch (err) {
       if (cancelled) return;
       log(`Could not encode the intro (${err}) — continuing without it.`, 'ERROR');
+    } finally {
+      if (resolvedIntroName && resolvedIntroName !== introName) await removeOutputFileQuietly(opfsRoot, resolvedIntroName);
     }
   }
   if (cancelled) return;
@@ -1637,11 +1740,17 @@ async function runAbrTranscodingWebCodecs(
 
   let outroResults: AbrSourceResult[] | null = null;
   if (outroName) {
+    let resolvedOutroName: string | undefined;
     try {
-      outroResults = await runAbrEncodeForSource(outroName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'outro_', false);
+      resolvedOutroName = await resolveIntroOutroClip(
+        outroName, session.introOutro?.outroIsImage, session.introOutro?.outroDuration, sourceWidth, sourceHeight,
+      );
+      outroResults = await runAbrEncodeForSource(resolvedOutroName, outputFolderHandle, renditions, sourceWidth, sourceHeight, 'outro_', false);
     } catch (err) {
       if (cancelled) return;
       log(`Could not encode the outro (${err}) — continuing without it.`, 'ERROR');
+    } finally {
+      if (resolvedOutroName && resolvedOutroName !== outroName) await removeOutputFileQuietly(opfsRoot, resolvedOutroName);
     }
   }
   if (cancelled) return;
@@ -3204,22 +3313,34 @@ async function spliceIntroOutro(
   const io = session.introOutro;
   const mainWidth = session.sourceWidth;
   const mainHeight = session.sourceHeight;
+  const opfsRoot = await navigator.storage.getDirectory();
   const texts: string[] = [];
 
   if (io?.introFileName) {
     log('Adding intro…');
-    texts.push(
-      await prepareAuxiliaryClip('intro', io.introFileName, 'intro_', outputFolderHandle, io.introWidth, io.introHeight, mainWidth, mainHeight),
-    );
+    const resolvedName = await resolveIntroOutroClip(io.introFileName, io.introIsImage, io.introDuration, mainWidth, mainHeight);
+    try {
+      // A synthesized image clip is generated at exactly mainWidth x
+      // mainHeight, so it always reports as matching main — no separate
+      // letterbox encode needed for it downstream.
+      const [clipWidth, clipHeight] = io.introIsImage ? [mainWidth, mainHeight] : [io.introWidth, io.introHeight];
+      texts.push(await prepareAuxiliaryClip('intro', resolvedName, 'intro_', outputFolderHandle, clipWidth, clipHeight, mainWidth, mainHeight));
+    } finally {
+      if (resolvedName !== io.introFileName) await removeOutputFileQuietly(opfsRoot, resolvedName);
+    }
   }
 
   texts.push(mainPlaylistText);
 
   if (io?.outroFileName) {
     log('Adding outro…');
-    texts.push(
-      await prepareAuxiliaryClip('outro', io.outroFileName, 'outro_', outputFolderHandle, io.outroWidth, io.outroHeight, mainWidth, mainHeight),
-    );
+    const resolvedName = await resolveIntroOutroClip(io.outroFileName, io.outroIsImage, io.outroDuration, mainWidth, mainHeight);
+    try {
+      const [clipWidth, clipHeight] = io.outroIsImage ? [mainWidth, mainHeight] : [io.outroWidth, io.outroHeight];
+      texts.push(await prepareAuxiliaryClip('outro', resolvedName, 'outro_', outputFolderHandle, clipWidth, clipHeight, mainWidth, mainHeight));
+    } finally {
+      if (resolvedName !== io.outroFileName) await removeOutputFileQuietly(opfsRoot, resolvedName);
+    }
   }
 
   return spliceM3U8Texts(texts);

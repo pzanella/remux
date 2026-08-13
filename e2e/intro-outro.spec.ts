@@ -12,6 +12,8 @@ import {
   listZipEntries,
   readZipEntryText,
   getLogText,
+  selectRendition,
+  totalPlaylistDurationSec,
 } from './helpers';
 
 test('splices an intro and outro clip onto the main content', async ({ page }, testInfo) => {
@@ -184,6 +186,77 @@ test('a hardware-encoding fallback along the way does not falsely report the exp
   // playback nuance from the false-failure bug this test is actually about
   // (no player-error fired above, which is what that bug would have
   // caused). Real, but for another investigation.
+  const video = page.locator('.player-frame video');
+  await expect
+    .poll(async () => video.evaluate((v: { readyState: number }) => v.readyState), { timeout: 25_000 })
+    .toBeGreaterThanOrEqual(2);
+});
+
+test('supports a still image for intro and outro, held for a chosen duration and spliced into a real playable export', async ({
+  page,
+}, testInfo) => {
+  // The worker has no path that can splice a raw still image directly (its
+  // Rust remuxer requires a real moov box) — this covers the actual new
+  // Phase 3 behavior: synthesizing a short held video clip from the image
+  // first (see convertImageToClip in remux.worker.ts) via the fast
+  // (non-ABR) splice path.
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+  await attachIntro(page, 'intro-image.jpg');
+
+  // A still image shows its own "Hold for … s" control in place of a fixed,
+  // probed duration, defaulting to 3s.
+  const holdInputs = page.locator('.timeline-extra-card-hold input');
+  await expect(holdInputs.first()).toHaveValue('3');
+  await holdInputs.first().fill('1');
+
+  // The live preview shows the image as a still overlay, not a blank/broken
+  // <video> frame — same phase machinery Phase 2 wired up for a video intro.
+  await expect(page.locator('.preview-still')).toBeVisible();
+
+  await attachOutro(page, 'intro-image.jpg');
+  await expect(holdInputs).toHaveCount(2);
+  await holdInputs.last().fill('1');
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+
+  const zipPath = testInfo.outputPath('output.zip');
+  await downloadZip(page, zipPath);
+  const entries = listZipEntries(zipPath);
+  expect(entries.filter((e) => e.endsWith('.ts')).length).toBeGreaterThan(1);
+  const playlist = readZipEntryText(zipPath, 'index.m3u8');
+  expect(playlist).toContain('#EXT-X-ENDLIST');
+  // ~1s held intro + 2s main + ~1s held outro.
+  expect(totalPlaylistDurationSec(playlist)).toBeGreaterThan(3.5);
+
+  await page.click('.export-modal-close');
+  await expect(page.locator('.player-error')).toHaveCount(0);
+  const video = page.locator('.player-frame video');
+  await expect
+    .poll(async () => video.evaluate((v: { readyState: number }) => v.readyState), { timeout: 25_000 })
+    .toBeGreaterThanOrEqual(2);
+});
+
+test('produces a correct adaptive-bitrate export when the intro is a still image', async ({ page }, testInfo) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+  await attachIntro(page, 'intro-image.jpg');
+  await page.locator('.timeline-extra-card-hold input').fill('1');
+  await selectRendition(page, '240p');
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+
+  const zipPath = testInfo.outputPath('output.zip');
+  await downloadZip(page, zipPath);
+  const entries = listZipEntries(zipPath);
+  expect(entries).toContain('master.m3u8');
+  const master = readZipEntryText(zipPath, 'master.m3u8');
+  expect(master).toContain('240');
+
+  await page.click('.export-modal-close');
+  await expect(page.locator('.player-error')).toHaveCount(0);
   const video = page.locator('.player-frame video');
   await expect
     .poll(async () => video.evaluate((v: { readyState: number }) => v.readyState), { timeout: 25_000 })

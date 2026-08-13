@@ -42,6 +42,7 @@ function syntheticPeaks(id: string, count: number): number[] {
 interface IntroOutroClip {
   label: string;
   duration?: number;
+  isImage?: boolean;
 }
 
 interface IntroOutroSlotProps {
@@ -50,6 +51,7 @@ interface IntroOutroSlotProps {
   disabled: boolean;
   onSelect: (file: File) => void;
   onClear: () => void;
+  onSetHoldDuration: (seconds: number) => void;
 }
 
 /**
@@ -62,7 +64,7 @@ interface IntroOutroSlotProps {
  * alongside MediaExtrasPanel's own former intro/outro row, not a
  * replacement for the file-picking mechanics.
  */
-function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear }: IntroOutroSlotProps) {
+function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDuration }: IntroOutroSlotProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isOver, setIsOver] = useState(false);
   const label = kind === 'intro' ? 'Intro' : 'Outro';
@@ -74,7 +76,25 @@ function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear }: IntroOutroS
         <div className="timeline-extra-card-info">
           <span className="timeline-extra-card-tag">{label}</span>
           <span className="timeline-extra-card-label">{clip.label}</span>
-          {clip.duration !== undefined && <span className="timeline-extra-card-duration">{formatDuration(clip.duration)}</span>}
+          {clip.isImage ? (
+            <label className="timeline-extra-card-hold">
+              Hold for
+              <input
+                type="number"
+                min={0.1}
+                step={0.1}
+                value={clip.duration ?? 3}
+                onChange={(e) => {
+                  const seconds = parseFloat(e.target.value);
+                  if (!Number.isNaN(seconds)) onSetHoldDuration(seconds);
+                }}
+                onClick={(e) => e.stopPropagation()}
+              />
+              s
+            </label>
+          ) : (
+            clip.duration !== undefined && <span className="timeline-extra-card-duration">{formatDuration(clip.duration)}</span>
+          )}
         </div>
         <button type="button" className="timeline-extra-card-remove" onClick={onClear} title={`Remove ${label.toLowerCase()}`}>
           ✕
@@ -103,7 +123,11 @@ function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear }: IntroOutroS
         const file = e.dataTransfer.files?.[0];
         if (file) onSelect(file);
       }}
-      title={disabled ? 'Not available together with a trimmed/split timeline yet' : `Drop a video here, or click to add ${kind === 'intro' ? 'an intro' : 'an outro'}`}
+      title={
+        disabled
+          ? 'Not available together with a trimmed/split timeline yet'
+          : `Drop a video or image here, or click to add ${kind === 'intro' ? 'an intro' : 'an outro'}`
+      }
     >
       <span className="timeline-extra-slot-plus">+</span> {label}
       <input
@@ -151,8 +175,10 @@ interface TimelineProps {
   outroClip?: IntroOutroClip | null;
   onSelectIntroFile: (file: File) => void;
   onClearIntroFile: () => void;
+  onSetIntroImageDuration: (seconds: number) => void;
   onSelectOutroFile: (file: File) => void;
   onClearOutroFile: () => void;
+  onSetOutroImageDuration: (seconds: number) => void;
   /** Disables Split (and the empty intro/outro slots' own picker/drop) —
    * intro/outro splicing and a trimmed/split timeline aren't supported
    * together yet (see remux.worker.ts's own guard). `hasIntroOrOutro`
@@ -195,8 +221,10 @@ export default function Timeline({
   outroClip,
   onSelectIntroFile,
   onClearIntroFile,
+  onSetIntroImageDuration,
   onSelectOutroFile,
   onClearOutroFile,
+  onSetOutroImageDuration,
   hasIntroOrOutro,
   hasEditedSegments,
 }: TimelineProps) {
@@ -277,7 +305,14 @@ export default function Timeline({
       )}
 
       <div className="timeline-strip">
-        <IntroOutroSlot kind="intro" clip={introClip} disabled={hasEditedSegments} onSelect={onSelectIntroFile} onClear={onClearIntroFile} />
+        <IntroOutroSlot
+          kind="intro"
+          clip={introClip}
+          disabled={hasEditedSegments}
+          onSelect={onSelectIntroFile}
+          onClear={onClearIntroFile}
+          onSetHoldDuration={onSetIntroImageDuration}
+        />
 
         <div className="timeline-track" ref={trackRef} onPointerDown={handleTrackPointerDown}>
           {segments.map((seg, i) => {
@@ -393,7 +428,14 @@ export default function Timeline({
           )}
         </div>
 
-        <IntroOutroSlot kind="outro" clip={outroClip} disabled={hasEditedSegments} onSelect={onSelectOutroFile} onClear={onClearOutroFile} />
+        <IntroOutroSlot
+          kind="outro"
+          clip={outroClip}
+          disabled={hasEditedSegments}
+          onSelect={onSelectOutroFile}
+          onClear={onClearOutroFile}
+          onSetHoldDuration={onSetOutroImageDuration}
+        />
       </div>
     </div>
   );

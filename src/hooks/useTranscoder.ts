@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppStatus, LogEntry, TranscodingSession, WorkerCommand, WorkerEvent } from '../types';
+import { isImageFileName } from '../types';
 import { saveFileToOpfs, writeOpfsTextFile, readOpfsFile, usePersistence } from './usePersistence';
 import { createZipBlob } from '../lib/zip';
 import { isTrivialEdit } from '../lib/segments';
@@ -14,7 +15,56 @@ export interface ClipFile {
   width?: number;
   height?: number;
   duration?: number;
+  /** True when this clip is a still image rather than a video — `duration`
+   * is then the user-adjustable hold length (default `DEFAULT_IMAGE_HOLD_SEC`),
+   * not a probed value, and the worker synthesizes a held video clip from it
+   * before splicing (see `convertImageToClip` in remux.worker.ts). */
+  isImage?: boolean;
   file: File;
+}
+
+/** Default hold length for a still-image intro/outro, in seconds — long
+ * enough to read a short title card, adjustable afterward via
+ * `setIntroImageDuration`/`setOutroImageDuration`. */
+const DEFAULT_IMAGE_HOLD_SEC = 3;
+
+/** MIME prefix first (the reliable signal for a real `File` picked through
+ * an OS dialog or drag-and-drop), falling back to the extension-based check
+ * shared with the worker (a `File` built in a test/other synthetic context
+ * may have no `type` at all). */
+function isImageFile(file: File): boolean {
+  return file.type.startsWith('image/') || isImageFileName(file.name);
+}
+
+function probeImageMetadata(file: File): Promise<{ width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    const cleanup = () => URL.revokeObjectURL(url);
+    img.onload = () => {
+      resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      cleanup();
+    };
+    img.onerror = () => {
+      resolve(null);
+      cleanup();
+    };
+    img.src = url;
+  });
+}
+
+/** Probes an intro/outro candidate file, branching on whether it's a still
+ * image or a video — the single place `selectIntroFile`/`selectOutroFile`/
+ * `loadProject`'s intro/outro rehydration all go through, so the two ways a
+ * clip can enter the editor never drift out of sync on how they classify
+ * or measure it. */
+async function probeClipMetadata(file: File): Promise<{ width?: number; height?: number; duration?: number; isImage: boolean }> {
+  if (isImageFile(file)) {
+    const dims = await probeImageMetadata(file);
+    return { width: dims?.width, height: dims?.height, duration: DEFAULT_IMAGE_HOLD_SEC, isImage: true };
+  }
+  const dims = await probeVideoMetadata(file);
+  return { width: dims?.width, height: dims?.height, duration: dims?.duration, isImage: false };
 }
 
 /** Reads intrinsic video dimensions and duration client-side, without
@@ -257,13 +307,13 @@ export function useTranscoder() {
 
         if (bundle.introFile) {
           const clip = bundle.introFile;
-          const [introPath, introDims] = await Promise.all([saveFileToOpfs(clip), probeVideoMetadata(clip)]);
-          setIntroFileState({ fileName: introPath, label: clip.name, width: introDims?.width, height: introDims?.height, duration: introDims?.duration, file: clip });
+          const [introPath, meta] = await Promise.all([saveFileToOpfs(clip), probeClipMetadata(clip)]);
+          setIntroFileState({ fileName: introPath, label: clip.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file: clip });
         }
         if (bundle.outroFile) {
           const clip = bundle.outroFile;
-          const [outroPath, outroDims] = await Promise.all([saveFileToOpfs(clip), probeVideoMetadata(clip)]);
-          setOutroFileState({ fileName: outroPath, label: clip.name, width: outroDims?.width, height: outroDims?.height, duration: outroDims?.duration, file: clip });
+          const [outroPath, meta] = await Promise.all([saveFileToOpfs(clip), probeClipMetadata(clip)]);
+          setOutroFileState({ fileName: outroPath, label: clip.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file: clip });
         }
 
         const newSubtitleTracks: { fileName: string; label: string; language: string }[] = [];
@@ -363,8 +413,8 @@ export function useTranscoder() {
   const selectIntroFile = useCallback(
     async (file: File) => {
       try {
-        const [opfsPath, dims] = await Promise.all([saveFileToOpfs(file), probeVideoMetadata(file)]);
-        setIntroFileState({ fileName: opfsPath, label: file.name, width: dims?.width, height: dims?.height, duration: dims?.duration, file });
+        const [opfsPath, meta] = await Promise.all([saveFileToOpfs(file), probeClipMetadata(file)]);
+        setIntroFileState({ fileName: opfsPath, label: file.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file });
         addLog(`Intro: ${file.name}`, 'success');
       } catch (err) {
         addLog(`Could not save the intro file: ${err}`, 'error');
@@ -373,12 +423,18 @@ export function useTranscoder() {
     [addLog],
   );
   const clearIntroFile = useCallback(() => setIntroFileState(null), []);
+  // Adjusts a still-image intro's hold length after the fact — a no-op for
+  // a video intro (there's no UI path to reach this for one; ClipFile keeps
+  // a video's own real, non-adjustable probed duration untouched).
+  const setIntroImageDuration = useCallback((seconds: number) => {
+    setIntroFileState((prev) => (prev?.isImage ? { ...prev, duration: Math.max(0.1, seconds) } : prev));
+  }, []);
 
   const selectOutroFile = useCallback(
     async (file: File) => {
       try {
-        const [opfsPath, dims] = await Promise.all([saveFileToOpfs(file), probeVideoMetadata(file)]);
-        setOutroFileState({ fileName: opfsPath, label: file.name, width: dims?.width, height: dims?.height, duration: dims?.duration, file });
+        const [opfsPath, meta] = await Promise.all([saveFileToOpfs(file), probeClipMetadata(file)]);
+        setOutroFileState({ fileName: opfsPath, label: file.name, width: meta.width, height: meta.height, duration: meta.duration, isImage: meta.isImage, file });
         addLog(`Outro: ${file.name}`, 'success');
       } catch (err) {
         addLog(`Could not save the outro file: ${err}`, 'error');
@@ -387,6 +443,9 @@ export function useTranscoder() {
     [addLog],
   );
   const clearOutroFile = useCallback(() => setOutroFileState(null), []);
+  const setOutroImageDuration = useCallback((seconds: number) => {
+    setOutroFileState((prev) => (prev?.isImage ? { ...prev, duration: Math.max(0.1, seconds) } : prev));
+  }, []);
 
   const selectDubAudioTrack = useCallback(
     async (file: File) => {
@@ -496,9 +555,12 @@ export function useTranscoder() {
             introWidth: introFile?.width,
             introHeight: introFile?.height,
             introDuration: introFile?.duration,
+            introIsImage: introFile?.isImage,
             outroFileName: outroFile?.fileName,
             outroWidth: outroFile?.width,
             outroHeight: outroFile?.height,
+            outroDuration: outroFile?.duration,
+            outroIsImage: outroFile?.isImage,
           }
         : undefined;
 
@@ -760,8 +822,10 @@ export function useTranscoder() {
     saveSubtitleEdits,
     selectIntroFile,
     clearIntroFile,
+    setIntroImageDuration,
     selectOutroFile,
     clearOutroFile,
+    setOutroImageDuration,
     selectDubAudioTrack,
     removeDubAudioTrack,
     setDubAudioTrackLanguage,

@@ -1162,6 +1162,24 @@ body {
   font-size: 0.66rem;
   color: var(--text-tertiary);
 }
+.timeline-extra-card-hold {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--text-tertiary);
+}
+.timeline-extra-card-hold input {
+  width: 3rem;
+  padding: 0.1rem 0.3rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+}
 .timeline-extra-card-remove {
   position: absolute;
   top: 0.3rem;

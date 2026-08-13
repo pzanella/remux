@@ -71,11 +71,25 @@ export interface TranscodingSession {
     introHeight?: number;
     /** Seconds, probed client-side — used to shift subtitle cue timestamps
      * (authored relative to the main content) forward so they still land
-     * on the right moment once an intro is spliced in front of it. */
+     * on the right moment once an intro is spliced in front of it. For a
+     * still-image intro (`introIsImage`), this is instead the user-chosen
+     * hold length, and doubles as the worker's synthesis duration. */
     introDuration?: number;
+    /** True when the intro is a still image rather than a video — the
+     * worker synthesizes a short held clip from it first (see
+     * `convertImageToClip` in remux.worker.ts), scaled/padded to the main
+     * content's own dimensions, before splicing it in like any other
+     * same-size video intro. */
+    introIsImage?: boolean;
     outroFileName?: string;
     outroWidth?: number;
     outroHeight?: number;
+    /** Outro's own probed/held length — the asymmetric twin of
+     * `introDuration` above (previously never captured at all; see
+     * useTranscoder.ts's `start()`), needed to know a still-image outro's
+     * hold length the same way `introDuration` does for the intro. */
+    outroDuration?: number;
+    outroIsImage?: boolean;
   };
   /**
    * Optional dub-audio tracks (OPFS filenames of audio or video files, only
@@ -271,4 +285,16 @@ export const SUPPORTED_VIDEO_MIME_TYPES =
 export function isNativeContainer(filename: string): boolean {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
   return ['mp4', 'mov', 'm4v', '3gp', 'f4v'].includes(ext);
+}
+
+/** Extension-based check for a still image, shared between the client (an
+ * intro/outro file picker) and the worker (deciding whether to synthesize a
+ * held clip from an OPFS filename before splicing — see
+ * `convertImageToClip` in remux.worker.ts). Client code additionally checks
+ * the `File`'s own MIME type first (see useTranscoder.ts's `isImageFile`);
+ * an OPFS filename has no MIME type to fall back to, so the worker relies on
+ * this extension check alone, the same way `isNativeContainer` above does. */
+export function isImageFileName(filename: string): boolean {
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  return ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].includes(ext);
 }
