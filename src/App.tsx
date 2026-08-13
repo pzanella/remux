@@ -240,6 +240,9 @@ export default function App() {
               onToggleAbrHeight={t.toggleAbrHeight}
               introClip={introPreviewClip}
               outroClip={outroPreviewClip}
+              subtitleTracks={t.subtitleTracks}
+              subtitleVttTextByFile={t.subtitleVttTextByFile}
+              chapters={chapters.chapters}
             />
             <Timeline
               segments={editor.segments}

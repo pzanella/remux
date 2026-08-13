@@ -15,6 +15,12 @@ export interface PreviewClip {
   isImage?: boolean;
 }
 
+interface PreviewSubtitleTrack {
+  fileName: string;
+  label: string;
+  language: string;
+}
+
 interface PreviewPaneProps {
   sourceFile: File | null;
   segments: EditorSegment[];
@@ -26,6 +32,27 @@ interface PreviewPaneProps {
   onToggleAbrHeight: (height: number) => void;
   introClip?: PreviewClip | null;
   outroClip?: PreviewClip | null;
+  /** Live subtitle preview during editing — real `<track kind="subtitles">`
+   * elements, browser-native cue rendering, no hand-rolled overlay. Cue
+   * text is used as-is from `subtitleVttTextByFile` (source-file-relative
+   * timestamps), *not* remapped through `segments` into the flattened
+   * output timeline: during the main phase this `<video>` plays straight
+   * from `sourceFile` and its own `currentTime` already tracks real source
+   * time (see `switchToMain`/`handleTimeUpdate`, which seek/jump it in
+   * source-file coordinates per segment) — so source-relative cues line up
+   * with the element's own timeline exactly as authored, and a cue whose
+   * source range was cut out is simply never reached as `currentTime` jumps
+   * across segment boundaries, with no remapping step required. Only
+   * meaningful during `phase === 'main'` — intro/outro have no cues. */
+  subtitleTracks?: PreviewSubtitleTrack[];
+  subtitleVttTextByFile?: Record<string, string>;
+  /** Live chapter label during editing — no `<track kind="chapters">`
+   * element, since that kind has no default rendering in any browser engine
+   * to hook into. `time` is already in the flattened/output timeline's own
+   * coordinates (see `lib/chapters.ts`), the same coordinate space as
+   * `playheadTime`, so — unlike subtitle cues above — no remapping is
+   * needed here either, just a plain last-chapter-at-or-before lookup. */
+  chapters?: { time: number; title: string }[];
 }
 
 function formatTimecode(seconds: number): string {
@@ -68,6 +95,9 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
     onToggleAbrHeight,
     introClip,
     outroClip,
+    subtitleTracks = [],
+    subtitleVttTextByFile = {},
+    chapters = [],
   },
   ref,
 ) {
@@ -134,6 +164,54 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
       outroUrlRef.current = null;
     };
   }, [outroClip]);
+
+  // Blob URLs for the live `<track>` elements below — rebuilt whenever the
+  // track list or any track's own VTT text changes (e.g. a cue edit saved
+  // in CaptionLane), same one-URL-per-effect-run pattern as intro/outro's
+  // own `introUrlRef`/`outroUrlRef` above.
+  const [subtitleUrls, setSubtitleUrls] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const urls: Record<string, string> = {};
+    for (const track of subtitleTracks) {
+      const vtt = subtitleVttTextByFile[track.fileName];
+      if (vtt) urls[track.fileName] = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
+    }
+    setSubtitleUrls(urls);
+    return () => {
+      Object.values(urls).forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [subtitleTracks, subtitleVttTextByFile]);
+
+  // A freshly (re)loaded cue list doesn't retroactively apply to a video
+  // that's sitting still — browsers only recompute which cue is active on
+  // playback progress or a real seek (their own "time marches on" step), so
+  // a track attached while paused would otherwise render nothing until the
+  // next scrub or play. Polls (bounded) for the new track's cues to finish
+  // their own async load, then forces a same-value `currentTime`
+  // reassignment — still a real seek even though the value is unchanged,
+  // which does force that recomputation (confirmed empirically, not just
+  // per spec).
+  useEffect(() => {
+    if (Object.keys(subtitleUrls).length === 0) return;
+    const video = videoRef.current;
+    if (!video) return;
+    let cancelled = false;
+    let attempts = 0;
+    const tryNudge = () => {
+      if (cancelled) return;
+      const loaded = Array.from(video.textTracks).some((t) => (t.cues?.length ?? 0) > 0);
+      if (loaded) {
+        // eslint-disable-next-line no-self-assign -- deliberate: this still runs a real seek (see comment above), not a no-op.
+        video.currentTime = video.currentTime;
+        return;
+      }
+      if (attempts++ < 30) requestAnimationFrame(tryNudge);
+    };
+    requestAnimationFrame(tryNudge);
+    return () => {
+      cancelled = true;
+    };
+  }, [subtitleUrls]);
 
   function stopImageClock() {
     if (rafRef.current !== null) {
@@ -366,6 +444,11 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
   const scrubPercent = totalDuration > 0 ? Math.min(100, (globalPreviewTime / totalDuration) * 100) : 0;
   const activeImageUrl = phase === 'intro' ? introUrlRef.current : phase === 'outro' ? outroUrlRef.current : null;
 
+  // The last chapter marker at or before the playhead — empty string (no
+  // label rendered) outside the main phase or before the first marker.
+  const currentChapterTitle =
+    phase === 'main' ? [...chapters].reverse().find((c) => c.time <= playheadTime)?.title ?? '' : '';
+
   return (
     <div className="preview-pane">
       <div className="preview-frame">
@@ -377,7 +460,14 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
           onPause={() => setIsPlaying(false)}
           onTimeUpdate={handleTimeUpdate}
           onEnded={handleEnded}
-        />
+        >
+          {phase === 'main' &&
+            subtitleTracks.map((track, i) => {
+              const url = subtitleUrls[track.fileName];
+              if (!url) return null;
+              return <track key={track.fileName} kind="subtitles" src={url} srcLang={track.language} label={track.label} default={i === 0} />;
+            })}
+        </video>
         {activeImageClip && activeImageUrl && <img className="preview-still" src={activeImageUrl} alt="" />}
       </div>
 
@@ -395,6 +485,8 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
         <span className="timecode">
           {formatTimecode(globalPreviewTime)} <span className="timecode-sep">/</span> {formatTimecode(totalDuration)}
         </span>
+
+        {currentChapterTitle && <span className="preview-chapter-label">{currentChapterTitle}</span>}
 
         <div
           ref={scrubRef}

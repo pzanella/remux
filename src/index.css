@@ -711,6 +711,18 @@ body {
   color: var(--text-tertiary);
 }
 
+.preview-chapter-label {
+  flex-shrink: 0;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  border-left: 1px solid var(--line);
+  padding-left: 0.6rem;
+}
+
 .scrub-bar {
   position: relative;
   flex: 1;
