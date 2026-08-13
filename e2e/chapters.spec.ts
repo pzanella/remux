@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { uploadSource, addChapter, runExport, downloadZip, listZipEntries, readZipEntryText } from './helpers';
+import { uploadSource, addChapter, attachIntro, splitTimelineAt, runExport, downloadZip, listZipEntries, readZipEntryText } from './helpers';
 
 test('a dropped chapter warns via a hover/click popup, not just an inert badge', async ({ page }) => {
   // The bug this covers: the old warning was a bare span with a native
@@ -69,6 +69,68 @@ test('marks a chapter while editing and emits a chapters.vtt with the real title
   // sample.mp4 is 2s; the one chapter was placed at the playhead's default
   // 0, so its cue spans the whole clip.
   expect(vtt).toContain('00:00:00.000 --> 00:00:02.000');
+});
+
+test('a chapter after an attached intro is offset to the real spliced output position', async ({ page }, testInfo) => {
+  // The bug this covers: chapters are authored purely against the main
+  // content's own timeline (time 0 = main content's own start), but an
+  // attached intro splices *before* main content in the real output —
+  // "Chapter 1" landed at 00:00:00.000 (the very start of the intro)
+  // instead of where main content actually begins. Subtitles already
+  // shifted correctly (resolveSubtitleTracks' own introDuration handling);
+  // chapters didn't. Split is part of the repro this bug was reported
+  // against, even though the root cause is independent of it.
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4'); // 2s
+  await splitTimelineAt(page, 0.5); // leaves the playhead at 1s, not 0
+  await attachIntro(page, 'intro.mp4'); // 1s
+
+  // Back to (near) main-content time 0 before placing the chapter —
+  // splitting above left the playhead mid-clip. x:10 rather than right at
+  // the very edge — the first (still-selected after the split) segment's
+  // own start trim-handle overlaps a few px past the clip's own edge and
+  // would otherwise eat the click instead of scrubbing. Waits for the
+  // scrub to actually land (the click resolving is not proof the
+  // resulting playheadTime state update has been committed yet) before
+  // reading it via "+ Chapter here" — via the chapter ruler's own
+  // playhead, which (unlike the main track's, now gated on the live
+  // preview's active phase) always reflects playheadTime regardless of
+  // intro/outro.
+  const track = page.locator('.timeline-track');
+  const box = await track.boundingBox();
+  if (!box) throw new Error('.timeline-track not found');
+  await track.click({ position: { x: 10, y: box.height / 2 } });
+  // Passed as a string, not a typed function — it references browser-only
+  // globals (document, getComputedStyle) that e2e/tsconfig.json's DOM-less
+  // lib doesn't know about, even though they're real and correct once this
+  // actually runs in the browser (same gap documented on other DOM-typed
+  // e2e helpers in helpers.ts).
+  await page.waitForFunction(`(() => {
+    const el = document.querySelector('.chapter-ruler-playhead');
+    return !!el && parseFloat(getComputedStyle(el).left) < 30;
+  })()`);
+  await addChapter(page, 'Cold Open'); // main-content time ~0
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+
+  const zipPath = testInfo.outputPath('output.zip');
+  await downloadZip(page, zipPath);
+  const vtt = readZipEntryText(zipPath, 'chapters.vtt');
+  expect(vtt).toContain('Cold Open');
+  // x:10 above lands very close to, but not exactly at, main-content time 0
+  // — so the cue's own start just needs to be *around* the 1s intro offset
+  // (not exactly 00:00:01.000), while its end is fixed at introDuration +
+  // mainDuration (1s + 2s) regardless of exactly where the chapter itself
+  // landed.
+  const match = vtt.match(/(\d\d):(\d\d):(\d\d)\.(\d\d\d) --> (\d\d):(\d\d):(\d\d)\.(\d\d\d)\nCold Open/);
+  if (!match) throw new Error(`no cue found for "Cold Open" in:\n${vtt}`);
+  const [, sh, sm, ss, sms, eh, em, es, ems] = match;
+  const startSec = Number(sh) * 3600 + Number(sm) * 60 + Number(ss) + Number(sms) / 1000;
+  const endSec = Number(eh) * 3600 + Number(em) * 60 + Number(es) + Number(ems) / 1000;
+  expect(startSec).toBeGreaterThanOrEqual(1); // never below the 1s intro offset
+  expect(startSec).toBeLessThan(1.1); // and close to it — this is the bug's own regression bar
+  expect(endSec).toBeCloseTo(3, 1); // introDuration(1) + mainDuration(2)
 });
 
 test('shows the real chapter title in Shaka Player\'s native Chapters menu', async ({ page }) => {

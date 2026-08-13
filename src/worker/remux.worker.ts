@@ -658,15 +658,25 @@ async function generateThumbnailSprite(srcBytes: Uint8Array, originalFileName: s
 // Unlike the thumbnail sprite above, this is pure text generation — no
 // FFmpeg, no reading the source's own bytes — so it's cheap enough to just
 // await directly rather than needing the same fire-and-forget treatment.
-// `session.chapters`' own `time` values are already in the flattened/output
-// timeline's coordinates (see lib/chapters.ts), so the total duration this
-// needs is the *output* duration (`session.segments`, flattened), not the
-// raw source duration.
+// `session.chapters`' own `time` values are already in the flattened *main
+// content's* own timeline coordinates (see lib/chapters.ts) — chapters
+// never refer to an attached intro/outro — so the bounds-checking total
+// duration this needs is the main content's own output duration
+// (`session.segments`, flattened), not the raw source duration or the
+// whole spliced output's length. An attached intro's own duration is
+// applied separately, as a plain forward shift of the surviving cues (see
+// buildChaptersVtt's own `offsetSec`) — the same two-step shape
+// `resolveSubtitleTracks` below already uses for subtitle cues.
 async function writeChaptersVtt(session: import('../types').TranscodingSession, outputFolderHandle: FileSystemDirectoryHandle): Promise<void> {
   if (!session.chapters?.length) return;
   const totalDurationSec = session.segments?.length ? flattenedDuration(session.segments) : (session.sourceDuration ?? 0);
   if (!(totalDurationSec > 0)) return;
-  const vtt = buildChaptersVtt(session.chapters.map((c, i) => ({ id: `chapter-${i}`, time: c.time, title: c.title })), totalDurationSec);
+  const introDuration = session.introOutro?.introDuration ?? 0;
+  const vtt = buildChaptersVtt(
+    session.chapters.map((c, i) => ({ id: `chapter-${i}`, time: c.time, title: c.title })),
+    totalDurationSec,
+    introDuration,
+  );
   await writeOutputFile(outputFolderHandle, 'chapters.vtt', vtt);
 }
 
