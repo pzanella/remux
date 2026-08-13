@@ -60,7 +60,7 @@ test('round-trips segments, chapters, a subtitle track, an ABR rendition, and lo
   await loadProjectFile(page, projectPath);
 
   // The editor comes back showing the exact same edit.
-  await expect(page.locator('.segment-card')).toHaveCount(2);
+  await expect(page.locator('.timeline-clip')).toHaveCount(2);
   await expect(page.locator('.chapter-marker')).toHaveCount(1);
   await expect(page.locator('.chapter-marker')).toHaveAttribute('title', /Cold Open/);
   await expect(page.locator('.caption-track-header .extras-item-name')).toHaveText('subtitle');
@@ -97,10 +97,9 @@ test('round-trips intro and outro clips through a saved project', async ({ page 
 
   await startOver(page);
   await loadProjectFile(page, projectPath);
-  await expandExtrasStrip(page);
 
-  await expect(page.locator('.extras-item-name', { hasText: 'Intro: intro.mp4' })).toBeVisible();
-  await expect(page.locator('.extras-item-name', { hasText: 'Outro: outro.mp4' })).toBeVisible();
+  await expect(page.locator('.timeline-extra-card--intro')).toContainText('intro.mp4');
+  await expect(page.locator('.timeline-extra-card--outro')).toContainText('outro.mp4');
 
   const result = await runExport(page);
   expect(result).toBe('done');

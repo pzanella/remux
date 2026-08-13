@@ -454,6 +454,14 @@ body {
   border-radius: var(--radius-md);
   aspect-ratio: 16 / 9;
   width: 100%;
+  /* Now that the preview/player sits alone in a full-width column (no more
+     360px timeline sidebar capping how wide this ever got), an unbounded
+     width at 16:9 grows tall enough on a normal-height viewport to push the
+     seek bar/controls below the fold — confirmed against a real Shaka seek
+     bar landing well past a 720px-tall viewport. Capped and centered
+     instead of left to grow with the page. */
+  max-width: 55rem;
+  margin: 0 auto;
   overflow: hidden;
   display: flex;
   align-items: center;
@@ -614,22 +622,9 @@ body {
   color: var(--text-tertiary);
 }
 
-/* ── Editor layout: preview + controls on the left, vertical rail on the
-   right — a single column below ~900px, rail becoming the primary
-   scrollable column beneath the player. ── */
+/* ── Editor layout: a single column stack — preview on top, then the
+   horizontal Timeline and the rest of the editing lanes directly under it. ── */
 .editor-layout {
-  display: grid;
-  grid-template-columns: 1fr 360px;
-  gap: 1rem;
-  align-items: stretch;
-}
-@media (max-width: 900px) {
-  .editor-layout {
-    grid-template-columns: 1fr;
-  }
-}
-
-.editor-main {
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -649,6 +644,11 @@ body {
   border-radius: var(--radius-md);
   aspect-ratio: 16 / 9;
   width: 100%;
+  /* Same reasoning as .player-frame's own cap — the editing preview is now
+     a full-width column too (no more 360px timeline sidebar), so it needs
+     the same ceiling to stay a sane height on a normal viewport. */
+  max-width: 55rem;
+  margin: 0 auto;
   overflow: hidden;
 }
 .preview-frame video {
@@ -973,10 +973,6 @@ body {
   border-top: 1px solid var(--line);
   padding-top: 0.7rem;
 }
-.extras-warning {
-  font-size: 0.72rem;
-  color: var(--danger);
-}
 .extras-row {
   display: flex;
   align-items: center;
@@ -1062,59 +1058,67 @@ body {
 }
 
 /* ── Vertical timeline rail ── */
-.timeline-rail-panel {
+.timeline-panel {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  max-height: calc(100vh - 8rem);
-}
-@media (max-width: 900px) {
-  .timeline-rail-panel {
-    max-height: none;
-  }
 }
 
-.rail-toolbar {
+.timeline-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  flex-shrink: 0;
 }
-.rail-toolbar-actions {
+.timeline-toolbar-actions {
   display: flex;
   gap: 0.7rem;
 }
+.timeline-warning {
+  font-size: 0.72rem;
+  color: var(--danger);
+}
 
-.rail-extra-card {
+.timeline-strip {
   display: flex;
   align-items: stretch;
   gap: 0.6rem;
+}
+
+/* Intro/outro flanking slots — fixed width so the layout doesn't jump when
+   toggling between the attached and empty states. */
+.timeline-extra-card,
+.timeline-extra-slot {
   flex-shrink: 0;
+  width: 9rem;
+}
+
+.timeline-extra-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
   padding: 0.4rem;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
   background: var(--bg-sunken);
 }
-.rail-extra-card-thumb {
-  flex-shrink: 0;
-  width: 2.6rem;
+.timeline-extra-card-thumb {
+  height: 2.6rem;
   border-radius: var(--radius-sm);
-  background: linear-gradient(160deg, color-mix(in srgb, var(--teal) 55%, var(--bg-sunken)) 0%, color-mix(in srgb, var(--teal) 14%, var(--bg-sunken)) 100%);
+  background: linear-gradient(200deg, color-mix(in srgb, var(--teal) 55%, var(--bg-sunken)) 0%, color-mix(in srgb, var(--teal) 14%, var(--bg-sunken)) 100%);
 }
-.rail-extra-card--outro .rail-extra-card-thumb {
-  background: linear-gradient(160deg, color-mix(in srgb, var(--accent) 55%, var(--bg-sunken)) 0%, color-mix(in srgb, var(--accent) 14%, var(--bg-sunken)) 100%);
+.timeline-extra-card--outro .timeline-extra-card-thumb {
+  background: linear-gradient(200deg, color-mix(in srgb, var(--accent) 55%, var(--bg-sunken)) 0%, color-mix(in srgb, var(--accent) 14%, var(--bg-sunken)) 100%);
 }
-.rail-extra-card-info {
-  flex: 1;
+.timeline-extra-card-info {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  justify-content: center;
   gap: 0.15rem;
+  padding-right: 1.3rem;
 }
-.rail-extra-card-tag {
+.timeline-extra-card-tag {
   align-self: flex-start;
-  flex-shrink: 0;
   font-family: var(--font-mono);
   font-size: 0.62rem;
   font-weight: 600;
@@ -1125,46 +1129,46 @@ body {
   border-radius: var(--radius-pill);
   padding: 0.1rem 0.5rem;
 }
-.rail-extra-card-label {
+.timeline-extra-card-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.8rem;
+  font-size: 0.78rem;
   color: var(--text-muted);
 }
-.rail-extra-card-duration {
+.timeline-extra-card-duration {
   font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   color: var(--text-tertiary);
 }
-.rail-extra-card-remove {
-  flex-shrink: 0;
-  align-self: center;
+.timeline-extra-card-remove {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.3rem;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.3rem;
-  height: 1.3rem;
+  width: 1.2rem;
+  height: 1.2rem;
   border: none;
   border-radius: 50%;
   background: transparent;
   color: var(--text-muted);
-  font-size: 0.7rem;
+  font-size: 0.65rem;
 }
-.rail-extra-card-remove:hover {
+.timeline-extra-card-remove:hover {
   background: var(--danger);
   color: var(--accent-text);
 }
 
-.rail-extra-slot {
-  flex-shrink: 0;
+.timeline-extra-slot {
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.4rem;
+  gap: 0.35rem;
   padding: 0.55rem;
   border: 1.5px dashed var(--line-strong);
   border-radius: var(--radius-md);
@@ -1173,131 +1177,107 @@ body {
   font-size: 0.78rem;
   transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
-.rail-extra-slot:hover:not(:disabled),
-.rail-extra-slot.is-drag-over {
+.timeline-extra-slot:hover:not(:disabled),
+.timeline-extra-slot.is-drag-over {
   border-color: var(--accent);
   border-style: solid;
   color: var(--text);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
-.rail-extra-slot:disabled {
+.timeline-extra-slot:disabled {
   cursor: not-allowed;
   opacity: 0.5;
 }
-.rail-extra-slot-plus {
+.timeline-extra-slot-plus {
   font-weight: 700;
   color: var(--accent);
 }
 
-.timeline-rail {
+.timeline-track {
   position: relative;
   flex: 1;
-  min-height: 0;
-  overflow-y: auto;
+  min-width: 0;
+  height: 5.5rem;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--bg-panel);
-  padding: 0.6rem 0.6rem 0.6rem 1.1rem;
   cursor: pointer;
 }
-@media (max-width: 900px) {
-  .timeline-rail {
-    overflow-y: visible;
-  }
-}
 
-.rail-spine {
+.timeline-clip {
   position: absolute;
-  left: 0.5rem;
-  top: 0.6rem;
-  bottom: 0.6rem;
-  width: 3px;
-}
-.rail-spine-segment {
-  position: absolute;
-  left: 0;
-  width: 100%;
-  border-radius: 2px;
-}
-
-.rail-cards {
+  top: 0;
+  bottom: 0;
+  min-width: 40px;
+  margin: 0 1px;
+  cursor: pointer;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  position: relative;
-}
-
-.segment-card {
-  position: relative;
-  cursor: pointer;
-  display: flex;
-  align-items: stretch;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
   background: var(--bg-sunken);
-  min-height: 56px;
+  overflow: hidden;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-.segment-card:hover {
+.timeline-clip:hover {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--line-strong));
 }
-.segment-card.is-selected {
+.timeline-clip.is-selected {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent), 0 0 16px -4px color-mix(in srgb, var(--accent) 70%, transparent);
+  z-index: 2;
 }
-.segment-card.is-drag-over {
+.timeline-clip.is-drag-over {
   border-color: var(--teal);
   box-shadow: 0 0 0 1px var(--teal);
 }
 
-.segment-card-thumb {
+.timeline-clip-thumb {
   position: absolute;
   inset: 0;
   display: flex;
-  align-items: stretch;
-  justify-content: flex-end;
+  align-items: flex-start;
+  justify-content: center;
   padding: 0.4rem;
   overflow: hidden;
   border-radius: inherit;
 }
-
-.segment-waveform {
+.timeline-clip-waveform {
   display: flex;
-  flex-direction: column;
-  justify-content: space-evenly;
   align-items: flex-end;
+  justify-content: space-evenly;
   gap: 1px;
-  width: 40%;
-  min-width: 2.2rem;
+  width: 100%;
+  height: 55%;
 }
-.segment-waveform-bar {
-  height: 2px;
+.timeline-clip-waveform-bar {
+  width: 2px;
   border-radius: 1px;
   opacity: 0.55;
 }
 
-.segment-card-info {
+.timeline-clip-info {
   position: relative;
   z-index: 1;
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.6rem;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
   margin-top: auto;
   width: 100%;
-  background: linear-gradient(to top, color-mix(in srgb, black 70%, transparent) 30%, transparent);
+  background: linear-gradient(to top, color-mix(in srgb, black 70%, transparent) 40%, transparent);
 }
 .drag-handle {
   flex-shrink: 0;
   cursor: grab;
   color: color-mix(in srgb, white 65%, transparent);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   line-height: 1;
 }
-.segment-card-name {
+.timeline-clip-name {
   flex: 1;
   min-width: 0;
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   font-weight: 600;
   color: #f2f2f4;
   overflow: hidden;
@@ -1305,74 +1285,74 @@ body {
   white-space: nowrap;
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
 }
-.segment-card-duration {
+.timeline-clip-duration {
   flex-shrink: 0;
   font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.64rem;
   color: color-mix(in srgb, white 75%, transparent);
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
 }
-.segment-card-delete {
+.timeline-clip-delete {
   flex-shrink: 0;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.3rem;
-  height: 1.3rem;
+  width: 1.2rem;
+  height: 1.2rem;
   border: none;
   border-radius: 50%;
   background: color-mix(in srgb, black 45%, transparent);
   color: #f2f2f4;
-  font-size: 0.7rem;
+  font-size: 0.65rem;
   line-height: 1;
   transition: background 0.15s, color 0.15s, transform 0.15s;
 }
-.segment-card-delete:hover:not(:disabled) {
+.timeline-clip-delete:hover:not(:disabled) {
   background: var(--danger);
   transform: scale(1.08);
 }
-.segment-card-delete:disabled {
+.timeline-clip-delete:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
 
 .trim-handle {
   position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 2.4rem;
-  height: 0.55rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0.55rem;
+  height: 2.4rem;
   border-radius: var(--radius-pill);
   background: var(--accent);
   border: 1px solid color-mix(in srgb, black 30%, var(--accent));
-  cursor: ns-resize;
-  z-index: 2;
+  cursor: ew-resize;
+  z-index: 3;
   touch-action: none;
 }
 .trim-handle--start {
-  top: -0.3rem;
+  left: -0.3rem;
 }
 .trim-handle--end {
-  bottom: -0.3rem;
+  right: -0.3rem;
 }
 
 .split-button {
   position: absolute;
-  left: 0.7rem;
-  z-index: 3;
-  transform: translateY(-50%);
+  top: 0.4rem;
+  z-index: 4;
+  transform: translateX(-50%);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 0.3rem;
-  padding: 0.25rem 0.55rem;
+  gap: 0.2rem;
+  padding: 0.2rem 0.45rem;
   border: 1px solid var(--accent);
   border-radius: var(--radius-pill);
   background: var(--bg-panel);
   color: var(--accent);
   font-family: var(--font-mono);
-  font-size: 0.66rem;
+  font-size: 0.6rem;
   font-weight: 600;
   white-space: nowrap;
   box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.6);
@@ -1388,27 +1368,28 @@ body {
   color: var(--text-tertiary);
 }
 
-.rail-playhead {
+.timeline-playhead {
   position: absolute;
-  left: 0;
-  right: 0.6rem;
-  height: 2px;
+  top: -0.4rem;
+  bottom: 0;
+  width: 2px;
   background: var(--accent);
   box-shadow: 0 0 8px 1px color-mix(in srgb, var(--accent) 80%, transparent);
   pointer-events: none;
-  z-index: 4;
+  z-index: 5;
 }
-.rail-playhead-badge {
+.timeline-playhead-badge {
   position: absolute;
-  right: 0;
-  top: -0.55rem;
+  top: 0;
+  left: 0.35rem;
   font-family: var(--font-mono);
-  font-size: 0.62rem;
+  font-size: 0.6rem;
   font-weight: 600;
   color: var(--accent-text);
   background: var(--accent);
   border-radius: var(--radius-sm);
-  padding: 0.1rem 0.35rem;
+  padding: 0.05rem 0.3rem;
+  white-space: nowrap;
 }
 
 /* ── Export modal ── */

@@ -1,19 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   type EditorSegment,
-  CARD_GAP_PX,
-  MIN_CARD_HEIGHT_PX,
   MIN_SEGMENT_DURATION_SEC,
-  PX_PER_SECOND,
-  computeCardLayout,
   createInitialSegments,
   deleteSegment,
   flattenedDuration,
   globalTimeForLocation,
-  globalTimeToPixel,
   isTrivialEdit,
   locateGlobalTime,
-  pixelToGlobalTime,
   remapSourceRangeToGlobal,
   reorderSegments,
   segmentDuration,
@@ -217,47 +211,6 @@ describe('trimSegmentEnd', () => {
     const segments = [seg('a', 0, 10)];
     const result = trimSegmentEnd(segments, 'a', 0.05, 20);
     expect(result[0].sourceEnd).toBe(0 + MIN_SEGMENT_DURATION_SEC);
-  });
-});
-
-describe('computeCardLayout', () => {
-  it('sizes a card proportional to duration above the height floor', () => {
-    const durationSec = (MIN_CARD_HEIGHT_PX + 20) / PX_PER_SECOND;
-    const layout = computeCardLayout([seg('a', 0, durationSec)]);
-    expect(layout[0].height).toBeCloseTo(MIN_CARD_HEIGHT_PX + 20, 5);
-  });
-
-  it('floors a short segments card height', () => {
-    const layout = computeCardLayout([seg('a', 0, 0.5)]);
-    expect(layout[0].height).toBe(MIN_CARD_HEIGHT_PX);
-  });
-
-  it('stacks cards top to bottom with the gap folded into the offsets', () => {
-    const segments = [seg('a', 0, 0.5), seg('b', 0, 0.5)];
-    const layout = computeCardLayout(segments);
-    expect(layout[0].top).toBe(0);
-    expect(layout[1].top).toBe(MIN_CARD_HEIGHT_PX + CARD_GAP_PX);
-  });
-});
-
-describe('globalTimeToPixel / pixelToGlobalTime round-trip', () => {
-  const segments = [seg('a', 0, 20), seg('b', 20, 40)];
-  const layout = computeCardLayout(segments);
-
-  it('maps the start and end of the timeline to the layouts bounds', () => {
-    expect(globalTimeToPixel(segments, layout, 0)).toBe(layout[0].top);
-    const totalHeight = layout[1].top + layout[1].height;
-    expect(globalTimeToPixel(segments, layout, 40)).toBeCloseTo(totalHeight, 5);
-  });
-
-  it('round-trips a mid-timeline time through pixel and back', () => {
-    const px = globalTimeToPixel(segments, layout, 25);
-    const time = pixelToGlobalTime(segments, layout, px);
-    expect(time).toBeCloseTo(25, 5);
-  });
-
-  it('pixelToGlobalTime returns 0 for an empty timeline', () => {
-    expect(pixelToGlobalTime([], [], 100)).toBe(0);
   });
 });
 

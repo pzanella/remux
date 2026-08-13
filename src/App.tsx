@@ -3,7 +3,7 @@ import TopBar from './components/TopBar';
 import EmptyState from './components/EmptyState';
 import BatchQueue from './components/BatchQueue';
 import PreviewPane, { type PreviewPaneHandle } from './components/PreviewPane';
-import VerticalTimeline from './components/VerticalTimeline';
+import Timeline from './components/Timeline';
 import CaptionLane from './components/CaptionLane';
 import ChapterRuler from './components/ChapterRuler';
 import MediaExtrasPanel from './components/MediaExtrasPanel';
@@ -25,10 +25,10 @@ export default function App() {
 
   // Intro/outro splicing and a trimmed/split timeline aren't supported
   // together yet (see remux.worker.ts's own guard in runTranscoding) —
-  // computed once here and threaded to both MediaExtrasPanel (disables
-  // attaching intro/outro once segments are edited) and VerticalTimeline
-  // (disables Split once intro/outro is attached), so whichever comes first
-  // blocks the other instead of only failing at export time.
+  // computed once here and passed to Timeline, which uses it in both
+  // directions: disables its own intro/outro slots once segments are
+  // edited, and disables Split once intro/outro is attached — whichever
+  // comes first blocks the other, instead of only failing at export time.
   const hasEditedSegments = t.sourceDuration !== undefined && !isTrivialEdit(editor.segments, t.sourceDuration);
   const hasIntroOrOutro = !!(t.introFile || t.outroFile);
 
@@ -199,99 +199,84 @@ export default function App() {
         <ResumeBanner session={t.resumableSession} canResume={t.canResume} onResume={t.resume} onDismiss={t.dismissResume} />
       )}
 
-      {editingPhase && (
-        <MediaExtrasPanel
-          introFile={t.introFile}
-          outroFile={t.outroFile}
-          onSelectIntroFile={t.selectIntroFile}
-          onClearIntroFile={t.clearIntroFile}
-          onSelectOutroFile={t.selectOutroFile}
-          onClearOutroFile={t.clearOutroFile}
-          dubAudioTracks={t.dubAudioTracks}
-          onSelectDubAudioTrack={t.selectDubAudioTrack}
-          onRemoveDubAudioTrack={t.removeDubAudioTrack}
-          onSetDubAudioTrackLanguage={t.setDubAudioTrackLanguage}
-          hasEditedSegments={hasEditedSegments}
-        />
-      )}
-
-      <div className={`editor-layout${editingPhase ? '' : ' editor-layout--single'}`}>
-        <div className="editor-main">
-          {editingPhase ? (
-            <>
-              <PreviewPane
-                ref={previewRef}
-                sourceFile={t.sourceFile}
-                segments={editor.segments}
-                playheadTime={editor.playheadTime}
-                onPlayheadChange={editor.setPlayheadTime}
-                disabled={!editingPhase}
-                abrHeights={t.abrHeights}
-                sourceResolution={t.sourceResolution}
-                onToggleAbrHeight={t.toggleAbrHeight}
-              />
-              <CaptionLane
-                segments={editor.segments}
-                playheadTime={editor.playheadTime}
-                onPlayheadChange={editor.setPlayheadTime}
-                subtitleTracks={t.subtitleTracks}
-                subtitleVttTextByFile={t.subtitleVttTextByFile}
-                onSelectSubtitleFile={t.selectSubtitleFile}
-                onAddBlankSubtitleTrack={t.addBlankSubtitleTrack}
-                onRemoveSubtitleTrack={t.removeSubtitleTrack}
-                onSetSubtitleTrackLanguage={t.setSubtitleTrackLanguage}
-                onSaveSubtitleEdits={t.saveSubtitleEdits}
-              />
-              <ChapterRuler
-                segments={editor.segments}
-                playheadTime={editor.playheadTime}
-                onPlayheadChange={editor.setPlayheadTime}
-                chapters={chapters.chapters}
-                onAddChapterAt={chapters.addChapterAt}
-                onRenameChapter={chapters.renameChapter}
-                onRemoveChapter={chapters.removeChapter}
-              />
-            </>
-          ) : (
-            <div className="preview-pane">
-              <Player
-                m3u8Content={t.masterM3u8Preview || t.m3u8Preview}
-                outputFolderHandle={t.outputFolder}
-                isComplete={t.status === 'complete'}
-                dashManifestFilename={t.outputContainer === 'fmp4' ? 'manifest.mpd' : undefined}
-              />
-            </div>
-          )}
-        </div>
-
-        {editingPhase && (
-          <VerticalTimeline
-            segments={editor.segments}
-            selectedId={editor.selectedId}
-            playheadTime={editor.playheadTime}
-            sourceDuration={t.sourceDuration ?? 0}
-            disabled={!editingPhase}
-            canUndo={editor.canUndo}
-            canRedo={editor.canRedo}
-            onUndo={editor.undo}
-            onRedo={editor.redo}
-            onSelect={editor.setSelectedId}
-            onPlayheadChange={editor.setPlayheadTime}
-            onSplit={editor.splitAtPlayhead}
-            onDelete={editor.remove}
-            onReorder={editor.reorder}
-            beginGesture={editor.beginGesture}
-            previewUpdate={editor.previewUpdate}
-            commitGesture={editor.commitGesture}
-            introClip={t.introFile ? { label: t.introFile.label, duration: t.introFile.duration } : null}
-            outroClip={t.outroFile ? { label: t.outroFile.label, duration: t.outroFile.duration } : null}
-            onSelectIntroFile={t.selectIntroFile}
-            onClearIntroFile={t.clearIntroFile}
-            onSelectOutroFile={t.selectOutroFile}
-            onClearOutroFile={t.clearOutroFile}
-            hasIntroOrOutro={hasIntroOrOutro}
-            hasEditedSegments={hasEditedSegments}
-          />
+      <div className="editor-layout">
+        {editingPhase ? (
+          <>
+            <PreviewPane
+              ref={previewRef}
+              sourceFile={t.sourceFile}
+              segments={editor.segments}
+              playheadTime={editor.playheadTime}
+              onPlayheadChange={editor.setPlayheadTime}
+              disabled={!editingPhase}
+              abrHeights={t.abrHeights}
+              sourceResolution={t.sourceResolution}
+              onToggleAbrHeight={t.toggleAbrHeight}
+            />
+            <Timeline
+              segments={editor.segments}
+              selectedId={editor.selectedId}
+              playheadTime={editor.playheadTime}
+              sourceDuration={t.sourceDuration ?? 0}
+              disabled={!editingPhase}
+              canUndo={editor.canUndo}
+              canRedo={editor.canRedo}
+              onUndo={editor.undo}
+              onRedo={editor.redo}
+              onSelect={editor.setSelectedId}
+              onPlayheadChange={editor.setPlayheadTime}
+              onSplit={editor.splitAtPlayhead}
+              onDelete={editor.remove}
+              onReorder={editor.reorder}
+              beginGesture={editor.beginGesture}
+              previewUpdate={editor.previewUpdate}
+              commitGesture={editor.commitGesture}
+              introClip={t.introFile ? { label: t.introFile.label, duration: t.introFile.duration } : null}
+              outroClip={t.outroFile ? { label: t.outroFile.label, duration: t.outroFile.duration } : null}
+              onSelectIntroFile={t.selectIntroFile}
+              onClearIntroFile={t.clearIntroFile}
+              onSelectOutroFile={t.selectOutroFile}
+              onClearOutroFile={t.clearOutroFile}
+              hasIntroOrOutro={hasIntroOrOutro}
+              hasEditedSegments={hasEditedSegments}
+            />
+            <MediaExtrasPanel
+              dubAudioTracks={t.dubAudioTracks}
+              onSelectDubAudioTrack={t.selectDubAudioTrack}
+              onRemoveDubAudioTrack={t.removeDubAudioTrack}
+              onSetDubAudioTrackLanguage={t.setDubAudioTrackLanguage}
+            />
+            <CaptionLane
+              segments={editor.segments}
+              playheadTime={editor.playheadTime}
+              onPlayheadChange={editor.setPlayheadTime}
+              subtitleTracks={t.subtitleTracks}
+              subtitleVttTextByFile={t.subtitleVttTextByFile}
+              onSelectSubtitleFile={t.selectSubtitleFile}
+              onAddBlankSubtitleTrack={t.addBlankSubtitleTrack}
+              onRemoveSubtitleTrack={t.removeSubtitleTrack}
+              onSetSubtitleTrackLanguage={t.setSubtitleTrackLanguage}
+              onSaveSubtitleEdits={t.saveSubtitleEdits}
+            />
+            <ChapterRuler
+              segments={editor.segments}
+              playheadTime={editor.playheadTime}
+              onPlayheadChange={editor.setPlayheadTime}
+              chapters={chapters.chapters}
+              onAddChapterAt={chapters.addChapterAt}
+              onRenameChapter={chapters.renameChapter}
+              onRemoveChapter={chapters.removeChapter}
+            />
+          </>
+        ) : (
+          <div className="preview-pane">
+            <Player
+              m3u8Content={t.masterM3u8Preview || t.m3u8Preview}
+              outputFolderHandle={t.outputFolder}
+              isComplete={t.status === 'complete'}
+              dashManifestFilename={t.outputContainer === 'fmp4' ? 'manifest.mpd' : undefined}
+            />
+          </div>
         )}
       </div>
 

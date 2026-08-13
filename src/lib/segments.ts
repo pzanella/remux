@@ -1,10 +1,10 @@
 /**
- * Pure editing logic for the vertical timeline editor — split/trim/delete/
- * reorder, and the mapping between a single flattened (post-edit) playhead
- * time and (segment, local source time) needed to drive both preview
- * playback and the rail's own layout. Nothing here touches the DOM or React
- * state; components/hooks call these to produce a new segment array and
- * re-render off that.
+ * Pure editing logic for the timeline editor — split/trim/delete/reorder,
+ * and the mapping between a single flattened (post-edit) playhead time and
+ * (segment, local source time) needed to drive preview playback and the
+ * timeline's own proportional (%-of-total-duration) layout. Nothing here
+ * touches the DOM or React state; components/hooks call these to produce a
+ * new segment array and re-render off that.
  */
 
 export interface EditorSegment {
@@ -18,21 +18,6 @@ export interface EditorSegment {
 /** Below this, a segment is too short to usefully trim/select/split further
  * — trim/split operations refuse to produce anything shorter than this. */
 export const MIN_SEGMENT_DURATION_SEC = 0.2;
-
-/** Shared scale between the rail's card heights and the trim-handle
- * pointer-drag math, so dragging a handle by N screen pixels always moves
- * the boundary by the same number of seconds the card's own height implies. */
-export const PX_PER_SECOND = 6.4;
-
-/** Height floor so a very short segment's card stays usable (draggable,
- * readable label) instead of collapsing to a sliver. */
-export const MIN_CARD_HEIGHT_PX = 56;
-
-/** Gap rendered between stacked cards — folded into `computeCardLayout`'s
- * cumulative offsets (rather than left to a CSS `gap`) so the playhead line
- * and spine, which are positioned from that same layout, land exactly where
- * the cards visually are instead of drifting by a few px per card. */
-export const CARD_GAP_PX = 4;
 
 function makeId(): string {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -175,61 +160,6 @@ export function trimSegmentEnd(segments: EditorSegment[], id: string, newSourceE
     const clamped = Math.max(Math.min(newSourceEnd, sourceDuration), s.sourceStart + MIN_SEGMENT_DURATION_SEC);
     return { ...s, sourceEnd: clamped };
   });
-}
-
-export interface SegmentCardLayout {
-  id: string;
-  top: number;
-  height: number;
-}
-
-/** Per-card pixel geometry for the rail: height proportional to trimmed
- * duration at `PX_PER_SECOND`, floored at `MIN_CARD_HEIGHT_PX` so short
- * clips stay usable. Cards stack top to bottom in array order. */
-export function computeCardLayout(segments: EditorSegment[]): SegmentCardLayout[] {
-  const layout: SegmentCardLayout[] = [];
-  let top = 0;
-  for (const s of segments) {
-    const height = Math.max(MIN_CARD_HEIGHT_PX, segmentDuration(s) * PX_PER_SECOND);
-    layout.push({ id: s.id, top, height });
-    top += height + CARD_GAP_PX;
-  }
-  return layout;
-}
-
-/** Flattened global time → a Y pixel in the rail, using the same
- * floor-adjusted card layout the cards themselves render at (so the
- * playhead line always lines up with the card it's actually inside, even
- * for segments short enough to hit the height floor). */
-export function globalTimeToPixel(segments: EditorSegment[], layout: SegmentCardLayout[], globalTime: number): number {
-  const offsets = segmentOffsets(segments);
-  const loc = locateGlobalTime(segments, globalTime);
-  if (!loc) return 0;
-  const card = layout[loc.index];
-  const seg = segments[loc.index];
-  const duration = segmentDuration(seg);
-  const localGlobal = globalTime - offsets[loc.index];
-  const fraction = duration > 0 ? Math.min(1, Math.max(0, localGlobal / duration)) : 0;
-  return card.top + fraction * card.height;
-}
-
-/** Inverse of `globalTimeToPixel` — a Y pixel in the rail → flattened
- * global time, for click-to-scrub anywhere in the rail. */
-export function pixelToGlobalTime(segments: EditorSegment[], layout: SegmentCardLayout[], y: number): number {
-  if (segments.length === 0 || layout.length === 0) return 0;
-  const offsets = segmentOffsets(segments);
-  let index = layout.length - 1;
-  for (let i = 0; i < layout.length; i++) {
-    if (y < layout[i].top + layout[i].height || i === layout.length - 1) {
-      index = i;
-      break;
-    }
-  }
-  const card = layout[index];
-  const seg = segments[index];
-  const duration = segmentDuration(seg);
-  const fraction = card.height > 0 ? Math.min(1, Math.max(0, (y - card.top) / card.height)) : 0;
-  return offsets[index] + fraction * duration;
 }
 
 /** Maps a `[sourceStart, sourceEnd)` range authored in the source file's own

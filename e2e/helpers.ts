@@ -53,24 +53,28 @@ export async function expandExtrasStrip(page: Page): Promise<void> {
   }
 }
 
+/** Attaches an intro clip via `Timeline.tsx`'s own flanking slot (rendered
+ * before the clip track in DOM order — intro is always the first
+ * `.timeline-extra-slot`, same trick `attachOutro` below relies on). */
 export async function attachIntro(page: Page, fixtureName: string): Promise<void> {
-  await expandExtrasStrip(page);
-  await page.locator('.extras-row input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
+  await page.locator('.timeline-extra-slot input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
   // selectIntroFile is async (OPFS write + video-metadata probe) — the
   // input's own change event resolving is not proof the ingest itself (and
-  // the resulting re-render that repositions outro's input to `.first()`)
-  // has actually landed. Without this wait, a same-tick attachOutro call
-  // can race it and land in what's still the *intro* slot (confirmed
-  // empirically: manifest.intro.fileName came back as the outro fixture).
-  await page.waitForSelector('.extras-item-name:has-text("Intro:")', { timeout: 10_000 });
+  // the resulting re-render that removes intro's own slot, leaving outro's
+  // as the new `.first()`) has actually landed. Without this wait, a
+  // same-tick attachOutro call can race it and land in what's still the
+  // *intro* slot (confirmed empirically: manifest.intro.fileName came back
+  // as the outro fixture).
+  await page.waitForSelector('.timeline-extra-card--intro', { timeout: 10_000 });
 }
 
+/** Attaches an outro clip the same way — intro's own slot is gone once
+ * attached (replaced by `.timeline-extra-card--intro`), so the one
+ * remaining `.timeline-extra-slot` is outro's regardless of whether intro
+ * was attached first. */
 export async function attachOutro(page: Page, fixtureName: string): Promise<void> {
-  await expandExtrasStrip(page);
-  // Intro's file input exists whether or not intro is already attached, so
-  // once intro is attached this is the remaining (first) file input.
-  await page.locator('.extras-row input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
-  await page.waitForSelector('.extras-item-name:has-text("Outro:")', { timeout: 10_000 });
+  await page.locator('.timeline-extra-slot input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
+  await page.waitForSelector('.timeline-extra-card--outro', { timeout: 10_000 });
 }
 
 /** Attaches a dub-audio track via the persistent intro/outro/dub-audio strip
@@ -111,22 +115,21 @@ export async function addChapter(page: Page, title: string): Promise<void> {
 }
 
 /** Splits the timeline at a fractional position (0-1) of the current
- * clip's own duration — scrubs the playhead there via the chapter ruler's
- * own scrub lane (any of the persistent lanes under the preview double as
- * one; this one needs no pre-existing track to already be attached), then
- * clicks the "Split here" button VerticalTimeline shows once the playhead
- * lands inside the selected (by default, the only) segment. */
+ * clip's own duration — scrubs the playhead there via the Timeline's own
+ * track, then clicks the "Split" button it shows once the playhead lands
+ * inside the selected (by default, the only) segment. */
 export async function splitTimelineAt(page: Page, fraction: number): Promise<void> {
-  const lane = page.locator('.chapter-ruler-lane');
-  const box = await lane.boundingBox();
-  if (!box) throw new Error('.chapter-ruler-lane not found — is the editor showing?');
+  const track = page.locator('.timeline-track');
+  const box = await track.boundingBox();
+  if (!box) throw new Error('.timeline-track not found — is the editor showing?');
   // A locator click with an explicit position — not a raw `page.mouse.click`
-  // at the same viewport coordinates — is what actually reaches the lane's
-  // own `onPointerDown` scrub handler reliably (confirmed empirically: the
-  // raw mouse API left the playhead at 0% here even though the click itself
-  // registered, silently turning every split below into a no-op refused for
-  // being too close to the segment's own start).
-  await lane.click({ position: { x: box.width * fraction, y: box.height / 2 } });
+  // at the same viewport coordinates — is what actually reaches the track's
+  // own `onPointerDown` scrub handler reliably (confirmed empirically for
+  // the equivalent lane elsewhere in this app: the raw mouse API left the
+  // playhead at 0% even though the click itself registered, silently
+  // turning every split below into a no-op refused for being too close to
+  // the segment's own start).
+  await track.click({ position: { x: box.width * fraction, y: box.height / 2 } });
   await page.click('.split-button');
 }
 

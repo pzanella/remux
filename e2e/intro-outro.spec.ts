@@ -5,7 +5,6 @@ import {
   uploadSource,
   attachIntro,
   attachOutro,
-  expandExtrasStrip,
   splitTimelineAt,
   dropFileOnto,
   runExport,
@@ -38,14 +37,14 @@ test('splices an intro and outro clip onto the main content', async ({ page }, t
   expect(playlist).toContain('#EXT-X-ENDLIST');
 });
 
-test('shows attached intro/outro as flanking cards in the timeline rail, not just the collapsed strip', async ({ page }) => {
+test('shows attached intro/outro as flanking cards in the horizontal timeline', async ({ page }) => {
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');
   await attachIntro(page, 'intro.mp4');
   await attachOutro(page, 'outro.mp4');
 
-  await expect(page.locator('.rail-extra-card--intro')).toContainText('intro.mp4');
-  await expect(page.locator('.rail-extra-card--outro')).toContainText('outro.mp4');
+  await expect(page.locator('.timeline-extra-card--intro')).toContainText('intro.mp4');
+  await expect(page.locator('.timeline-extra-card--outro')).toContainText('outro.mp4');
 });
 
 test('blocks splitting the timeline once an intro/outro is attached, instead of only failing at export time', async ({ page }) => {
@@ -56,9 +55,9 @@ test('blocks splitting the timeline once an intro/outro is attached, instead of 
   // The split button is only reachable this way once a card is selected
   // and the playhead lands inside it — same setup as splitTimelineAt, but
   // asserting on the button's own disabled state instead of clicking it.
-  const lane = page.locator('.chapter-ruler-lane');
-  const box = await lane.boundingBox();
-  await lane.click({ position: { x: box!.width * 0.5, y: box!.height / 2 } });
+  const track = page.locator('.timeline-track');
+  const box = await track.boundingBox();
+  await track.click({ position: { x: box!.width * 0.5, y: box!.height / 2 } });
   await expect(page.locator('.split-button')).toBeDisabled();
 });
 
@@ -66,31 +65,26 @@ test('blocks attaching an intro/outro once the timeline has been split, instead 
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');
   await splitTimelineAt(page, 0.5);
-  await expandExtrasStrip(page);
 
-  await expect(page.locator('.extras-warning')).toBeVisible();
-  await expect(page.locator('.extras-row').getByRole('button', { name: '+ Intro' })).toBeDisabled();
-  await expect(page.locator('.extras-row').getByRole('button', { name: '+ Outro' })).toBeDisabled();
-  // The timeline's own intro/outro slots (see VerticalTimeline's
-  // IntroOutroSlot) are a second entry point for the exact same action —
-  // must be equally blocked, not just the collapsed strip's buttons.
-  await expect(page.locator('.rail-extra-slot').first()).toBeDisabled();
-  await expect(page.locator('.rail-extra-slot').last()).toBeDisabled();
+  await expect(page.locator('.timeline-warning')).toBeVisible();
+  await expect(page.locator('.timeline-extra-slot').first()).toBeDisabled();
+  await expect(page.locator('.timeline-extra-slot').last()).toBeDisabled();
 });
 
 test('drag-and-dropping a video file onto the timeline\'s intro/outro slots attaches it', async ({ page }) => {
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');
 
-  const introSlot = page.locator('.rail-extra-slot').first();
+  const introSlot = page.locator('.timeline-extra-slot').first();
   await dropFileOnto(page, introSlot, path.join(FIXTURES, 'intro.mp4'));
-  await expect(page.locator('.rail-extra-card--intro')).toContainText('intro.mp4');
+  await expect(page.locator('.timeline-extra-card--intro')).toContainText('intro.mp4');
 
   // Intro's own empty slot is gone now that it's attached (replaced by
-  // .rail-extra-card--intro), so the one remaining .rail-extra-slot is outro's.
-  const outroSlot = page.locator('.rail-extra-slot').first();
+  // .timeline-extra-card--intro), so the one remaining .timeline-extra-slot
+  // is outro's.
+  const outroSlot = page.locator('.timeline-extra-slot').first();
   await dropFileOnto(page, outroSlot, path.join(FIXTURES, 'outro.mp4'));
-  await expect(page.locator('.rail-extra-card--outro')).toContainText('outro.mp4');
+  await expect(page.locator('.timeline-extra-card--outro')).toContainText('outro.mp4');
 });
 
 test('a hardware-encoding fallback along the way does not falsely report the export as failed', async ({ page }, testInfo) => {
