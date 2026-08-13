@@ -495,26 +495,135 @@ function formatVttTimestamp(seconds: number): string {
  * up front rather than lazily — the same trade-off `convertToMp4`/
  * `normalizeLoudness` already make for their own (much larger) FFmpeg work.
  */
+/** How many sequential `ffmpeg.exec()` calls one FFmpeg.wasm instance
+ * tolerates before its single WASM linear memory becomes unstable —
+ * confirmed empirically against a real 180s source: extracting one still
+ * frame per call (see `generateThumbnailSprite` below) reliably crashed
+ * with a bare "RuntimeError: memory access out of bounds" around the 65th
+ * call on one instance, well past what any individual call's own memory use
+ * would explain. Recycling the instance well before that (see
+ * `extractThumbnailTiles`) avoids the cumulative corruption entirely. */
+const FFMPEG_CALLS_PER_INSTANCE = 20;
+
+/** Extracts one still frame per tile via a fast input-side `-ss` seek (same
+ * convention `cutSegmentClip` establishes elsewhere in this file) —
+ * decoding only a small window near each timestamp, rather than piping the
+ * whole source through one `fps=...,tile=...` filter chain that has to
+ * decode every frame sequentially to pick out the ones it keeps (that
+ * single-call version costs a full decode pass on the *entire* source
+ * regardless of length, a real way to blow ffmpeg.wasm's memory-constrained
+ * core on a long/heavy real file — the original "Internal error" WASM abort
+ * this rewrite exists to fix). Recycles the FFmpeg instance itself every
+ * `FFMPEG_CALLS_PER_INSTANCE` tiles (see that constant's own doc comment)
+ * and returns each tile's own JPEG bytes read back into JS memory —
+ * nothing is left relying on any one instance's virtual FS surviving to a
+ * later step, since the instance that wrote it may already be gone. */
+async function extractThumbnailTiles(
+  srcBytes: Uint8Array,
+  inputName: string,
+  tileCount: number,
+  intervalSec: number,
+  durationSec: number,
+): Promise<Uint8Array[]> {
+  const { FFmpeg } = await loadFFmpegModule();
+  const scalePad = `scale=${THUMBNAIL_TILE_WIDTH}:${THUMBNAIL_TILE_HEIGHT}:force_original_aspect_ratio=decrease,pad=${THUMBNAIL_TILE_WIDTH}:${THUMBNAIL_TILE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black`;
+  const tiles: Uint8Array[] = [];
+
+  // `writeFile` transfers (not clones) a Uint8Array's underlying buffer to
+  // the FFmpeg worker (same gotcha `encodeRendition`'s own doc comment
+  // flags elsewhere in this file) — reusing `srcBytes` as-is across more
+  // than one instance (recycled below) would detach it after the first
+  // write and leave every instance after that with nothing to read. Each
+  // instance gets its own independent copy via `.slice()`.
+  let ffmpeg = new FFmpeg();
+  await loadFFmpegCore(ffmpeg);
+  await ffmpeg.writeFile(inputName, srcBytes.slice());
+  const lines: string[] = [];
+  ffmpeg.on('log', ({ message }) => lines.push(message));
+
+  try {
+    for (let i = 0; i < tileCount; i++) {
+      if (i > 0 && i % FFMPEG_CALLS_PER_INSTANCE === 0) {
+        ffmpeg.terminate();
+        ffmpeg = new FFmpeg();
+        await loadFFmpegCore(ffmpeg);
+        await ffmpeg.writeFile(inputName, srcBytes.slice());
+        ffmpeg.on('log', ({ message }) => lines.push(message));
+      }
+
+      // Midpoint of the tile's own interval — a more representative sample
+      // of the range its VTT cue covers than the interval's start would be
+      // — clamped just short of the real end so a seek never lands past EOF.
+      const ts = Math.max(0, Math.min(i * intervalSec + intervalSec / 2, durationSec - 0.05));
+      const tileName = 'tile.jpg';
+      const tileCode = await ffmpeg.exec(['-ss', ts.toFixed(3), '-i', inputName, '-frames:v', '1', '-vf', scalePad, '-q:v', '4', '-y', tileName]);
+      if (tileCode !== 0) {
+        throw new Error(`FFmpeg exited with code ${tileCode} extracting tile ${i}: ${lines.slice(-10).join(' / ')}`);
+      }
+      tiles.push((await ffmpeg.readFile(tileName)) as Uint8Array);
+    }
+  } finally {
+    ffmpeg.terminate();
+  }
+
+  return tiles;
+}
+
+/** Composites already-extracted tile JPEGs into one grid sprite — plain
+ * `OffscreenCanvas`, available in this dedicated Worker context, not
+ * another FFmpeg pass. Tried feeding the tiles back into FFmpeg as an
+ * `image2` sequence input for its own `tile=RxC` filter first (mirroring
+ * how the rest of this file leans on FFmpeg for compositing work); that
+ * combination reliably hung indefinitely (no error, no output, no exit —
+ * a genuine deadlock, not just slow) with every tile already confirmed
+ * successfully extracted beforehand, isolating the problem to that specific
+ * image2-sequence-into-tile-filter combination rather than anything about
+ * the tiles themselves. `createImageBitmap`/`OffscreenCanvas` sidesteps
+ * FFmpeg for this step entirely — well-supported, uncomplicated 2D drawing,
+ * nothing for a video filter graph to get stuck on. */
+async function compositeThumbnailSprite(tiles: Uint8Array[], cols: number, rows: number): Promise<Uint8Array> {
+  const canvas = new OffscreenCanvas(cols * THUMBNAIL_TILE_WIDTH, rows * THUMBNAIL_TILE_HEIGHT);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('OffscreenCanvas 2D context is unavailable in this browser.');
+
+  for (let i = 0; i < tiles.length; i++) {
+    const bitmap = await createImageBitmap(new Blob([tiles[i] as BlobPart], { type: 'image/jpeg' }));
+    try {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      ctx.drawImage(bitmap, col * THUMBNAIL_TILE_WIDTH, row * THUMBNAIL_TILE_HEIGHT);
+    } finally {
+      bitmap.close();
+    }
+  }
+
+  const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 });
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
 async function generateThumbnailSprite(srcBytes: Uint8Array, originalFileName: string, outputFolderHandle: FileSystemDirectoryHandle): Promise<void> {
   const { FFmpeg } = await loadFFmpegModule();
-
-  const ffmpeg = new FFmpeg();
-  await loadFFmpegCore(ffmpeg);
+  const probeFfmpeg = new FFmpeg();
+  await loadFFmpegCore(probeFfmpeg);
 
   const ext = originalFileName.includes('.') ? originalFileName.slice(originalFileName.lastIndexOf('.')) : '.video';
   const inputName = `input${ext}`;
-  await ffmpeg.writeFile(inputName, srcBytes);
 
-  const durationLines: string[] = [];
-  const onDurationLog = ({ message }: { message: string }) => durationLines.push(message);
-  ffmpeg.on('log', onDurationLog);
-  await ffmpeg.ffprobe(['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', inputName, '-o', 'duration.txt']);
-  ffmpeg.off('log', onDurationLog);
-  const durationText = (await ffmpeg.readFile('duration.txt', 'utf8')) as string;
-  const durationSec = parseFloat(durationText.trim());
-  await ffmpeg.deleteFile('duration.txt');
-  if (!(durationSec > 0)) {
-    throw new Error(`Could not read source duration: ${durationLines.slice(-5).join(' / ') || durationText}`);
+  let durationSec = 0;
+  try {
+    // Sliced (see extractThumbnailTiles's own comment on this same gotcha)
+    // so the original `srcBytes` buffer survives intact for that call below.
+    await probeFfmpeg.writeFile(inputName, srcBytes.slice());
+    const durationLines: string[] = [];
+    probeFfmpeg.on('log', ({ message }) => durationLines.push(message));
+    await probeFfmpeg.ffprobe(['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', inputName, '-o', 'duration.txt']);
+    const durationText = (await probeFfmpeg.readFile('duration.txt', 'utf8')) as string;
+    durationSec = parseFloat(durationText.trim());
+    if (!(durationSec > 0)) {
+      throw new Error(`Could not read source duration: ${durationLines.slice(-5).join(' / ') || durationText}`);
+    }
+  } finally {
+    probeFfmpeg.terminate();
   }
 
   // Sized to fill the grid the sprite actually has (cols*rows), not the
@@ -526,34 +635,9 @@ async function generateThumbnailSprite(srcBytes: Uint8Array, originalFileName: s
   const tileCount = cols * rows;
   const intervalSec = durationSec / tileCount;
 
-  const outputName = 'sprite.jpg';
-  const spriteLines: string[] = [];
-  const onSpriteLog = ({ message }: { message: string }) => spriteLines.push(message);
-  ffmpeg.on('log', onSpriteLog);
-  let code: number;
-  try {
-    code = await ffmpeg.exec([
-      '-i', inputName,
-      '-vf',
-      `fps=1/${intervalSec},scale=${THUMBNAIL_TILE_WIDTH}:${THUMBNAIL_TILE_HEIGHT}:force_original_aspect_ratio=decrease,pad=${THUMBNAIL_TILE_WIDTH}:${THUMBNAIL_TILE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,tile=${cols}x${rows}`,
-      '-frames:v', '1',
-      '-q:v', '4',
-      '-y', outputName,
-    ]);
-  } finally {
-    ffmpeg.off('log', onSpriteLog);
-  }
-  if (code !== 0) {
-    ffmpeg.terminate();
-    throw new Error(`FFmpeg exited with code ${code}: ${spriteLines.slice(-10).join(' / ')}`);
-  }
-
-  const spriteData = (await ffmpeg.readFile(outputName)) as Uint8Array;
+  const tiles = await extractThumbnailTiles(srcBytes, inputName, tileCount, intervalSec, durationSec);
+  const spriteData = await compositeThumbnailSprite(tiles, cols, rows);
   await writeOutputFile(outputFolderHandle, 'thumbnails.jpg', spriteData);
-
-  await ffmpeg.deleteFile(inputName);
-  await ffmpeg.deleteFile(outputName);
-  ffmpeg.terminate();
 
   // One cue per tile, in the same left-to-right/top-to-bottom raster order
   // `tile=` fills the sprite in.

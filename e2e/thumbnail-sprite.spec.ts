@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { uploadSource, runExport, downloadZip, listZipEntries, readZipEntryText } from './helpers';
+import { uploadSource, runExport, downloadZip, listZipEntries, readZipEntryText, getLogText } from './helpers';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
@@ -42,6 +42,59 @@ test('generates a scrubbing-preview thumbnail sprite + WebVTT storyboard', async
     encoding: 'utf-8',
   }).trim();
   expect(spriteInfo).toBe('mjpeg,160,90');
+});
+
+test('generates a thumbnail sprite for a longer source without crashing FFmpeg', async ({ page }, testInfo) => {
+  // Regression test for a real "Could not generate the scrubbing-preview
+  // thumbnail sprite: Error: FFmpeg exited with code -1: Internal error"
+  // report: the old implementation piped the *entire* source through one
+  // `fps=...,tile=...` filter chain, decoding every frame sequentially —
+  // fine for sample.mp4's 2s, but a plausible way to blow ffmpeg.wasm's
+  // single-threaded WASM heap on a longer/heavier real source. long-sample.mp4
+  // (180s) needs close to the full THUMBNAIL_MAX_TILES=100 tiles, enough to
+  // also exercise the current implementation's own per-tile FFmpeg-instance
+  // recycling (confirmed empirically to matter: reusing one instance across
+  // ~90 sequential extractions crashes with a bare WASM "memory access out
+  // of bounds" around the 65th call, independent of any single call's own
+  // cost).
+  await page.goto('/');
+  await uploadSource(page, 'long-sample.mp4');
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+
+  // More tiles than sample.mp4's single-tile case means more recycled
+  // FFmpeg-instance cold starts (each paying its own core-load cost, even
+  // cached) — a longer wait than the short-fixture test's own 8s.
+  await page.waitForTimeout(25_000);
+
+  const logText = await getLogText(page);
+  expect(logText).not.toContain('Could not generate the scrubbing-preview thumbnail sprite');
+
+  const zipPath = testInfo.outputPath('output.zip');
+  await downloadZip(page, zipPath);
+  const entries = listZipEntries(zipPath);
+  expect(entries).toContain('thumbnails.jpg');
+  expect(entries).toContain('thumbnails.vtt');
+
+  const vtt = readZipEntryText(zipPath, 'thumbnails.vtt');
+  const cueCount = (vtt.match(/-->/g) ?? []).length;
+  // 180s of content, capped at THUMBNAIL_MAX_TILES=100 — comfortably more
+  // than sample.mp4's single-tile case, a real multi-tile grid.
+  expect(cueCount).toBeGreaterThan(50);
+
+  const unzipDir = testInfo.outputPath('unzipped');
+  execFileSync('unzip', ['-o', zipPath, '-d', unzipDir]);
+  const spriteInfo = execFileSync(
+    'ffprobe',
+    ['-v', 'error', '-show_entries', 'stream=width,height,codec_name', '-of', 'csv=p=0', path.join(unzipDir, 'thumbnails.jpg')],
+    { encoding: 'utf-8' },
+  ).trim();
+  const [codec, width, height] = spriteInfo.split(',');
+  expect(codec).toBe('mjpeg');
+  // A real multi-column, multi-row grid, not a single 160x90 tile.
+  expect(Number(width)).toBeGreaterThan(160);
+  expect(Number(height)).toBeGreaterThan(90);
 });
 
 test('shows a real thumbnail preview on seek-bar hover, via Shaka Player\'s own thumbnails track', async ({ page }) => {
