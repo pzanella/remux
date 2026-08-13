@@ -98,8 +98,8 @@ test('round-trips intro and outro clips through a saved project', async ({ page 
   await startOver(page);
   await loadProjectFile(page, projectPath);
 
-  await expect(page.locator('.timeline-extra-card--intro')).toContainText('intro.mp4');
-  await expect(page.locator('.timeline-extra-card--outro')).toContainText('outro.mp4');
+  await expect(page.locator('.timeline-clip--intro')).toHaveAttribute('title', 'intro.mp4');
+  await expect(page.locator('.timeline-clip--outro')).toHaveAttribute('title', 'outro.mp4');
 
   const result = await runExport(page);
   expect(result).toBe('done');

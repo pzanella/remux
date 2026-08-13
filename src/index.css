@@ -1111,99 +1111,10 @@ body {
 
 /* Intro/outro flanking slots — fixed width so the layout doesn't jump when
    toggling between the attached and empty states. */
-.timeline-extra-card,
+.timeline-clip--extra,
 .timeline-extra-slot {
   flex-shrink: 0;
   width: 9rem;
-}
-
-.timeline-extra-card {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
-  padding: 0.4rem;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-md);
-  background: var(--bg-sunken);
-}
-.timeline-extra-card-thumb {
-  height: 2.6rem;
-  border-radius: var(--radius-sm);
-  background: linear-gradient(200deg, color-mix(in srgb, var(--teal) 55%, var(--bg-sunken)) 0%, color-mix(in srgb, var(--teal) 14%, var(--bg-sunken)) 100%);
-}
-.timeline-extra-card--outro .timeline-extra-card-thumb {
-  background: linear-gradient(200deg, color-mix(in srgb, var(--accent) 55%, var(--bg-sunken)) 0%, color-mix(in srgb, var(--accent) 14%, var(--bg-sunken)) 100%);
-}
-.timeline-extra-card-info {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.15rem;
-  padding-right: 1.3rem;
-}
-.timeline-extra-card-tag {
-  align-self: flex-start;
-  font-family: var(--font-mono);
-  font-size: 0.62rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-pill);
-  padding: 0.1rem 0.5rem;
-}
-.timeline-extra-card-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.78rem;
-  color: var(--text-muted);
-}
-.timeline-extra-card-duration {
-  font-family: var(--font-mono);
-  font-size: 0.66rem;
-  color: var(--text-tertiary);
-}
-.timeline-extra-card-hold {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  font-family: var(--font-mono);
-  font-size: 0.66rem;
-  color: var(--text-tertiary);
-}
-.timeline-extra-card-hold input {
-  width: 3rem;
-  padding: 0.1rem 0.3rem;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 0.66rem;
-}
-.timeline-extra-card-remove {
-  position: absolute;
-  top: 0.3rem;
-  right: 0.3rem;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.2rem;
-  height: 1.2rem;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 0.65rem;
-}
-.timeline-extra-card-remove:hover {
-  background: var(--danger);
-  color: var(--accent-text);
 }
 
 .timeline-extra-slot {
@@ -1273,6 +1184,47 @@ body {
 .timeline-clip.is-drag-over {
   border-color: var(--teal);
   box-shadow: 0 0 0 1px var(--teal);
+}
+
+/* Attached intro/outro cards reuse the same .timeline-clip visual language
+   real content clips get (thumb/waveform, info row, delete button) — this
+   modifier swaps the base class's absolute/proportional positioning for a
+   normal fixed-width flex child instead (intro/outro have no shared
+   timeline axis with the content track to be positioned proportionally
+   against), while every other .timeline-clip-* rule below applies as-is.
+   See Timeline.tsx's own IntroOutroSlot. Declared after the base
+   `.timeline-clip` rule above on purpose — same specificity, so cascade
+   order is what makes this override actually win. */
+.timeline-clip--extra {
+  position: relative;
+  top: auto;
+  bottom: auto;
+  min-width: 9rem;
+  margin: 0;
+  cursor: default;
+}
+.timeline-clip--extra .timeline-clip-name {
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 0.68rem;
+}
+.timeline-clip--extra .timeline-clip-hold {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--text-tertiary);
+}
+.timeline-clip--extra .timeline-clip-hold input {
+  width: 2.6rem;
+  padding: 0.1rem 0.3rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
 }
 
 .timeline-clip-thumb {

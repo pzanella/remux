@@ -39,14 +39,24 @@ test('splices an intro and outro clip onto the main content', async ({ page }, t
   expect(playlist).toContain('#EXT-X-ENDLIST');
 });
 
-test('shows attached intro/outro as flanking cards in the horizontal timeline', async ({ page }) => {
+test('shows attached intro/outro as real timeline clips, styled like content clips', async ({ page }) => {
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');
   await attachIntro(page, 'intro.mp4');
   await attachOutro(page, 'outro.mp4');
 
-  await expect(page.locator('.timeline-extra-card--intro')).toContainText('intro.mp4');
-  await expect(page.locator('.timeline-extra-card--outro')).toContainText('outro.mp4');
+  // Same .timeline-clip-* markup a real content clip uses (waveform thumb,
+  // name, duration, delete button) — labeled generically ("Intro"/"Outro"),
+  // matching how a content clip is labeled "Clip N" rather than by
+  // filename; the attached file's own name is still surfaced as a tooltip.
+  const intro = page.locator('.timeline-clip--intro');
+  const outro = page.locator('.timeline-clip--outro');
+  await expect(intro).toContainText('Intro');
+  await expect(intro).toHaveAttribute('title', 'intro.mp4');
+  await expect(intro.locator('.timeline-clip-waveform-bar')).not.toHaveCount(0);
+  await expect(outro).toContainText('Outro');
+  await expect(outro).toHaveAttribute('title', 'outro.mp4');
+  await expect(outro.locator('.timeline-clip-waveform-bar')).not.toHaveCount(0);
 });
 
 test('plays an attached intro, then main content, then an attached outro, in sequence in the live preview', async ({ page }) => {
@@ -137,14 +147,14 @@ test('drag-and-dropping a video file onto the timeline\'s intro/outro slots atta
 
   const introSlot = page.locator('.timeline-extra-slot').first();
   await dropFileOnto(page, introSlot, path.join(FIXTURES, 'intro.mp4'));
-  await expect(page.locator('.timeline-extra-card--intro')).toContainText('intro.mp4');
+  await expect(page.locator('.timeline-clip--intro')).toHaveAttribute('title', 'intro.mp4');
 
   // Intro's own empty slot is gone now that it's attached (replaced by
-  // .timeline-extra-card--intro), so the one remaining .timeline-extra-slot
-  // is outro's.
+  // .timeline-clip--intro), so the one remaining .timeline-extra-slot is
+  // outro's.
   const outroSlot = page.locator('.timeline-extra-slot').first();
   await dropFileOnto(page, outroSlot, path.join(FIXTURES, 'outro.mp4'));
-  await expect(page.locator('.timeline-extra-card--outro')).toContainText('outro.mp4');
+  await expect(page.locator('.timeline-clip--outro')).toHaveAttribute('title', 'outro.mp4');
 });
 
 test('a hardware-encoding fallback along the way does not falsely report the export as failed', async ({ page }, testInfo) => {
@@ -206,7 +216,7 @@ test('supports a still image for intro and outro, held for a chosen duration and
 
   // A still image shows its own "Hold for … s" control in place of a fixed,
   // probed duration, defaulting to 3s.
-  const holdInputs = page.locator('.timeline-extra-card-hold input');
+  const holdInputs = page.locator('.timeline-clip-hold input');
   await expect(holdInputs.first()).toHaveValue('3');
   await holdInputs.first().fill('1');
 
@@ -242,7 +252,7 @@ test('produces a correct adaptive-bitrate export when the intro is a still image
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');
   await attachIntro(page, 'intro-image.jpg');
-  await page.locator('.timeline-extra-card-hold input').fill('1');
+  await page.locator('.timeline-clip-hold input').fill('1');
   await selectRendition(page, '240p');
 
   const result = await runExport(page);

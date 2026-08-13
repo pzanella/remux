@@ -65,16 +65,16 @@ export async function attachIntro(page: Page, fixtureName: string): Promise<void
   // same-tick attachOutro call can race it and land in what's still the
   // *intro* slot (confirmed empirically: manifest.intro.fileName came back
   // as the outro fixture).
-  await page.waitForSelector('.timeline-extra-card--intro', { timeout: 10_000 });
+  await page.waitForSelector('.timeline-clip--intro', { timeout: 10_000 });
 }
 
 /** Attaches an outro clip the same way — intro's own slot is gone once
- * attached (replaced by `.timeline-extra-card--intro`), so the one
- * remaining `.timeline-extra-slot` is outro's regardless of whether intro
- * was attached first. */
+ * attached (replaced by `.timeline-clip--intro`), so the one remaining
+ * `.timeline-extra-slot` is outro's regardless of whether intro was
+ * attached first. */
 export async function attachOutro(page: Page, fixtureName: string): Promise<void> {
   await page.locator('.timeline-extra-slot input[type="file"]').first().setInputFiles(path.join(FIXTURES, fixtureName));
-  await page.waitForSelector('.timeline-extra-card--outro', { timeout: 10_000 });
+  await page.waitForSelector('.timeline-clip--outro', { timeout: 10_000 });
 }
 
 /** Attaches a dub-audio track via the persistent intro/outro/dub-audio strip

@@ -57,28 +57,47 @@ interface IntroOutroSlotProps {
 /**
  * A fixed-width slot flanking the clips track — to the left for intro, the
  * right for outro, matching where they actually sit in the final spliced
- * output. Styled like a real clip (thumb block, name, duration) once
- * something's attached — accepting either a click (opens a picker) or a
- * native OS file drop, the same two ways `EmptyState`'s own dropzone already
- * accepts the very first source file. This is a second entry point
- * alongside MediaExtrasPanel's own former intro/outro row, not a
- * replacement for the file-picking mechanics.
+ * output. Once something's attached, rendered with the exact same
+ * `.timeline-clip-*` markup a real content clip uses (color-coded waveform
+ * thumb, name, duration, delete button) via the `.timeline-clip--extra`
+ * modifier (see index.css) — a fixed-width flex child instead of a
+ * proportionally-positioned one, since intro/outro have no shared timeline
+ * axis with the content track, but visually indistinguishable otherwise.
+ * The empty state accepts either a click (opens a picker) or a native OS
+ * file drop, the same two ways `EmptyState`'s own dropzone already accepts
+ * the very first source file.
  */
 function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDuration }: IntroOutroSlotProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isOver, setIsOver] = useState(false);
   const label = kind === 'intro' ? 'Intro' : 'Outro';
+  // Fixed per kind rather than colorForSegment's per-id hash — intro/outro
+  // aren't drawn from `segments`, and a stable intro=teal/outro=accent
+  // pairing is worth keeping regardless of which file is attached.
+  const color = kind === 'intro' ? 'var(--teal)' : 'var(--accent)';
 
   if (clip) {
+    const peaks = syntheticPeaks(kind, 14);
     return (
-      <div className={`timeline-extra-card timeline-extra-card--${kind}`}>
-        <div className="timeline-extra-card-thumb" aria-hidden="true" />
-        <div className="timeline-extra-card-info">
-          <span className="timeline-extra-card-tag">{label}</span>
-          <span className="timeline-extra-card-label">{clip.label}</span>
+      <div className={`timeline-clip timeline-clip--extra timeline-clip--${kind}`} title={clip.label}>
+        <div
+          className="timeline-clip-thumb"
+          style={{
+            background: `linear-gradient(200deg, color-mix(in srgb, ${color} 55%, var(--bg-sunken)) 0%, color-mix(in srgb, ${color} 14%, var(--bg-sunken)) 100%)`,
+          }}
+        >
+          <div className="timeline-clip-waveform">
+            {peaks.map((p, pi) => (
+              <span key={pi} className="timeline-clip-waveform-bar" style={{ height: `${p * 100}%`, background: color }} />
+            ))}
+          </div>
+        </div>
+
+        <div className="timeline-clip-info">
+          <span className="timeline-clip-name">{label}</span>
           {clip.isImage ? (
-            <label className="timeline-extra-card-hold">
-              Hold for
+            <label className="timeline-clip-hold" onClick={(e) => e.stopPropagation()}>
+              Hold
               <input
                 type="number"
                 min={0.1}
@@ -88,17 +107,25 @@ function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDura
                   const seconds = parseFloat(e.target.value);
                   if (!Number.isNaN(seconds)) onSetHoldDuration(seconds);
                 }}
-                onClick={(e) => e.stopPropagation()}
               />
               s
             </label>
           ) : (
-            clip.duration !== undefined && <span className="timeline-extra-card-duration">{formatDuration(clip.duration)}</span>
+            clip.duration !== undefined && <span className="timeline-clip-duration">{formatDuration(clip.duration)}</span>
           )}
+          <button
+            type="button"
+            className="timeline-clip-delete"
+            draggable={false}
+            onClick={(e) => {
+              e.stopPropagation();
+              onClear();
+            }}
+            title={`Remove ${label.toLowerCase()}`}
+          >
+            ✕
+          </button>
         </div>
-        <button type="button" className="timeline-extra-card-remove" onClick={onClear} title={`Remove ${label.toLowerCase()}`}>
-          ✕
-        </button>
       </div>
     );
   }
