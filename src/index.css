@@ -304,6 +304,10 @@ body {
   cursor: not-allowed;
   text-decoration: none;
 }
+.extras-preview-toggle--active {
+  color: var(--accent);
+  text-decoration: none;
+}
 
 /* ── Form controls ── */
 .text-input {

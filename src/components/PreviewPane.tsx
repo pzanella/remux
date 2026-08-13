@@ -53,6 +53,17 @@ interface PreviewPaneProps {
    * `playheadTime`, so — unlike subtitle cues above — no remapping is
    * needed here either, just a plain last-chapter-at-or-before lookup. */
   chapters?: { time: number; title: string }[];
+  /** A dub-audio track selected for live preview (resolved from OPFS back
+   * into a real `File` in App.tsx — `useTranscoder`'s own `dubAudioTracks`
+   * only keeps the OPFS filename in memory, unlike intro/outro's
+   * `ClipFile`). Only meaningful during `phase === 'main'`, same as
+   * subtitles above: the dub content only ever covers the main clip.
+   * Not frame-accurate sample sync — the same tolerance-based resync this
+   * file already uses for segment-jumping, reused here against
+   * `playheadTime` rather than `video.currentTime` directly, since the dub
+   * track (like its export-time counterpart) tracks the flattened output
+   * position, not the source file's own time across a cut. */
+  dubPreviewFile?: File | null;
 }
 
 function formatTimecode(seconds: number): string {
@@ -98,15 +109,28 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
     subtitleTracks = [],
     subtitleVttTextByFile = {},
     chapters = [],
+    dubPreviewFile = null,
   },
   ref,
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const scrubRef = useRef<HTMLDivElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const currentIndexRef = useRef(0);
 
   const [phase, setPhase] = useState<Phase>('intro');
+  // Mirrors `phase` synchronously (see `setPhaseSynced`) — `switchToMain`
+  // can call `video.play()` in the same tick it requests the phase change,
+  // firing the native `play` event (and this component's `onPlay` handler)
+  // before React has re-rendered and attached a handler closure that's
+  // actually seen the new `phase` state. The dub-audio play/pause sync
+  // below needs the *current* phase at that exact moment, not a stale one.
+  const phaseRef = useRef<Phase>('intro');
+  function setPhaseSynced(p: Phase) {
+    phaseRef.current = p;
+    setPhase(p);
+  }
   // Whether the user has asked for playback to be running — set only by
   // `toggleImageOrVideoPlayback` (an explicit play/pause), never by the
   // native `pause` event: a video's natural end-of-playback fires `pause`
@@ -213,6 +237,54 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
     };
   }, [subtitleUrls]);
 
+  // Blob URL for the secondary `<audio>` element below — same
+  // one-URL-per-effect-run pattern as the other sources in this file.
+  const [dubPreviewUrl, setDubPreviewUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!dubPreviewFile) {
+      setDubPreviewUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(dubPreviewFile);
+    setDubPreviewUrl(url);
+    return () => {
+      URL.revokeObjectURL(url);
+    };
+  }, [dubPreviewFile]);
+
+  // The main video is muted for as long as a dub preview is active, so the
+  // viewer hears the dub track instead of the original rather than both
+  // layered — restored the moment preview selection clears.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (video) video.muted = !!dubPreviewUrl;
+    if (!dubPreviewUrl) audioRef.current?.pause();
+  }, [dubPreviewUrl]);
+
+  // A freshly selected dub track needs its own starting position — it has
+  // no `timeupdate`/`seeked` history with the rest of this component yet,
+  // so once its metadata is ready (immediately, if it already is), seek it
+  // to the current playhead and match whatever the main video is already
+  // doing.
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !dubPreviewUrl) return;
+    const sync = () => {
+      audio.currentTime = playheadTime;
+      if (isPlaying && phaseRef.current === 'main') void audio.play().catch(() => {});
+    };
+    if (audio.readyState >= 1) {
+      sync();
+      return;
+    }
+    audio.addEventListener('loadedmetadata', sync, { once: true });
+    return () => audio.removeEventListener('loadedmetadata', sync);
+    // Only re-run on a genuine track swap, not on every playheadTime/
+    // isPlaying tick — those are handled by the resync and play/pause-sync
+    // effects below instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dubPreviewUrl]);
+
   function stopImageClock() {
     if (rafRef.current !== null) {
       cancelAnimationFrame(rafRef.current);
@@ -248,7 +320,7 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
 
   function switchToIntro(elapsed: number) {
     stopImageClock();
-    setPhase('intro');
+    setPhaseSynced('intro');
     setPhaseElapsed(elapsed);
     if (!introClip) return;
     if (introClip.isImage) {
@@ -265,7 +337,7 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
 
   function switchToMain(localMainTime: number) {
     stopImageClock();
-    setPhase('main');
+    setPhaseSynced('main');
     const video = videoRef.current;
     if (video && sourceUrlRef.current) {
       if (video.currentSrc !== sourceUrlRef.current) video.src = sourceUrlRef.current;
@@ -281,7 +353,7 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
 
   function switchToOutro(elapsed: number) {
     stopImageClock();
-    setPhase('outro');
+    setPhaseSynced('outro');
     setPhaseElapsed(elapsed);
     if (!outroClip) return;
     if (outroClip.isImage) {
@@ -325,16 +397,33 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
   useEffect(() => {
     if (phase !== 'main') return;
     const video = videoRef.current;
-    if (!video || segments.length === 0) return;
-    const loc = locateGlobalTime(segments, playheadTime);
-    if (!loc) return;
-    currentIndexRef.current = loc.index;
-    // Tolerance distinguishes "someone moved the playhead" from "the video
-    // is just playing forward and timeupdate is echoing its own position".
-    if (Math.abs(video.currentTime - loc.localSourceTime) > 0.35) {
-      video.currentTime = loc.localSourceTime;
+    if (video && segments.length > 0) {
+      const loc = locateGlobalTime(segments, playheadTime);
+      if (loc) {
+        currentIndexRef.current = loc.index;
+        // Tolerance distinguishes "someone moved the playhead" from "the
+        // video is just playing forward and timeupdate is echoing its own
+        // position".
+        if (Math.abs(video.currentTime - loc.localSourceTime) > 0.35) {
+          video.currentTime = loc.localSourceTime;
+        }
+      }
     }
-  }, [playheadTime, segments, phase]);
+    // The dub track has no segments/cuts of its own — it tracks the
+    // flattened `playheadTime` directly, the same tolerance-based resync
+    // rather than frame-accurate sample sync (see the prop's own doc
+    // comment).
+    const audio = audioRef.current;
+    if (audio && dubPreviewUrl && Math.abs(audio.currentTime - playheadTime) > 0.35) {
+      audio.currentTime = playheadTime;
+    }
+  }, [playheadTime, segments, phase, dubPreviewUrl]);
+
+  // Dub content only ever covers the main clip — pause it the instant we
+  // leave that phase (switching to an outro, or running out of content).
+  useEffect(() => {
+    if (phase !== 'main') audioRef.current?.pause();
+  }, [phase]);
 
   const handleTimeUpdate = () => {
     const video = videoRef.current;
@@ -456,8 +545,14 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
           ref={videoRef}
           playsInline
           style={activeImageClip ? { visibility: 'hidden' } : undefined}
-          onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
+          onPlay={() => {
+            setIsPlaying(true);
+            if (dubPreviewUrl && phaseRef.current === 'main') void audioRef.current?.play().catch(() => {});
+          }}
+          onPause={() => {
+            setIsPlaying(false);
+            audioRef.current?.pause();
+          }}
           onTimeUpdate={handleTimeUpdate}
           onEnded={handleEnded}
         >
@@ -469,6 +564,10 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
             })}
         </video>
         {activeImageClip && activeImageUrl && <img className="preview-still" src={activeImageUrl} alt="" />}
+        {/* No visible UI of its own — a secondary audio source kept in lockstep
+            with the main video for as long as a dub track is selected for
+            preview (see the play/pause sync above and the resync effect). */}
+        <audio ref={audioRef} className="dub-preview-audio" src={dubPreviewUrl ?? undefined} style={{ display: 'none' }} />
       </div>
 
       <div className="preview-controls">

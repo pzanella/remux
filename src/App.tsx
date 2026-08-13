@@ -15,6 +15,7 @@ import { useTranscoder } from './hooks/useTranscoder';
 import { useEditorSegments } from './hooks/useEditorSegments';
 import { useChapters } from './hooks/useChapters';
 import { useBatchTranscoder } from './hooks/useBatchTranscoder';
+import { readOpfsFile } from './hooks/usePersistence';
 import { isTrivialEdit } from './lib/segments';
 
 export default function App() {
@@ -53,6 +54,27 @@ export default function App() {
     () => (t.outroFile ? { file: t.outroFile.file, duration: t.outroFile.duration ?? 0, isImage: t.outroFile.isImage } : null),
     [t.outroFile],
   );
+
+  // Which dub-audio track (by OPFS filename) is selected for live preview —
+  // radio-style, at most one at a time (see MediaExtrasPanel's own toggle).
+  // `dubAudioTracks` only ever keeps the OPFS filename in memory (unlike
+  // intro/outro's `ClipFile`, which keeps a real `File`), so the selected
+  // track's bytes are resolved back into one asynchronously below.
+  const [dubPreviewTrackFileName, setDubPreviewTrackFileName] = useState<string | null>(null);
+  const [dubPreviewFile, setDubPreviewFile] = useState<File | null>(null);
+  useEffect(() => {
+    if (!dubPreviewTrackFileName || !t.dubAudioTracks.some((track) => track.fileName === dubPreviewTrackFileName)) {
+      setDubPreviewFile(null);
+      return;
+    }
+    let cancelled = false;
+    void readOpfsFile(dubPreviewTrackFileName).then((file) => {
+      if (!cancelled) setDubPreviewFile(file);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [dubPreviewTrackFileName, t.dubAudioTracks]);
 
   // Batch mode is a fully separate flow (see useBatchTranscoder's own doc
   // comment) — its own hook instance, never touching `t` at all, swapped in
@@ -243,6 +265,7 @@ export default function App() {
               subtitleTracks={t.subtitleTracks}
               subtitleVttTextByFile={t.subtitleVttTextByFile}
               chapters={chapters.chapters}
+              dubPreviewFile={dubPreviewFile}
             />
             <Timeline
               segments={editor.segments}
@@ -281,6 +304,8 @@ export default function App() {
               warning={dubAudioAbrWarning}
               error={t.dubAudioError}
               onClearError={t.clearDubAudioError}
+              previewTrackFileName={dubPreviewTrackFileName}
+              onSetPreviewTrackFileName={setDubPreviewTrackFileName}
             />
             <CaptionLane
               segments={editor.segments}

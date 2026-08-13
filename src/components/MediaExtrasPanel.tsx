@@ -42,6 +42,12 @@ interface MediaExtrasPanelProps {
    * a standing structural state rather than a one-off failure). */
   error?: string | null;
   onClearError?: () => void;
+  /** Which dub-audio track (by OPFS filename) is selected for live preview
+   * in `PreviewPane` — radio-style, at most one at a time (see App.tsx's
+   * own `dubPreviewTrackFileName` state and its OPFS-resolving effect).
+   * Toggling the same track off sets it back to `null`. */
+  previewTrackFileName?: string | null;
+  onSetPreviewTrackFileName?: (fileName: string | null) => void;
 }
 
 function FilePickerButton({
@@ -91,6 +97,8 @@ export default function MediaExtrasPanel({
   warning,
   error,
   onClearError,
+  previewTrackFileName,
+  onSetPreviewTrackFileName,
 }: MediaExtrasPanelProps) {
   const [expanded, setExpanded] = useState(false);
 
@@ -138,6 +146,24 @@ export default function MediaExtrasPanel({
                     onChange={(e) => onSetDubAudioTrackLanguage(track.fileName, e.target.value)}
                     title="BCP-47 language code, e.g. en, it, fr"
                   />
+                  {onSetPreviewTrackFileName && (
+                    <button
+                      type="button"
+                      className={
+                        'btn-quiet dub-preview-toggle' + (previewTrackFileName === track.fileName ? ' extras-preview-toggle--active' : '')
+                      }
+                      onClick={() =>
+                        onSetPreviewTrackFileName(previewTrackFileName === track.fileName ? null : track.fileName)
+                      }
+                      title={
+                        previewTrackFileName === track.fileName
+                          ? 'Stop previewing this dub track'
+                          : `Preview "${track.label}" in the player above (mutes the main audio)`
+                      }
+                    >
+                      {previewTrackFileName === track.fileName ? '◉ Previewing' : '○ Preview'}
+                    </button>
+                  )}
                 </div>
               ))}
               <div className="extras-row">
