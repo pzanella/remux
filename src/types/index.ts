@@ -166,6 +166,17 @@ export const ABR_LADDER: AbrRendition[] = [
   { height: 360, label: '360p', videoBitrateKbps: 800, audioBitrateKbps: 96 },
   { height: 480, label: '480p', videoBitrateKbps: 1400, audioBitrateKbps: 128 },
   { height: 720, label: '720p', videoBitrateKbps: 2800, audioBitrateKbps: 128 },
+  // 1080p/1440p/2160p continue the same non-linear real-world-ladder curve
+  // as the rungs above rather than a strict height*6 formula (that's
+  // `matchMainRendition`'s own separate heuristic for a one-off arbitrary
+  // height, not this curated ladder) — each roughly doubles the rung below
+  // it, in line with typical H.264 targets at each tier. `RenditionChips`
+  // already disables any rung above the source's own resolution
+  // automatically (see its own `tooLarge` check), so listing the full
+  // common range here doesn't risk offering an upscale by default.
+  { height: 1080, label: '1080p', videoBitrateKbps: 5000, audioBitrateKbps: 128 },
+  { height: 1440, label: '1440p', videoBitrateKbps: 9000, audioBitrateKbps: 128 },
+  { height: 2160, label: '2160p', videoBitrateKbps: 18000, audioBitrateKbps: 128 },
 ];
 
 // ── Worker messages ────────────────────────────────────────────────
