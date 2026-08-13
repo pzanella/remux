@@ -23,16 +23,20 @@ export default function App() {
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const previewRef = useRef<PreviewPaneHandle>(null);
 
-  // Dub-audio + edited (trimmed/split) segments works now on the fast path
-  // (see runSegmentedFastPath's own hasDubAudio handling) — the one
-  // remaining unsupported combination is that same pair *plus* adaptive
-  // bitrate (worker-side: runTranscoding's own guard), which is what this
-  // warns about before it can only be discovered as a hard export-time
-  // error.
+  // Dub-audio + edited (trimmed/split) segments, and dub-audio + intro/
+  // outro, both work now on the fast path (see runSegmentedFastPath's and
+  // spliceIntroOutro's own hasDubAudio handling) — the one remaining
+  // unsupported combination is either of those *plus* adaptive bitrate
+  // (worker-side: runTranscoding's own guard), which is what this warns
+  // about before it can only be discovered as a hard export-time error.
   const hasEditedSegments = t.sourceDuration !== undefined && !isTrivialEdit(editor.segments, t.sourceDuration);
-  const dubAudioAbrEditedWarning =
-    hasEditedSegments && t.abrEnabled && t.dubAudioTracks.length > 0
-      ? "Dub-audio tracks aren't supported together with a trimmed/split timeline on an adaptive-bitrate export yet — switch to a single quality, or remove one of the two."
+  const hasIntroOrOutro = !!(t.introFile || t.outroFile);
+  const dubAudioAbrBlockers = [hasEditedSegments && 'a trimmed/split timeline', hasIntroOrOutro && 'an attached intro/outro'].filter(
+    (s): s is string => !!s,
+  );
+  const dubAudioAbrWarning =
+    dubAudioAbrBlockers.length > 0 && t.abrEnabled && t.dubAudioTracks.length > 0
+      ? `Dub-audio tracks aren't supported together with ${dubAudioAbrBlockers.join(' or ')} on an adaptive-bitrate export yet — switch to a single quality, or remove one of the two.`
       : undefined;
 
   // PreviewPane's own reset effect keys off these objects' identity (to
@@ -265,7 +269,7 @@ export default function App() {
               onSelectDubAudioTrack={t.selectDubAudioTrack}
               onRemoveDubAudioTrack={t.removeDubAudioTrack}
               onSetDubAudioTrackLanguage={t.setDubAudioTrackLanguage}
-              warning={dubAudioAbrEditedWarning}
+              warning={dubAudioAbrWarning}
             />
             <CaptionLane
               segments={editor.segments}
