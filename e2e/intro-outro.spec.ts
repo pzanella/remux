@@ -119,6 +119,44 @@ test('plays an attached intro, then main content, then an attached outro, in seq
     .toBe(outroSrc);
 });
 
+test('the timeline playhead starts in the intro slot and hands off to the main track, mirroring the live preview phase', async ({ page }) => {
+  // The bug this covers: Timeline.tsx's own playhead only ever knew about
+  // `playheadTime` (main-content-relative), so with an intro attached it
+  // sat frozen at the main track's own 0% for the whole intro phase instead
+  // of reflecting where playback actually was.
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4'); // 2s
+  await attachIntro(page, 'intro.mp4'); // 1s
+  await attachOutro(page, 'outro.mp4'); // 1s
+
+  const introPlayhead = page.locator('.timeline-clip--intro .timeline-playhead');
+  const mainPlayhead = page.locator('.timeline-track > .timeline-playhead');
+
+  await expect(introPlayhead).toBeVisible();
+  await expect(introPlayhead).toHaveCSS('left', '0px');
+  await expect(mainPlayhead).toHaveCount(0);
+
+  await page.click('.transport-btn');
+
+  // Once the intro (1s) hands off, the main track's own playhead takes
+  // over and the intro's own disappears.
+  await expect(mainPlayhead).toBeVisible({ timeout: 5_000 });
+  await expect(introPlayhead).toHaveCount(0);
+
+  // ...and once main content (2s) hands off to the outro, the reverse.
+  const outroPlayhead = page.locator('.timeline-clip--outro .timeline-playhead');
+  await expect(outroPlayhead).toBeVisible({ timeout: 5_000 });
+  await expect(mainPlayhead).toHaveCount(0);
+});
+
+test('the timeline playhead starts directly on the main track when no intro is attached', async ({ page }) => {
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4');
+
+  await expect(page.locator('.timeline-track > .timeline-playhead')).toBeVisible();
+  await expect(page.locator('.timeline-playhead')).toHaveCount(1);
+});
+
 test('splits the timeline, then attaches an intro and outro on top of it — no longer mutually exclusive', async ({ page }, testInfo) => {
   await page.goto('/');
   await uploadSource(page, 'sample.mp4');

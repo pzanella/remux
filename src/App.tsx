@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import TopBar from './components/TopBar';
 import EmptyState from './components/EmptyState';
 import BatchQueue from './components/BatchQueue';
-import PreviewPane, { type PreviewPaneHandle } from './components/PreviewPane';
+import PreviewPane, { type PreviewPaneHandle, type Phase } from './components/PreviewPane';
 import Timeline from './components/Timeline';
 import CaptionLane from './components/CaptionLane';
 import ChapterRuler from './components/ChapterRuler';
@@ -24,6 +24,16 @@ export default function App() {
   const chapters = useChapters(t.sourceDuration);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const previewRef = useRef<PreviewPaneHandle>(null);
+
+  // Mirrors PreviewPane's own internal phase/phaseElapsed (see its own
+  // `onPhaseChange` doc comment) — Timeline's playhead has no other way to
+  // know intro/outro playback is happening at all, let alone how far in.
+  const [previewPhase, setPreviewPhase] = useState<Phase>('intro');
+  const [previewPhaseElapsed, setPreviewPhaseElapsed] = useState(0);
+  const handlePreviewPhaseChange = useCallback((phase: Phase, elapsed: number) => {
+    setPreviewPhase(phase);
+    setPreviewPhaseElapsed(elapsed);
+  }, []);
 
   // Dub-audio + edited (trimmed/split) segments, and dub-audio + intro/
   // outro, both work now on the fast path (see runSegmentedFastPath's and
@@ -266,6 +276,7 @@ export default function App() {
               subtitleVttTextByFile={t.subtitleVttTextByFile}
               chapters={chapters.chapters}
               dubPreviewFile={dubPreviewFile}
+              onPhaseChange={handlePreviewPhaseChange}
             />
             <Timeline
               segments={editor.segments}
@@ -295,6 +306,8 @@ export default function App() {
               onSetOutroImageDuration={t.setOutroImageDuration}
               introOutroError={t.introOutroError}
               onClearIntroOutroError={t.clearIntroOutroError}
+              activePhase={previewPhase}
+              phaseElapsed={previewPhaseElapsed}
             />
             <MediaExtrasPanel
               dubAudioTracks={t.dubAudioTracks}

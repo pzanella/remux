@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { type EditorSegment, flattenedDuration, segmentDuration, segmentOffsets, trimSegmentEnd, trimSegmentStart } from '../lib/segments';
 import { NATIVE_ACCEPT } from './MediaExtrasPanel';
+import type { Phase } from './PreviewPane';
 
 /** A curated warm-orange/teal spread (the two brand colors plus a few
  * in-between tones) rather than a full hue wheel — clip colors need to stay
@@ -52,6 +53,12 @@ interface IntroOutroSlotProps {
   onSelect: (file: File) => void;
   onClear: () => void;
   onSetHoldDuration: (seconds: number) => void;
+  /** Whether the live preview is currently playing *this* slot's own clip
+   * (`PreviewPane`'s own `phase`, surfaced through App.tsx) — when true,
+   * shows a playhead reusing the same `.timeline-playhead` markup the main
+   * track uses, positioned by `phaseElapsed / clip.duration`. */
+  isActivePhase: boolean;
+  phaseElapsed: number;
 }
 
 /**
@@ -67,7 +74,7 @@ interface IntroOutroSlotProps {
  * file drop, the same two ways `EmptyState`'s own dropzone already accepts
  * the very first source file.
  */
-function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDuration }: IntroOutroSlotProps) {
+function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDuration, isActivePhase, phaseElapsed }: IntroOutroSlotProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isOver, setIsOver] = useState(false);
   const label = kind === 'intro' ? 'Intro' : 'Outro';
@@ -126,6 +133,12 @@ function IntroOutroSlot({ kind, clip, disabled, onSelect, onClear, onSetHoldDura
             ✕
           </button>
         </div>
+
+        {isActivePhase && clip.duration && clip.duration > 0 && (
+          <div className="timeline-playhead" style={{ left: `${Math.min(100, (phaseElapsed / clip.duration) * 100)}%` }}>
+            <span className="timeline-playhead-badge">{formatDuration(phaseElapsed)}</span>
+          </div>
+        )}
       </div>
     );
   }
@@ -209,6 +222,14 @@ interface TimelineProps {
    * the same message always reaching `ToastStack` too. Dismissable. */
   introOutroError?: string | null;
   onClearIntroOutroError?: () => void;
+  /** `PreviewPane`'s own current phase/phase-relative elapsed time (see its
+   * own `onPhaseChange` doc comment), surfaced through App.tsx — drives
+   * which playhead is shown: the main track's own when `'main'` (also the
+   * default, so a caller with no intro/outro attached — or one that
+   * doesn't pass this at all — sees exactly the prior behavior), or the
+   * relevant `IntroOutroSlot`'s own when `'intro'`/`'outro'`. */
+  activePhase?: Phase;
+  phaseElapsed?: number;
 }
 
 /**
@@ -248,6 +269,8 @@ export default function Timeline({
   onSetOutroImageDuration,
   introOutroError,
   onClearIntroOutroError,
+  activePhase = 'main',
+  phaseElapsed = 0,
 }: TimelineProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
@@ -339,6 +362,8 @@ export default function Timeline({
           onSelect={onSelectIntroFile}
           onClear={onClearIntroFile}
           onSetHoldDuration={onSetIntroImageDuration}
+          isActivePhase={activePhase === 'intro'}
+          phaseElapsed={phaseElapsed}
         />
 
         <div className="timeline-track" ref={trackRef} onPointerDown={handleTrackPointerDown}>
@@ -448,7 +473,7 @@ export default function Timeline({
             );
           })}
 
-          {totalDuration > 0 && (
+          {activePhase === 'main' && totalDuration > 0 && (
             <div className="timeline-playhead" style={{ left: `${playheadPercent}%` }}>
               <span className="timeline-playhead-badge">{formatDuration(playheadTime)}</span>
             </div>
@@ -462,6 +487,8 @@ export default function Timeline({
           onSelect={onSelectOutroFile}
           onClear={onClearOutroFile}
           onSetHoldDuration={onSetOutroImageDuration}
+          isActivePhase={activePhase === 'outro'}
+          phaseElapsed={phaseElapsed}
         />
       </div>
     </div>

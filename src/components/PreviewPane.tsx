@@ -64,6 +64,14 @@ interface PreviewPaneProps {
    * track (like its export-time counterpart) tracks the flattened output
    * position, not the source file's own time across a cut. */
   dubPreviewFile?: File | null;
+  /** Fired on every change to which of the three real sources is currently
+   * loaded/playing and how far into it — `Timeline.tsx`'s own playhead has
+   * no other way to reflect intro/outro playback (their position lives
+   * entirely locally in this component; see `Phase`'s own doc comment).
+   * Fires as often as `onPlayheadChange` does during main playback (i.e.
+   * on every `timeupdate`/image-clock tick), not just on phase transitions —
+   * consumers that only care about transitions should diff it themselves. */
+  onPhaseChange?: (phase: Phase, elapsed: number) => void;
 }
 
 function formatTimecode(seconds: number): string {
@@ -81,7 +89,7 @@ function formatTimecode(seconds: number): string {
  * position (`phaseElapsed` below) lives entirely locally in this component
  * instead — there's nothing for it to synchronize against elsewhere, since
  * intro/outro have no cues/chapters/split points of their own. */
-type Phase = 'intro' | 'main' | 'outro';
+export type Phase = 'intro' | 'main' | 'outro';
 
 /** A native `<video>` playing straight from the loaded `sourceFile` for the
  * main-content phase — driven entirely by the flattened (post-edit)
@@ -110,6 +118,7 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
     subtitleVttTextByFile = {},
     chapters = [],
     dubPreviewFile = null,
+    onPhaseChange,
   },
   ref,
 ) {
@@ -145,6 +154,16 @@ const PreviewPane = forwardRef<PreviewPaneHandle, PreviewPaneProps>(function Pre
   const [phaseElapsed, setPhaseElapsed] = useState(0);
   const rafRef = useRef<number | null>(null);
   const rafLastTsRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    onPhaseChange?.(phase, phaseElapsed);
+    // `onPhaseChange` deliberately left out — an inline callback from the
+    // parent would be a new function identity every render, and re-running
+    // this on every parent re-render (rather than only on a genuine
+    // phase/elapsed change) would defeat the point of tracking them as
+    // deps at all; it still always calls the *current* render's callback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, phaseElapsed]);
 
   const sourceUrlRef = useRef<string | null>(null);
   const introUrlRef = useRef<string | null>(null);
