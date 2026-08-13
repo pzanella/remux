@@ -350,6 +350,8 @@ export default function App() {
               outputFolderHandle={t.outputFolder}
               isComplete={t.status === 'complete'}
               dashManifestFilename={t.outputContainer === 'fmp4' ? 'manifest.mpd' : undefined}
+              introDurationSec={t.introFile?.duration}
+              outroDurationSec={t.outroFile?.duration}
             />
           </div>
         )}

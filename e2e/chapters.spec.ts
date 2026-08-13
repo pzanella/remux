@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { uploadSource, addChapter, attachIntro, splitTimelineAt, runExport, downloadZip, listZipEntries, readZipEntryText } from './helpers';
+import { uploadSource, addChapter, attachIntro, attachOutro, splitTimelineAt, runExport, downloadZip, listZipEntries, readZipEntryText } from './helpers';
 
 test('a dropped chapter warns via a hover/click popup, not just an inert badge', async ({ page }) => {
   // The bug this covers: the old warning was a bare span with a native
@@ -131,6 +131,52 @@ test('a chapter after an attached intro is offset to the real spliced output pos
   expect(startSec).toBeGreaterThanOrEqual(1); // never below the 1s intro offset
   expect(startSec).toBeLessThan(1.1); // and close to it — this is the bug's own regression bar
   expect(endSec).toBeCloseTo(3, 1); // introDuration(1) + mainDuration(2)
+});
+
+test('the Shaka seek bar shows a real inter-chapter tick but not one at the intro/outro splice points', async ({ page }) => {
+  // The bug this covers: chapters only ever span the main content (never
+  // intro/outro — see lib/chapters.ts's own top comment), so the very
+  // first chapter's own start and the very last chapter's own end always
+  // land exactly on the intro/outro splice points once either is attached
+  // — Shaka's own built-in seek-bar chapter ticks have no way to know that
+  // and drew a real-looking tick right there, which read as a separate
+  // "intro/outro marker". A genuine transition between two chapters the
+  // user actually placed must still show up.
+  await page.goto('/');
+  await uploadSource(page, 'sample.mp4'); // 2s
+  await attachIntro(page, 'intro.mp4'); // 1s
+  await attachOutro(page, 'outro.mp4'); // 1s
+
+  const track = page.locator('.timeline-track');
+  const box = await track.boundingBox();
+  if (!box) throw new Error('.timeline-track not found');
+  await track.click({ position: { x: 10, y: box.height / 2 } });
+  await addChapter(page, 'First Half'); // main-content time ~0
+  await track.click({ position: { x: box.width * 0.5, y: box.height / 2 } });
+  await addChapter(page, 'Second Half'); // main-content time ~1s (the real, internal boundary)
+
+  const result = await runExport(page);
+  expect(result).toBe('done');
+  await page.click('.export-modal-close');
+
+  const seekBar = page.locator('.shaka-seek-bar-container, .shaka-seek-bar').first();
+  await seekBar.waitFor({ timeout: 10_000 });
+
+  let ticks: string[] = [];
+  for (let attempt = 0; attempt < 10 && ticks.length === 0; attempt++) {
+    ticks = await page.locator('.player-chapter-tick').evaluateAll((els) => els.map((e) => (e as { style: { left: string } }).style.left));
+    if (ticks.length === 0) await page.waitForTimeout(1_500);
+  }
+  // 1s intro + ~1s into a 2s main content = ~2s of a 4s total = ~50%. Exactly
+  // one tick — nothing at 25% (the intro/main splice) or 75% (main/outro).
+  expect(ticks).toHaveLength(1);
+  expect(parseFloat(ticks[0])).toBeGreaterThan(40);
+  expect(parseFloat(ticks[0])).toBeLessThan(60);
+
+  // Shaka's own built-in chapter-tick coloring is disabled — this component
+  // now owns `.shaka-chapter-markers` itself (see Player.tsx's own
+  // `applyChapterTicks`).
+  await expect(page.locator('.shaka-chapter-markers')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
 });
 
 test('shows the real chapter title in Shaka Player\'s native Chapters menu', async ({ page }) => {

@@ -496,6 +496,24 @@ body {
   font-size: 0.78rem;
 }
 
+/* Chapter-boundary ticks on Shaka's own seek bar (see Player.tsx's own
+   applyChapterTicks) — drawn into Shaka's own `.shaka-chapter-markers`
+   overlay in place of its built-in (and, once intro/outro splicing is
+   involved, sometimes misleading — see that function's own doc comment)
+   ones. Same amber this app already uses for every other boundary marker
+   (PreviewPane's own .scrub-bar-marker, Timeline's own overview ruler),
+   not Shaka's arbitrary default red, for visual consistency across the
+   whole app rather than just matching whatever Shaka ships with. */
+.player-chapter-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--warning);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
 /* ── Top bar ── */
 .topbar {
   display: flex;

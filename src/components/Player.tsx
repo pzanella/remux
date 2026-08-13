@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import shaka from 'shaka-player/dist/shaka-player.ui';
 import 'shaka-player/dist/controls.css';
+import { retryUntilCancelled } from '../lib/retry';
 
 const SCHEME = 'localdir';
 const MANIFEST_URI = `${SCHEME}://root/__manifest__.m3u8`;
@@ -92,20 +93,96 @@ async function loadThumbnailsTrack(player: shaka.Player, dirHandle: FileSystemDi
 /** `generateThumbnailSprite` in remux.worker.ts runs as a fire-and-forget
  * background task, deliberately not blocking the main export (see its own
  * comment) — so the sprite may well not exist yet the instant this player
- * first loads, especially for a fast native-remux job that can finish
- * before an FFmpeg-based background task does. Retries a few times on a
- * fixed interval rather than giving up after one miss, so a live preview
- * (or a fast job's final result) still picks up thumbnails once they land,
- * not just a slow job's. Stops as soon as it succeeds, `isCancelled()`
- * turns true (component unmounted / a new load superseded this one), or
- * attempts run out — whichever comes first. */
+ * first loads, especially for a fast native-remux job (fast is exactly what
+ * the whole splice/segment path — including intro/outro — stays even with
+ * that work added on top, all still Rust/WASM, no FFmpeg) that finishes
+ * near-instantly while the FFmpeg-based sprite pass is still running.
+ *
+ * The retry budget used to be a short, fixed ~18s window (5 attempts) —
+ * confirmed empirically that generation for even this project's own tiny
+ * (2s) test fixture can still be mid-flight by then (each of up to
+ * `THUMBNAIL_MAX_TILES` tiles is its own sequential `ffmpeg.exec()` call,
+ * with a full FFmpeg-core reload every `FFMPEG_CALLS_PER_INSTANCE` of them —
+ * see both in remux.worker.ts), so a real, longer source has no trouble
+ * blowing well past 18s. The old behavior wasn't a bug in the generation
+ * itself (it always finished, and did land in the exported ZIP once it
+ * did) — it just gave up watching for it too early, which reads identically
+ * to "thumbnails were never generated" from the UI with no error anywhere
+ * to explain why, since nothing actually failed.
+ *
+ * Retries on a capped-exponential backoff with *no attempt limit* instead —
+ * checking is cheap (three tiny OPFS reads), the alternative of guessing
+ * another fixed timeout just moves the same failure mode to a longer video,
+ * and `isCancelled()` (component unmounted / a new load superseding this
+ * one) is still the real stop condition, exactly as before. */
 async function loadThumbnailsTrackWithRetry(player: shaka.Player, dirHandle: FileSystemDirectoryHandle, isCancelled: () => boolean): Promise<void> {
-  const RETRY_DELAYS_MS = [500, 1500, 3000, 5000, 8000];
-  if (await loadThumbnailsTrack(player, dirHandle)) return;
-  for (const delay of RETRY_DELAYS_MS) {
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    if (isCancelled()) return;
-    if (await loadThumbnailsTrack(player, dirHandle)) return;
+  await retryUntilCancelled(() => loadThumbnailsTrack(player, dirHandle), isCancelled, { initialDelayMs: 500, maxDelayMs: 20000 });
+}
+
+/**
+ * Draws chapter-boundary ticks on the seek bar ourselves, instead of
+ * Shaka's own built-in ones (disabled via `seekBarColors.chapters =
+ * 'transparent'` where the player is created below — see that call site's
+ * own comment for why).
+ *
+ * Chapters only ever refer to the main content clip, never an attached
+ * intro/outro (see lib/chapters.ts's own top comment) — so the *first*
+ * chapter's own start and the *last* chapter's own end always land exactly
+ * on the intro/outro splice points whenever either is attached, landing
+ * strictly inside the real seekable range instead of at its edges. Shaka's
+ * own tick logic only ever suppresses a boundary that's at the seek range's
+ * own start/end (the normal, no-intro/outro case, where a chapter set
+ * spanning the whole video naturally has its own outer edges there too) —
+ * it has no way to know the *content's* own start/end have shifted inward,
+ * so it drew a real-looking tick at each splice point, which is what
+ * actually looked like a separate "intro/outro marker" in the first place.
+ * Every other candidate point (a real transition between two chapters the
+ * user actually placed) is kept exactly as Shaka's own logic would show it.
+ */
+function applyChapterTicks(
+  container: HTMLElement,
+  chapters: shaka.extern.Chapter[],
+  seekRange: { start: number; end: number },
+  introDurationSec: number,
+  outroDurationSec: number,
+) {
+  const markerContainer = container.querySelector<HTMLElement>('.shaka-chapter-markers');
+  if (!markerContainer) return;
+  markerContainer.innerHTML = '';
+
+  const span = seekRange.end - seekRange.start;
+  if (!(span > 0)) return;
+
+  // The intro/main splice point is at introDurationSec into the real
+  // output; the main/outro one is outroDurationSec back from the real end
+  // (seekRange.end) — not from the main content's own duration, which this
+  // function has no reason to know at all.
+  const introBoundarySec = seekRange.start + introDurationSec;
+  const outroBoundarySec = seekRange.end - outroDurationSec;
+  // Just generous enough to absorb real sub-frame/rounding drift between a
+  // client-probed clip duration and what actually lands in the exported
+  // manifest's own segment durations (millisecond-scale for a native,
+  // stream-copied clip, not the much coarser slop dub-audio's own
+  // TOLERANCE_SEC allows for a completely different purpose — whole-track
+  // audio/video sync, not splice-point detection) — wide enough for that,
+  // deliberately not any wider, so a chapter a user genuinely placed close
+  // to the splice point still gets its own real tick instead of being
+  // mistaken for the boundary itself.
+  const SPLICE_EPSILON_SEC = 0.15;
+  const isSpliceBoundary = (t: number) => Math.abs(t - introBoundarySec) < SPLICE_EPSILON_SEC || Math.abs(t - outroBoundarySec) < SPLICE_EPSILON_SEC;
+
+  const points = new Set<number>();
+  for (const chapter of chapters) {
+    if (chapter.startTime < seekRange.start || chapter.startTime > seekRange.end) continue;
+    if (chapter.startTime > seekRange.start && !isSpliceBoundary(chapter.startTime)) points.add(chapter.startTime);
+    if (chapter.endTime && chapter.endTime < seekRange.end - 1 && !isSpliceBoundary(chapter.endTime)) points.add(chapter.endTime);
+  }
+
+  for (const point of points) {
+    const tick = document.createElement('div');
+    tick.className = 'player-chapter-tick';
+    tick.style.left = `${((point - seekRange.start) / span) * 100}%`;
+    markerContainer.appendChild(tick);
   }
 }
 
@@ -124,22 +201,35 @@ async function loadThumbnailsTrackWithRetry(player: shaka.Player, dirHandle: Fil
  * the worker), so this fails every attempt and gives up silently for those
  * — same "optional, non-fatal" tolerance as thumbnails.
  */
-async function loadChaptersTrack(player: shaka.Player): Promise<boolean> {
+async function loadChaptersTrack(
+  player: shaka.Player,
+  container: HTMLElement,
+  introDurationSec: number,
+  outroDurationSec: number,
+): Promise<boolean> {
   try {
     await player.addChaptersTrack(`${URI_PREFIX}chapters.vtt`, 'en');
+    const chapters = await player.getChaptersAsync('en');
+    applyChapterTicks(container, chapters, player.seekRange(), introDurationSec, outroDurationSec);
     return true;
   } catch {
     return false;
   }
 }
 
-async function loadChaptersTrackWithRetry(player: shaka.Player, isCancelled: () => boolean): Promise<void> {
+async function loadChaptersTrackWithRetry(
+  player: shaka.Player,
+  container: HTMLElement,
+  introDurationSec: number,
+  outroDurationSec: number,
+  isCancelled: () => boolean,
+): Promise<void> {
   const RETRY_DELAYS_MS = [500, 1500, 3000, 5000, 8000];
-  if (await loadChaptersTrack(player)) return;
+  if (await loadChaptersTrack(player, container, introDurationSec, outroDurationSec)) return;
   for (const delay of RETRY_DELAYS_MS) {
     await new Promise((resolve) => setTimeout(resolve, delay));
     if (isCancelled()) return;
-    if (await loadChaptersTrack(player)) return;
+    if (await loadChaptersTrack(player, container, introDurationSec, outroDurationSec)) return;
   }
 }
 
@@ -158,13 +248,27 @@ interface PlayerProps {
    * in-progress version to track live.
    */
   dashManifestFilename?: string;
+  /** An attached intro/outro's own duration, if any — used purely to keep
+   * the seek bar's own chapter ticks from misrepresenting the intro/outro
+   * splice points as chapter boundaries (see `applyChapterTicks`'s own doc
+   * comment). Not needed for anything else here — chapters.vtt itself is
+   * already correctly offset by the worker (see writeChaptersVtt). */
+  introDurationSec?: number;
+  outroDurationSec?: number;
 }
 
-export default function Player({ m3u8Content, outputFolderHandle, isComplete, dashManifestFilename }: PlayerProps) {
+export default function Player({ m3u8Content, outputFolderHandle, isComplete, dashManifestFilename, introDurationSec = 0, outroDurationSec = 0 }: PlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<shaka.Player | null>(null);
   const uiRef = useRef<shaka.ui.Overlay | null>(null);
+  // Whatever the most recent `player.load()` call's own promise is — the
+  // post-completion reload effect further down awaits this before issuing
+  // its own `load()` call. Calling `load()` again on the same player while
+  // an earlier one is still in flight doesn't queue behind it; it
+  // interrupts the first with a LOAD_INTERRUPTED error and leaves playback
+  // broken outright (confirmed empirically — shaka.util.Error code 7000).
+  const loadPromiseRef = useRef<Promise<unknown> | null>(null);
   const manifestContentRef = useRef(m3u8Content);
   manifestContentRef.current = m3u8Content;
   const useDash = !!dashManifestFilename;
@@ -230,9 +334,19 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
       });
 
       uiRef.current = new shaka.ui.Overlay(player, containerRef.current!, videoRef.current!);
+      // Disables Shaka's own built-in chapter-tick rendering (the seek
+      // bar's `.shaka-chapter-markers` overlay, colored red by default) —
+      // `applyChapterTicks` draws into that exact same element itself,
+      // filtered to exclude the intro/outro splice points (see its own doc
+      // comment for why those need excluding). Once this config value is
+      // transparent, Shaka's own tick logic sets that element blank and
+      // stops touching it for good — safe to then own it ourselves.
+      uiRef.current.configure({ seekBarColors: { chapters: 'transparent' } });
 
       try {
-        await player.load(useDash ? `${URI_PREFIX}${dashManifestFilename}` : MANIFEST_URI);
+        const loadPromise = player.load(useDash ? `${URI_PREFIX}${dashManifestFilename}` : MANIFEST_URI);
+        loadPromiseRef.current = loadPromise;
+        await loadPromise;
         if (cancelled) return;
         videoRef.current?.play().catch(() => {
           // Autoplay may be blocked; the user can press play.
@@ -244,8 +358,10 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
         void loadThumbnailsTrackWithRetry(player, outputFolderHandle, () => cancelled);
         // Chapter markers (see writeChaptersVtt in remux.worker.ts) — same
         // "appears automatically once added" deal as thumbnails above, this
-        // time powering Shaka's Chapters overflow-menu entry.
-        void loadChaptersTrackWithRetry(player, () => cancelled);
+        // time powering Shaka's Chapters overflow-menu entry (and this
+        // component's own seek-bar ticks, see loadChaptersTrack's own doc
+        // comment).
+        void loadChaptersTrackWithRetry(player, containerRef.current!, introDurationSec, outroDurationSec, () => cancelled);
         // `load()` resolving isn't proof playback actually works: WebKit's
         // MediaSource can silently accept a segment append that never
         // produces decodable data (confirmed against a real MPEG-TS HLS
@@ -292,7 +408,79 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
     // on its own timer. `hasContent` only flips once, false→true, the
     // moment there's anything to load at all — which is the one transition
     // that actually needs a fresh player.
+    //
+    // `introDurationSec`/`outroDurationSec` are deliberately excluded too,
+    // same reasoning as `m3u8Content` above: they're stable for the whole
+    // life of a given export result (intro/outro isn't editable once
+    // there's something to preview here at all), only ever read once to
+    // seed `loadChaptersTrackWithRetry`'s own closure — not something a
+    // change to should tear the whole player down and rebuild over.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasContent, outputFolderHandle, destroyPlayer, useDash, dashManifestFilename]);
+
+  // The manifest text can genuinely change *shape*, not just grow, once a
+  // job finishes: intro/outro splicing (see spliceIntroOutro in
+  // remux.worker.ts) only ever runs *after* the per-segment loop that
+  // first makes `hasContent` true above, rewriting the whole thing (intro
+  // segments prepended, outro appended) rather than appending more
+  // segments the way a real live HLS update would. Confirmed empirically:
+  // for an unedited source plus an attached intro/outro, the very first
+  // per-segment manifest already carries its own #EXT-X-ENDLIST (a single-
+  // segment "live" job finishes its own loop almost instantly) — once
+  // Shaka's own re-poll logic sees that, it stops polling for good, so it
+  // never picks up the real, later, spliced-in version at all. The result:
+  // `player.seekRange()` stayed stuck reporting just the main content's own
+  // duration for the rest of the session, with no way to seek into the
+  // outro at all from this "done" screen's own seek bar.
+  //
+  // Re-loading the *same* player instance (not tearing the whole thing
+  // down and rebuilding it — that's what the WebKit re-attach hang the big
+  // load effect above documents is about) exactly once, right as the job
+  // transitions to actually complete, forces Shaka to re-parse whatever
+  // `manifestContentRef` holds by then, which is always the real, final
+  // text (every COMPLETE event's own `m3u8` field is written *after*
+  // intro/outro splicing — see runWithHandle/runSegmentedFastPath). A no-op
+  // (bar a harmless brief reload) whenever the content never needed it —
+  // e.g. no intro/outro attached — since the text ends up identical either
+  // way.
+  useEffect(() => {
+    if (!isComplete || useDash || !playerRef.current || !outputFolderHandle || !containerRef.current) return;
+    const player = playerRef.current;
+    const container = containerRef.current;
+    let cancelled = false;
+    void (async () => {
+      // Wait for whatever load() call is already in flight (the initial
+      // one, almost always, for how quickly this can fire on a fast job) to
+      // settle before issuing this one — see `loadPromiseRef`'s own doc
+      // comment for why a second concurrent call breaks playback outright
+      // instead of queueing behind the first.
+      if (loadPromiseRef.current) await loadPromiseRef.current.catch(() => {});
+      if (cancelled) return;
+
+      try {
+        const reloadPromise = player.load(MANIFEST_URI);
+        loadPromiseRef.current = reloadPromise;
+        await reloadPromise;
+        if (cancelled) return;
+        videoRef.current?.play().catch(() => {
+          // Autoplay may be blocked; the user can press play.
+        });
+        // `load()` drops whatever text tracks the pre-reload player had —
+        // both need re-adding against the now-correct (post-splice)
+        // manifest, the same way the initial load establishes them.
+        void loadThumbnailsTrackWithRetry(player, outputFolderHandle, () => cancelled);
+        void loadChaptersTrackWithRetry(player, container, introDurationSec, outroDurationSec, () => cancelled);
+      } catch {
+        // Best-effort — playerError already covers a genuinely broken
+        // player elsewhere; this just leaves whatever was already playing
+        // as it was rather than surfacing a second error path for it.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- introDurationSec/outroDurationSec stable per session, same reasoning as the big load effect above.
+  }, [isComplete, useDash, outputFolderHandle]);
 
   useEffect(() => () => destroyPlayer(), [destroyPlayer]);
 
