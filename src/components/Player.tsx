@@ -113,8 +113,21 @@ async function loadThumbnailsTrack(player: shaka.Player, dirHandle: FileSystemDi
  * another fixed timeout just moves the same failure mode to a longer video,
  * and `isCancelled()` (component unmounted / a new load superseding this
  * one) is still the real stop condition, exactly as before. */
-async function loadThumbnailsTrackWithRetry(player: shaka.Player, dirHandle: FileSystemDirectoryHandle, isCancelled: () => boolean): Promise<void> {
-  await retryUntilCancelled(() => loadThumbnailsTrack(player, dirHandle), isCancelled, { initialDelayMs: 500, maxDelayMs: 20000 });
+async function loadThumbnailsTrackWithRetry(
+  player: shaka.Player,
+  dirHandle: FileSystemDirectoryHandle,
+  isCancelled: () => boolean,
+  onLoaded: () => void,
+): Promise<void> {
+  await retryUntilCancelled(
+    async () => {
+      const loaded = await loadThumbnailsTrack(player, dirHandle);
+      if (loaded) onLoaded();
+      return loaded;
+    },
+    isCancelled,
+    { initialDelayMs: 500, maxDelayMs: 20000 },
+  );
 }
 
 /**
@@ -265,6 +278,11 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
   // effect below only creates a new one for a genuinely new session.
   const loadedHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
+  // Surfaces the same "still generating" window loadThumbnailsTrackWithRetry
+  // already tolerates (a few seconds, occasionally longer for a real
+  // source — see its own doc comment) instead of leaving a silent gap where
+  // hovering the seek bar shows nothing and reads as broken.
+  const [thumbnailsReady, setThumbnailsReady] = useState(false);
 
   const destroyPlayer = useCallback(() => {
     void uiRef.current?.destroy();
@@ -291,6 +309,7 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
 
       destroyPlayer();
       setPlayerError(null);
+      setThumbnailsReady(false);
       registerLocalDirScheme(outputFolderHandle, () => manifestContentRef.current);
 
       const player = new shaka.Player();
@@ -337,7 +356,7 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
         // remux.worker.ts and loadThumbnailsTrackWithRetry's own doc
         // comment above) — the seek bar's own hover preview picks this up
         // automatically once added, no further wiring needed here.
-        void loadThumbnailsTrackWithRetry(player, outputFolderHandle, () => cancelled);
+        void loadThumbnailsTrackWithRetry(player, outputFolderHandle, () => cancelled, () => setThumbnailsReady(true));
         // Chapter markers (see writeChaptersVtt in remux.worker.ts) — same
         // "appears automatically once added" deal as thumbnails above, this
         // time powering Shaka's Chapters overflow-menu entry (and this
@@ -391,7 +410,17 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
           <span className="section-label">{useDash ? 'DASH result' : 'HLS result'}</span>
           <span className="preview-badge preview-badge--final">Packaged</span>
         </span>
-        {isReady && <span className="status-line is-done">Ready</span>}
+        {isReady && (
+          // A single wrapping element, not two siblings, so this row's own
+          // 2-column grid (see .panel-row--split) never sees a 3rd top-level
+          // child — that auto-wrapped into a second grid row whenever both
+          // status lines were present at once, shifting the seek bar down
+          // and then back up the instant thumbnail generation finished.
+          <span className="status-line-group">
+            <span className="status-line is-done">Ready</span>
+            {!thumbnailsReady && <span className="status-line is-active">Generating thumbnails…</span>}
+          </span>
+        )}
       </div>
 
       {playerError ? (

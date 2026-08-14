@@ -145,6 +145,12 @@ body {
   gap: 0.5rem;
 }
 
+.status-line-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .preview-badge {
   display: inline-flex;
   align-items: center;

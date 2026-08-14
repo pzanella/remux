@@ -105,6 +105,12 @@ test('shows a real thumbnail preview on seek-bar hover, via Shaka Player\'s own 
   expect(result).toBe('done');
   await page.click('.export-modal-close');
 
+  // generateThumbnailSprite is still fire-and-forget in the worker at this
+  // point — the result screen says so up front instead of leaving a silent
+  // gap where hovering the seek bar shows nothing and reads as broken.
+  const generatingLabel = page.locator('.status-line', { hasText: 'Generating thumbnails' });
+  await expect(generatingLabel).toBeVisible();
+
   const seekBar = page.locator('.shaka-seek-bar-container, .shaka-seek-bar').first();
   await seekBar.waitFor({ timeout: 10_000 });
   const box = await seekBar.boundingBox();
@@ -129,4 +135,5 @@ test('shows a real thumbnail preview on seek-bar hover, via Shaka Player\'s own 
   }
   expect(naturalWidth).toBeGreaterThan(0);
   await expect(thumbnailImage).toHaveAttribute('src', /^blob:/);
+  await expect(generatingLabel).toHaveCount(0);
 });
