@@ -84,8 +84,8 @@ async function loadThumbnailsTrack(player: shaka.Player, dirHandle: FileSystemDi
   } catch {
     // Optional feature — see this function's own doc comment. Doesn't
     // distinguish "file doesn't exist yet" from any other failure; the
-    // caller's own retry loop treats every failure the same way (try
-    // again later, give up eventually).
+    // caller's own retry loop treats every failure the same way (try again
+    // later).
     return false;
   }
 }
@@ -93,9 +93,7 @@ async function loadThumbnailsTrack(player: shaka.Player, dirHandle: FileSystemDi
 /** `generateThumbnailSprite` in remux.worker.ts runs as a fire-and-forget
  * background task, deliberately not blocking the main export (see its own
  * comment) — so the sprite may well not exist yet the instant this player
- * first loads, especially for a fast native-remux job (fast is exactly what
- * the whole splice/segment path — including intro/outro — stays even with
- * that work added on top, all still Rust/WASM, no FFmpeg) that finishes
+ * first loads, especially for a fast native-remux job that finishes
  * near-instantly while the FFmpeg-based sprite pass is still running.
  *
  * The retry budget used to be a short, fixed ~18s window (5 attempts) —
@@ -237,16 +235,9 @@ interface PlayerProps {
   m3u8Content: string;
   outputFolderHandle: FileSystemDirectoryHandle | null;
   isComplete: boolean;
-  /**
-   * When set (e.g. `'manifest.mpd'`), preview via this DASH manifest
-   * instead of the HLS live-preview flow below — read directly from
-   * `outputFolderHandle` once the job is done, the same way any other
-   * referenced file already is (see `registerLocalDirScheme`), rather
-   * than through `manifestContentRef`'s in-memory text: unlike the HLS
-   * media playlist, this project's DASH manifest is only ever written
-   * once, at the very end (see runFmp4FastPath), so there's no
-   * in-progress version to track live.
-   */
+  /** When set (e.g. `'manifest.mpd'`), read this DASH manifest directly
+   * from `outputFolderHandle` (see `registerLocalDirScheme`) instead of the
+   * in-memory `m3u8Content` text the HLS path uses. */
   dashManifestFilename?: string;
   /** An attached intro/outro's own duration, if any — used purely to keep
    * the seek bar's own chapter ticks from misrepresenting the intro/outro
@@ -262,21 +253,14 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<shaka.Player | null>(null);
   const uiRef = useRef<shaka.ui.Overlay | null>(null);
-  // Whatever the most recent `player.load()` call's own promise is — the
-  // post-completion reload effect further down awaits this before issuing
-  // its own `load()` call. Calling `load()` again on the same player while
-  // an earlier one is still in flight doesn't queue behind it; it
-  // interrupts the first with a LOAD_INTERRUPTED error and leaves playback
-  // broken outright (confirmed empirically — shaka.util.Error code 7000).
-  const loadPromiseRef = useRef<Promise<unknown> | null>(null);
   const manifestContentRef = useRef(m3u8Content);
   manifestContentRef.current = m3u8Content;
   const useDash = !!dashManifestFilename;
-  // Only whether there's *any* content yet, not the string itself, drives
-  // the load effect below — see its dependency array for why. DASH has no
-  // such string to watch (see `dashManifestFilename` above), so "ready"
-  // just means "the job is done".
-  const hasContent = useDash ? isComplete : m3u8Content.length > 0;
+  // No live preview during an in-progress conversion — the player only
+  // ever loads once the job is actually done, when `m3u8Content` already
+  // holds its own final, complete text (see the COMPLETE event handler in
+  // useTranscoder.ts, which sets both together).
+  const hasContent = isComplete;
   // Which folder handle the current Shaka player was built for, so the
   // effect below only creates a new one for a genuinely new session.
   const loadedHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
@@ -344,9 +328,7 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
       uiRef.current.configure({ seekBarColors: { chapters: 'transparent' } });
 
       try {
-        const loadPromise = player.load(useDash ? `${URI_PREFIX}${dashManifestFilename}` : MANIFEST_URI);
-        loadPromiseRef.current = loadPromise;
-        await loadPromise;
+        await player.load(useDash ? `${URI_PREFIX}${dashManifestFilename}` : MANIFEST_URI);
         if (cancelled) return;
         videoRef.current?.play().catch(() => {
           // Autoplay may be blocked; the user can press play.
@@ -375,7 +357,7 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
         const video = videoRef.current;
         const stallTimer = window.setTimeout(() => {
           if (cancelled || !video || video.readyState > 0) return;
-          setPlayerError("Live preview isn't available in this browser for this output yet — your download will still work once conversion finishes.");
+          setPlayerError("Playback preview isn't available in this browser for this output — your download will still work.");
         }, 8000);
         video?.addEventListener('loadeddata', () => window.clearTimeout(stallTimer), { once: true });
       } catch (err) {
@@ -392,99 +374,15 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
       cancelled = true;
       destroyPlayer();
     };
-    // `hasContent`, not `m3u8Content` itself, is the dependency on purpose:
-    // a live conversion updates `m3u8Content` on every segment (often
-    // several times within ~100ms right around completion, confirmed
-    // empirically), and depending on the raw string would tear this whole
-    // effect's player down and rebuild it on every single tick. That's not
-    // just wasteful, it hangs WebKit outright: destroying one Shaka player
-    // and immediately attaching a new one to the same <video> element in
-    // rapid succession never resolves there (confirmed against real WebKit
-    // — `player.attach()` simply never settles on the second attempt),
-    // leaving a permanently blank preview with no error. None of that
-    // rebuilding is needed for a same-session content update anyway:
-    // `manifestContentRef` above already serves the latest content to
-    // Shaka's own scheme plugin, and Shaka re-fetches a still-live manifest
-    // on its own timer. `hasContent` only flips once, false→true, the
-    // moment there's anything to load at all — which is the one transition
-    // that actually needs a fresh player.
-    //
-    // `introDurationSec`/`outroDurationSec` are deliberately excluded too,
-    // same reasoning as `m3u8Content` above: they're stable for the whole
-    // life of a given export result (intro/outro isn't editable once
-    // there's something to preview here at all), only ever read once to
-    // seed `loadChaptersTrackWithRetry`'s own closure — not something a
-    // change to should tear the whole player down and rebuild over.
+    // `introDurationSec`/`outroDurationSec` deliberately excluded — stable
+    // for the whole life of a given export result, only ever read once to
+    // seed `loadChaptersTrackWithRetry`'s own closure.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasContent, outputFolderHandle, destroyPlayer, useDash, dashManifestFilename]);
 
-  // The manifest text can genuinely change *shape*, not just grow, once a
-  // job finishes: intro/outro splicing (see spliceIntroOutro in
-  // remux.worker.ts) only ever runs *after* the per-segment loop that
-  // first makes `hasContent` true above, rewriting the whole thing (intro
-  // segments prepended, outro appended) rather than appending more
-  // segments the way a real live HLS update would. Confirmed empirically:
-  // for an unedited source plus an attached intro/outro, the very first
-  // per-segment manifest already carries its own #EXT-X-ENDLIST (a single-
-  // segment "live" job finishes its own loop almost instantly) — once
-  // Shaka's own re-poll logic sees that, it stops polling for good, so it
-  // never picks up the real, later, spliced-in version at all. The result:
-  // `player.seekRange()` stayed stuck reporting just the main content's own
-  // duration for the rest of the session, with no way to seek into the
-  // outro at all from this "done" screen's own seek bar.
-  //
-  // Re-loading the *same* player instance (not tearing the whole thing
-  // down and rebuilding it — that's what the WebKit re-attach hang the big
-  // load effect above documents is about) exactly once, right as the job
-  // transitions to actually complete, forces Shaka to re-parse whatever
-  // `manifestContentRef` holds by then, which is always the real, final
-  // text (every COMPLETE event's own `m3u8` field is written *after*
-  // intro/outro splicing — see runWithHandle/runSegmentedFastPath). A no-op
-  // (bar a harmless brief reload) whenever the content never needed it —
-  // e.g. no intro/outro attached — since the text ends up identical either
-  // way.
-  useEffect(() => {
-    if (!isComplete || useDash || !playerRef.current || !outputFolderHandle || !containerRef.current) return;
-    const player = playerRef.current;
-    const container = containerRef.current;
-    let cancelled = false;
-    void (async () => {
-      // Wait for whatever load() call is already in flight (the initial
-      // one, almost always, for how quickly this can fire on a fast job) to
-      // settle before issuing this one — see `loadPromiseRef`'s own doc
-      // comment for why a second concurrent call breaks playback outright
-      // instead of queueing behind the first.
-      if (loadPromiseRef.current) await loadPromiseRef.current.catch(() => {});
-      if (cancelled) return;
-
-      try {
-        const reloadPromise = player.load(MANIFEST_URI);
-        loadPromiseRef.current = reloadPromise;
-        await reloadPromise;
-        if (cancelled) return;
-        videoRef.current?.play().catch(() => {
-          // Autoplay may be blocked; the user can press play.
-        });
-        // `load()` drops whatever text tracks the pre-reload player had —
-        // both need re-adding against the now-correct (post-splice)
-        // manifest, the same way the initial load establishes them.
-        void loadThumbnailsTrackWithRetry(player, outputFolderHandle, () => cancelled);
-        void loadChaptersTrackWithRetry(player, container, introDurationSec, outroDurationSec, () => cancelled);
-      } catch {
-        // Best-effort — playerError already covers a genuinely broken
-        // player elsewhere; this just leaves whatever was already playing
-        // as it was rather than surfacing a second error path for it.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- introDurationSec/outroDurationSec stable per session, same reasoning as the big load effect above.
-  }, [isComplete, useDash, outputFolderHandle]);
-
   useEffect(() => () => destroyPlayer(), [destroyPlayer]);
 
-  const isReady = !!((useDash ? isComplete : m3u8Content) && outputFolderHandle);
+  const isReady = isComplete && !!outputFolderHandle;
 
   return (
     <div className="panel">
@@ -493,24 +391,14 @@ export default function Player({ m3u8Content, outputFolderHandle, isComplete, da
           <span className="section-label">{useDash ? 'DASH result' : 'HLS result'}</span>
           <span className="preview-badge preview-badge--final">Packaged</span>
         </span>
-        {isReady && (
-          <span className={`status-line ${isComplete ? 'is-done' : 'is-active'}`}>
-            {isComplete ? 'Ready' : 'Playing live while it converts'}
-          </span>
-        )}
+        {isReady && <span className="status-line is-done">Ready</span>}
       </div>
 
       {playerError ? (
         <div className="player-error">{playerError}</div>
       ) : (
         <div className="player-frame" ref={containerRef}>
-          {isReady ? (
-            <video ref={videoRef} />
-          ) : (
-            <p className="player-placeholder">
-              {useDash ? 'Your video will play here once the DASH manifest is ready.' : 'Your video will play here once the first segment is ready.'}
-            </p>
-          )}
+          {isReady ? <video ref={videoRef} /> : <p className="player-placeholder">Your video will play here once the export finishes.</p>}
         </div>
       )}
     </div>
