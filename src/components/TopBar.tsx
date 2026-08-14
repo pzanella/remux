@@ -21,6 +21,8 @@ interface TopBarProps {
   sourceDuration: number | undefined;
   sourceFileSize: number | undefined;
   isSavingProject: boolean;
+  screen: 'editor' | 'result';
+  onToggleScreen: () => void;
   onReset: () => void;
   onExportClick: () => void;
   onSaveProject: () => void;
@@ -36,10 +38,11 @@ interface TopBarProps {
 /** Logo/wordmark + current project's identity, and the one primary action
  * (export) — everything else (output destination, renditions, progress)
  * lives inside the export flow it triggers, not cluttering this bar. "Save
- * Project"/"Load Project" are the exception, kept quiet (`.btn-quiet`, not
- * `.btn-primary`) precisely so they don't compete with Export as a second
- * primary action — they're a save/resume checkpoint for work in progress,
- * not something that belongs inside the export review flow itself. */
+ * Project"/"Load Project" and the editor/result screen toggle are the
+ * exception, kept quiet (`.btn-quiet`, not `.btn-primary`) precisely so they
+ * don't compete with Export as a second primary action — they're a save/
+ * resume checkpoint and a navigation control, not something that belongs
+ * inside the export review flow itself. */
 export default function TopBar({
   hasSource,
   status,
@@ -48,6 +51,8 @@ export default function TopBar({
   sourceDuration,
   sourceFileSize,
   isSavingProject,
+  screen,
+  onToggleScreen,
   onReset,
   onExportClick,
   onSaveProject,
@@ -100,6 +105,17 @@ export default function TopBar({
       {hasSource && (
         <button type="button" className="btn-quiet" onClick={onSaveProject} disabled={isSavingProject} title="Download this project (source + edits) to resume later or share it">
           {isSavingProject ? 'Saving…' : 'Save Project'}
+        </button>
+      )}
+
+      {hasSource && status !== 'idle' && (
+        <button
+          type="button"
+          className="btn-quiet"
+          onClick={onToggleScreen}
+          title={screen === 'editor' ? 'Switch to the export/result view' : 'Switch back to the editor'}
+        >
+          {screen === 'editor' ? 'View Export' : 'Back to Editor'}
         </button>
       )}
 

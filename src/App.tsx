@@ -25,6 +25,23 @@ export default function App() {
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const previewRef = useRef<PreviewPaneHandle>(null);
 
+  const [screen, setScreen] = useState<'editor' | 'result'>('editor');
+  const prevStatusRef = useRef(t.status);
+  // Tracks status's own previous value so this only forces the result
+  // screen on the genuine idle -> non-idle edge (an export/resume just
+  // began) — reacting to "status !== 'idle'" directly would re-force it on
+  // every later status change too (e.g. converting -> processing),
+  // overriding a user who had already navigated back to the editor mid-job.
+  useEffect(() => {
+    if (prevStatusRef.current === 'idle' && t.status !== 'idle') {
+      setScreen('result');
+    }
+    prevStatusRef.current = t.status;
+  }, [t.status]);
+  const handleToggleScreen = useCallback(() => {
+    setScreen((s) => (s === 'editor' ? 'result' : 'editor'));
+  }, []);
+
   // Mirrors PreviewPane's own internal phase/phaseElapsed (see its own
   // `onPhaseChange` doc comment) — Timeline's playhead has no other way to
   // know intro/outro playback is happening at all, let alone how far in.
@@ -104,6 +121,7 @@ export default function App() {
   }, [batch]);
 
   const editingPhase = t.status === 'idle';
+  const showEditor = editingPhase || screen === 'editor';
   const { abrHeights, setAbrEnabled } = t;
 
   // A row of rendition chips doubles as adaptive HLS's on/off switch —
@@ -248,6 +266,8 @@ export default function App() {
         sourceDuration={t.sourceDuration}
         sourceFileSize={t.session?.sourceFileSize}
         isSavingProject={t.isZipping}
+        screen={screen}
+        onToggleScreen={handleToggleScreen}
         onReset={handleReset}
         onExportClick={handleExportClick}
         onSaveProject={handleSaveProject}
@@ -259,7 +279,7 @@ export default function App() {
       )}
 
       <div className="editor-layout">
-        {editingPhase ? (
+        {showEditor ? (
           <>
             <PreviewPane
               ref={previewRef}
