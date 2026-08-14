@@ -79,10 +79,32 @@ async function loadFFmpegModule(): Promise<FFmpegModule> {
  * API, so only the first conversion on a given browser pays the download. */
 const FFMPEG_CORE_CACHE = 'remux-ffmpeg-core-v1';
 
+/** A fresh browsing context (every e2e test, in particular) starts with an
+ * empty Cache Storage, so every ABR/loudness/FFmpeg-fallback job re-fetches
+ * this ~32 MB from unpkg.com — a real external CDN a single unretried
+ * `fetch()` had no resilience against. Bounded (not `retryUntilCancelled`'s
+ * unlimited backoff): a CDN that's still failing after a few attempts needs
+ * a clear error, not an export that silently hangs retrying forever. */
+async function fetchWithRetry(url: string, attempts = 4): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    if (cancelled) throw new Error('Cancelled');
+    try {
+      const response = await fetch(url);
+      if (response.ok) return response;
+      lastErr = new Error(`HTTP ${response.status}`);
+    } catch (err) {
+      lastErr = err;
+    }
+    if (i < attempts - 1) await sleep(500 * 2 ** i);
+  }
+  throw new Error(`Could not download ${url} after ${attempts} attempts: ${lastErr}`);
+}
+
 async function cachedBlobURL(url: string, mimeType: string): Promise<string> {
   const cache = await caches.open(FFMPEG_CORE_CACHE);
   const cached = await cache.match(url);
-  const response = cached ?? (await fetch(url));
+  const response = cached ?? (await fetchWithRetry(url));
   if (!cached && response.ok) await cache.put(url, response.clone());
   const blob = await response.blob();
   return URL.createObjectURL(new Blob([blob], { type: mimeType }));

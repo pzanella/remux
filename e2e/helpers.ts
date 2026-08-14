@@ -162,6 +162,33 @@ export async function selectFmp4Container(page: Page): Promise<void> {
   await page.getByLabel('Fragmented MP4 (experimental)').check();
 }
 
+/** Mirrors remux.worker.ts's own `canUseWebCodecsAbr` upfront check for the
+ * 240p rendition — adaptive fMP4/DASH has no FFmpeg fallback (see
+ * runAdaptiveHls's own doc comment), so a browser/environment without real
+ * hardware WebCodecs H.264 encode support genuinely cannot produce this
+ * output, by design. Lets a test skip cleanly there instead of failing on
+ * an assertion the app was never going to satisfy. */
+export async function supportsAbrFmp4(page: Page): Promise<boolean> {
+  // e2e/tsconfig.json's lib has no DOM (see `dropFileOnto`'s own comment on
+  // the same gap) — passed as a string, not a typed function, so TS doesn't
+  // try to resolve `VideoEncoder` against a lib that doesn't have it.
+  return page.evaluate(`(async () => {
+    if (typeof VideoEncoder === 'undefined') return false;
+    try {
+      const { supported } = await VideoEncoder.isConfigSupported({
+        codec: 'avc1.42001f',
+        width: 426,
+        height: 240,
+        bitrate: 400_000,
+        avc: { format: 'annexb' },
+      });
+      return supported ?? false;
+    } catch {
+      return false;
+    }
+  })()`);
+}
+
 /** Enables EBU R128 loudness normalization on the export review screen —
  * see `runExport`'s `beforeStart`. */
 export async function enableLoudnessNormalization(page: Page): Promise<void> {
